@@ -1,0 +1,908 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+    <script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/jquery.terminal@2.35.2/js/jquery.terminal.min.js"></script>
+    <script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/jquery.terminal@2.35.2/js/unix_formatting.min.js"></script>
+    <script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+    <script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
+    <link crossorigin="anonymous" href="https://cdn.jsdelivr.net/npm/jquery.terminal@2.35.2/css/jquery.terminal.min.css" rel="stylesheet" />
+    <link
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.86em' font-size='84'>ET</text></svg>"
+      rel="icon"
+    />
+    <title>EdgeTerm Workspace</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='assets/styles.css') }}" />
+  </head>
+  <body>
+<div id="loading">
+      <div class="loading-card">
+        <div class="busy-spinner"></div>
+        <div id="loadingLabel" class="loading-label">Loading EdgeTerm runtime...</div>
+        <div id="loadingTransfer" class="loading-transfer hidden">
+          <div class="loading-progress-track">
+            <div id="loadingProgressFill" class="loading-progress-fill"></div>
+          </div>
+          <div class="loading-transfer-stats">
+            <span id="loadingProgressText">0%</span>
+            <span id="loadingSpeedText">0 B/s</span>
+          </div>
+          <div id="loadingTransferMeta" class="loading-transfer-meta">Waiting for transfer...</div>
+        </div>
+      </div>
+    </div>
+    <div id="app" class="app hidden">
+      <aside class="sidebar">
+        <div class="brand">
+          <strong>EdgeTerm Workspace</strong>
+          <span>Local-first terminal instances</span>
+        </div>
+        <div class="workspace-actions">
+          <button id="newWorkspace" class="icon-button" title="New workspace"><i data-lucide="plus"></i>New</button>
+          <button id="importRootfs" class="icon-button" title="Import custom rootfs"><i data-lucide="upload-cloud"></i>Import</button>
+          <button id="exportWorkspace" class="icon-button" title="Download workspace"><i data-lucide="archive"></i>Export</button>
+          <button id="deleteWorkspace" class="icon-button" title="Delete workspace"><i data-lucide="trash-2"></i>Delete</button>
+        </div>
+        <div id="workspaceList" class="workspace-list"></div>
+      </aside>
+      <div id="sidebarResizer" class="sidebar-resizer" aria-hidden="true"></div>
+      <div id="sidebarBackdrop" class="sidebar-backdrop hidden"></div>
+
+      <main class="main">
+          <header class="topbar">
+            <div class="topbar-left">
+            <button id="toggleSidebar" class="icon-only sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar"><i data-lucide="panel-left"></i></button>
+            <div class="tabs">
+              <button class="tab active" data-view="terminalView" title="Terminal" aria-label="Terminal"><i data-lucide="terminal"></i></button>
+              <button class="tab" data-view="displayView" title="Display" aria-label="Display"><i data-lucide="monitor-play"></i></button>
+              <button class="tab" data-view="browserView" title="EdgeTerm Browser" aria-label="EdgeTerm Browser"><i data-lucide="globe-2"></i></button>
+              <button class="tab" data-view="filesView" title="Files" aria-label="Files"><i data-lucide="folder-tree"></i></button>
+              <button class="tab" data-view="editorView" title="Editor" aria-label="Editor"><i data-lucide="file-code-2"></i></button>
+              <button class="tab" data-view="usersView" title="Users" aria-label="Users"><i data-lucide="users"></i></button>
+              <button class="tab" data-view="cloudView" title="Cloud" aria-label="Cloud"><i data-lucide="cloud"></i></button>
+              <button class="tab hidden" id="adminTab" data-view="adminView" title="Admin" aria-label="Admin"><i data-lucide="shield"></i></button>
+              <button class="tab" data-view="settingsView" title="Settings" aria-label="Settings"><i data-lucide="settings"></i></button>
+            </div>
+            </div>
+            <div class="topbar-right">
+          <div id="activeTitle" class="active-title"></div>
+          <button id="topbarShareWriteback" class="icon-button hidden"><i data-lucide="upload"></i>Save Shared Copy</button>
+          <button id="toggleTheme" class="icon-only" title="Switch theme" aria-label="Switch theme"><i data-lucide="moon-star"></i></button>
+          <button id="toggleFullscreen" class="icon-button"><i data-lucide="maximize-2"></i>Fullscreen</button>
+          </div>
+        </header>
+
+          <section id="terminalView" class="view terminal-view active">
+            <button id="exitFullscreen" class="icon-button fullscreen-exit hidden" title="Exit fullscreen"><i data-lucide="minimize-2"></i>Exit</button>
+            <div id="terminal"></div>
+          </section>
+
+            <section id="displayView" class="view display-view">
+              <div class="display-shell">
+                <div class="toolbar">
+                  <div id="displayStatus" class="file-muted">Display ready</div>
+                  <div class="ml-auto flex gap-2">
+                    <button id="clearDisplay" class="icon-only" title="Clear display"><i data-lucide="eraser"></i></button>
+                  <button id="focusDisplay" class="icon-only" title="Focus display"><i data-lucide="crosshair"></i></button>
+                  <button id="fullscreenDisplay" class="icon-only" title="Fullscreen display"><i data-lucide="expand"></i></button>
+                </div>
+              </div>
+              <div id="displaySurface" class="display-surface" tabindex="0">
+                <div id="displayStage" class="display-stage">
+                  <div id="displayEmpty" class="display-empty">
+                    <div>
+                      <strong>EdgeTerm Display</strong>
+                      Python, charts, SVG, images, HTML, and SDL canvas output appear here.
+                    </div>
+                  </div>
+                  <canvas id="displayCanvas" class="display-canvas hidden" tabindex="0"></canvas>
+                  <div id="displayContent" class="display-content hidden"></div>
+                </div>
+              </div>
+            </div>
+            </section>
+
+            <section id="browserView" class="view browser-view">
+              <div class="browser-shell">
+                <div class="toolbar">
+                  <div id="browserStatus" class="file-muted">EdgeTerm Browser</div>
+                  <form id="displayBrowserBar" class="display-browser-bar">
+                    <button id="displayBackButton" type="button" class="icon-only" title="Back" aria-label="Back"><i data-lucide="arrow-left"></i></button>
+                    <button id="displayRefreshButton" type="button" class="icon-only" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
+                    <input id="displayUrlInput" class="path" autocomplete="off" spellcheck="false" value="/" aria-label="Browser URL" />
+                    <button id="displayUrlGo" type="submit" class="icon-only" title="Go" aria-label="Go"><i data-lucide="arrow-right"></i></button>
+                  </form>
+                  <div class="ml-auto flex gap-2">
+                    <button id="focusBrowser" class="icon-only" title="Focus browser"><i data-lucide="crosshair"></i></button>
+                    <button id="fullscreenBrowser" class="icon-only" title="Fullscreen browser"><i data-lucide="expand"></i></button>
+                  </div>
+                </div>
+                <div id="browserSurface" class="browser-surface">
+                  <div id="browserLoadingProgress" class="browser-loading-progress" aria-hidden="true">
+                    <div id="browserLoadingProgressFill" class="browser-loading-progress-fill"></div>
+                  </div>
+                  <div id="browserEmpty" class="display-empty">
+                    <div>
+                      <div class="display-empty-icon"><i data-lucide="globe-2"></i></div>
+                      <p>Start EdgeServe or open a running instance.</p>
+                    </div>
+                  </div>
+                  <div id="browserContent" class="display-content hidden"></div>
+                </div>
+              </div>
+            </section>
+
+            <section id="filesView" class="view file-view">
+          <div class="toolbar">
+            <button id="goUp" class="icon-only" title="Up"><i data-lucide="corner-left-up"></i></button>
+            <input id="filePath" class="path" value="/home/user" />
+            <button id="refreshFiles" class="icon-only" title="Refresh"><i data-lucide="refresh-cw"></i></button>
+            <button id="uploadFile" class="icon-only" title="Upload"><i data-lucide="upload"></i></button>
+            <button id="downloadFile" class="icon-only" title="Download"><i data-lucide="download"></i></button>
+            <button id="copyFile" class="icon-only" title="Copy"><i data-lucide="copy"></i></button>
+            <button id="cutFile" class="icon-only" title="Cut"><i data-lucide="scissors"></i></button>
+            <button id="pasteFile" class="icon-only" title="Paste"><i data-lucide="clipboard-paste"></i></button>
+            <button id="renameFile" class="icon-only" title="Rename"><i data-lucide="pencil"></i></button>
+            <button id="deleteFile" class="icon-only" title="Delete"><i data-lucide="trash-2"></i></button>
+          </div>
+          <div id="fileList" class="file-list"></div>
+        </section>
+
+        <section id="editorView" class="view editor-view">
+          <div class="editor-shell">
+            <div id="editorMenuBar" class="editor-menubar"></div>
+            <div class="editor-toolbar">
+              <div id="editorToolbarPrimary" class="editor-toolbar-group"></div>
+              <input id="editorPath" class="path" value="/home/user/notes.txt" />
+              <div class="editor-toolbar-group">
+                <span id="editorStatus" class="editor-status">Ready</span>
+              </div>
+            </div>
+            <div id="editorMain" class="editor-main">
+              <div class="editor-pane">
+                <div id="editor"></div>
+              </div>
+              <div id="editorSplitPane" class="editor-pane hidden">
+                <div class="editor-pane-header">
+                  <div class="editor-toolbar-group">
+                    <button id="openSplitEditorButton" class="icon-only" type="button" title="Open file in split editor" aria-label="Open file in split editor">
+                      <i data-lucide="folder-open"></i>
+                    </button>
+                    <button id="saveSplitEditorButton" class="icon-only" type="button" title="Save split editor file" aria-label="Save split editor file">
+                      <i data-lucide="save"></i>
+                    </button>
+                    <button id="useSplitAsPrimaryButton" class="icon-only" type="button" title="Use split file in main editor" aria-label="Use split file in main editor">
+                      <i data-lucide="arrow-left-right"></i>
+                    </button>
+                  </div>
+                  <input id="editorSplitPath" class="path" value="/home/user/notes.txt" />
+                  <div class="editor-toolbar-group">
+                    <span id="editorSplitStatus" class="editor-status">Split ready</span>
+                  </div>
+                </div>
+                <div id="editorSplit"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="usersView" class="view manager-view">
+          <div class="panel-grid">
+            <div class="panel">
+              <h2>Workspace Users</h2>
+              <div id="userList"></div>
+              <button id="createUser" class="icon-button mt-3" title="Create user"><i data-lucide="user-plus"></i>Create User</button>
+            </div>
+            <div class="panel">
+              <h2>Current Session</h2>
+              <div class="setting-row">
+                <span>Active user</span>
+                <strong id="activeUserLabel">user</strong>
+              </div>
+              <div class="setting-row">
+                <span>Home directory</span>
+                <code id="activeHomeLabel">/home/user</code>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="cloudView" class="view settings-view">
+          <div class="product-header">
+            <div>
+              <h1>Cloud Workspace</h1>
+              <p>Optional backup, restore, and sharing for local EdgeTerm workspaces.</p>
+            </div>
+            <div id="cloudStatus" class="status-pill">Local-only</div>
+          </div>
+          <div id="cloudNoticeBlock" class="panel notice-block hidden">
+            <div id="cloudNoticeContent" class="notice-html"></div>
+          </div>
+          <div id="cloudAuthGate" class="cloud-gate">
+            <div class="panel">
+              <h2>Login</h2>
+              <div id="authForms" class="setting-stack mt-3">
+                <div class="setting-field">
+                  <label for="cloudEmail">Email</label>
+                  <input id="cloudEmail" type="email" autocomplete="email" />
+                </div>
+                <div class="setting-field">
+                  <label for="cloudPassword">Password</label>
+                  <input id="cloudPassword" type="password" autocomplete="current-password" />
+                </div>
+                <label id="cloudRegisterTosRow" class="setting-checkbox">
+                  <input id="cloudAcceptTos" type="checkbox" />
+                  I agree to the Terms of Service
+                </label>
+                <div id="cloudRegisterTosHint" class="hint-inline">
+                  Required for new accounts. Review the Terms of Service at the bottom of this page.
+                </div>
+                <div class="setting-actions">
+                  <button id="cloudLogin" class="icon-button"><i data-lucide="log-in"></i>Login</button>
+                  <button id="cloudRegister" class="icon-button"><i data-lucide="user-plus"></i>Register</button>
+                </div>
+                <div id="cloudAuthTosPreview" class="panel tos-inline-panel">
+                  <div class="panel-head">
+                    <h2>Terms of Service</h2>
+                  </div>
+                  <div id="cloudAuthTosContent" class="notice-html"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="guestShareWritebackPanel" class="panel hidden">
+            <div class="panel-head">
+              <h2>Shared Workspace Save</h2>
+              <div id="guestShareWritebackStatus" class="status-pill">Unavailable</div>
+            </div>
+            <p id="guestShareWritebackMessage" class="file-muted">
+              Open a public read-write shared workspace to save changes back without logging in.
+            </p>
+            <div class="setting-field">
+              <label for="guestShareWritebackStrategy">Write-back mode</label>
+              <div class="setting-actions">
+                <select id="guestShareWritebackStrategy" disabled>
+                  <option value="overwrite">Overwrite share</option>
+                </select>
+                <button id="guestShareWriteback" class="icon-button" disabled><i data-lucide="upload"></i>Save Shared Copy</button>
+              </div>
+            </div>
+          </div>
+          <div id="cloudFeatureGrid" class="hidden">
+            <div class="metric-strip">
+              <div><span>Account</span><strong id="profileEmail"></strong></div>
+              <div><span>Tier</span><strong id="profileTier"></strong></div>
+              <div><span>Storage</span><strong id="profileStorage"></strong></div>
+              <div><span>Max snapshots</span><strong id="profileMaxSnapshots">0</strong></div>
+            </div>
+            <div class="panel-grid cloud-panel-grid">
+              <div class="panel">
+                <h2>Account</h2>
+              <div id="profilePanel" class="setting-stack hidden mt-3">
+                <div class="setting-row"><span>Auto-sync available</span><code id="profileAutoSync">No</code></div>
+                <div class="setting-row"><span>Keep latest backups</span><code id="profileKeepBackups">0</code></div>
+                <button id="cloudLogout" class="icon-button"><i data-lucide="log-out"></i>Logout</button>
+              </div>
+            </div>
+            <div class="panel cloud-panel-wide">
+              <div class="panel-head">
+                <h2>Cloud Backups</h2>
+                <div class="backup-toolbar-actions">
+                  <button id="syncToCloud" class="icon-button"><i data-lucide="cloud-upload"></i>Backup Now</button>
+                  <button id="saveCloudBackupSettings" class="icon-button"><i data-lucide="save"></i>Save Backup Settings</button>
+                </div>
+              </div>
+              <div class="setting-guide">
+                <div><strong>Backup now</strong><span>Uploads the current workspace rootfs as a fresh cloud snapshot.</span></div>
+                <div><strong>Auto-sync</strong><span>Runs backups on a schedule or when you leave the page, depending on your tier.</span></div>
+                <div><strong>Keep latest backups</strong><span>Prunes older cloud snapshots after each successful backup. Turn it off for unlimited history until you hit your snapshot quota.</span></div>
+                <div><strong>Shared write-back</strong><span>Applies only to writable shares. <code>Overwrite share</code> updates the same shared rootfs; <code>Fork to my cloud</code> creates a separate backup in your account.</span></div>
+              </div>
+              <div class="setting-field">
+                <label for="autoSyncMode">Auto-sync</label>
+                <select id="autoSyncMode">
+                  <option value="off">Off</option>
+                  <option value="interval">Every X minutes</option>
+                  <option value="exit">On exit</option>
+                </select>
+              </div>
+              <div class="setting-field">
+                <label for="autoSyncMinutes">Auto-sync interval (minutes)</label>
+                <input id="autoSyncMinutes" type="number" min="1" step="1" value="5" />
+              </div>
+              <label class="setting-checkbox"><input id="backupRetentionEnabled" type="checkbox" checked /> Limit retained backups</label>
+              <div class="setting-field">
+                <label for="backupRetentionCount">Keep latest backups</label>
+                <input id="backupRetentionCount" type="number" min="1" step="1" placeholder="Unlimited when disabled" />
+              </div>
+              <div class="setting-field">
+                <label for="shareWritebackStrategy">Shared write-back</label>
+                <div class="setting-actions">
+                  <select id="shareWritebackStrategy">
+                    <option value="overwrite">Overwrite share</option>
+                    <option value="fork">Fork to my cloud</option>
+                  </select>
+                  <button id="shareWriteback" class="icon-button" disabled><i data-lucide="upload"></i>Save Shared Copy</button>
+                </div>
+              </div>
+              <div class="backup-toolbar">
+                <div class="backup-toolbar-controls">
+                  <label class="setting-checkbox"><input id="snapshotSelectPage" type="checkbox" /> Select page</label>
+                  <button id="deleteSelectedSnapshots" class="icon-button" type="button" disabled><i data-lucide="trash-2"></i>Delete Selected</button>
+                  <button id="deleteAllSnapshots" class="icon-button" type="button"><i data-lucide="trash"></i>Delete All</button>
+                </div>
+                <div class="backup-toolbar-controls">
+                  <label for="snapshotPageSize">Backups per page
+                    <select id="snapshotPageSize">
+                      <option value="15">15</option>
+                      <option value="30">30</option>
+                      <option value="50">50</option>
+                      <option value="100">100</option>
+                      <option value="200">200</option>
+                    </select>
+                  </label>
+                  <div id="snapshotRangeLabel" class="file-muted">0 backups</div>
+                </div>
+              </div>
+              <div id="snapshotList" class="backup-list"></div>
+              <div class="backup-pagination">
+                <div id="snapshotPageLabel" class="file-muted">Page 1</div>
+                <div class="backup-pagination-controls">
+                  <button id="snapshotPrevPage" type="button">Previous</button>
+                  <button id="snapshotNextPage" type="button">Next</button>
+                </div>
+              </div>
+            </div>
+            <div class="panel cloud-panel-full">
+              <h2>Sharing</h2>
+              <div class="setting-guide">
+                <div><strong>Read-only</strong><span>People can open and run the shared snapshot, but they cannot push changes back.</span></div>
+                <div><strong>Read-write</strong><span>People can edit the shared workspace. This is required before cloud write-back can do anything.</span></div>
+                <div><strong>Allow cloud write-back</strong><span>Lets writable shares send edits back upstream instead of only viewing or forking.</span></div>
+                <div><strong>Temp mode</strong><span>Opens from the URL without keeping a saved local workspace entry on the receiver side.</span></div>
+              </div>
+              <div class="setting-field">
+                <label for="shareSnapshot">Snapshot</label>
+                <select id="shareSnapshot"></select>
+              </div>
+              <div class="setting-field">
+                <label for="shareVisibility">Visibility</label>
+                <select id="shareVisibility">
+                  <option value="private">Private</option>
+                  <option value="restricted">Restricted</option>
+                  <option value="public">Public</option>
+                </select>
+              </div>
+              <label class="setting-checkbox"><input id="shareReadWrite" type="checkbox" /> Read-write</label>
+              <div id="shareModeHint" class="hint-inline">Read-only shares can be opened, but they cannot save changes back.</div>
+              <label class="setting-checkbox"><input id="shareTempMode" type="checkbox" /> Temp mode</label>
+              <label class="setting-checkbox"><input id="shareAllowFork" type="checkbox" checked /> Allow fork / clone</label>
+              <label class="setting-checkbox"><input id="shareCloudWriteBack" type="checkbox" /> Allow cloud write-back</label>
+              <div id="shareCloudWriteBackHint" class="hint-inline">Requires <code>Read-write</code>. When enabled, writable shares may push edits back to the shared cloud snapshot.</div>
+              <label class="setting-checkbox"><input id="shareAppMode" type="checkbox" /> Open in App Mode</label>
+              <div class="setting-field">
+                <label for="shareAllowedUsers">Restricted users</label>
+                <input id="shareAllowedUsers" placeholder="user@example.com, teammate@example.com" />
+              </div>
+              <div class="setting-field">
+                <label for="shareCustomSlug">Custom share URL</label>
+                <input id="shareCustomSlug" placeholder="my-app-demo" />
+              </div>
+              <div class="setting-field">
+                <label for="shareExpirationDays">Expiration (days, blank = tier default)</label>
+                <input id="shareExpirationDays" type="number" min="0" placeholder="30" />
+              </div>
+              <button id="createShare" class="icon-button"><i data-lucide="share-2"></i>Create Share Link</button>
+              <div id="shareList" class="workspace-list mt-3"></div>
+            </div>
+            </div>
+          </div>
+          <div id="cloudTosBlock" class="panel notice-block hidden">
+            <div class="panel-head">
+              <h2>Terms of Service</h2>
+            </div>
+            <div id="cloudTosContent" class="notice-html"></div>
+          </div>
+        </section>
+
+        <section id="adminView" class="view settings-view">
+          <div class="product-header">
+            <div>
+              <h1>Admin Control</h1>
+              <p>Manage users, tiers, quotas, sharing, storage, and App Mode policy.</p>
+            </div>
+            <div id="adminStatus" class="status-pill">Admin login required</div>
+          </div>
+          <div id="adminLoginPanel" class="cloud-gate">
+            <div class="panel">
+              <h2>Admin Access</h2>
+              <p class="file-muted">Use an EdgeTerm account with the admin role. The first registered account is admin by default.</p>
+              <div class="feature-list">
+                <div><span>Users</span><strong>Create, delete, role, tier, quotas</strong></div>
+                <div><span>Tiers</span><strong>Plans and feature limits</strong></div>
+                <div><span>Sharing</span><strong>Visibility, expiry, revoke, write-back</strong></div>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>Login</h2>
+              <div class="setting-stack">
+                <div class="setting-field">
+                  <label for="adminEmail">Email</label>
+                  <input id="adminEmail" type="email" autocomplete="email" />
+                </div>
+                <div class="setting-field">
+                  <label for="adminPassword">Password</label>
+                  <input id="adminPassword" type="password" autocomplete="current-password" />
+                </div>
+                <button id="adminLogin" class="icon-button"><i data-lucide="log-in"></i>Login</button>
+              </div>
+            </div>
+          </div>
+          <div id="adminDashboard" class="hidden">
+            <div class="metric-strip admin-metric-strip">
+              <div><span>Users</span><strong id="adminMetricUsers">0</strong></div>
+              <div><span>Backups</span><strong id="adminMetricSnapshots">0</strong></div>
+              <div><span>Share Links</span><strong id="adminMetricShares">0</strong></div>
+              <div><span>Total Storage</span><strong id="adminMetricStorage">0 B</strong></div>
+            </div>
+            <div class="panel-grid admin-platform-grid">
+              <div class="panel cloud-panel-wide">
+                <div class="panel-head">
+                  <h2>User Manager</h2>
+                  <div class="setting-actions">
+                    <button id="adminRefresh" class="icon-button"><i data-lucide="refresh-cw"></i>Refresh</button>
+                    <button id="adminCreateUser" class="icon-button"><i data-lucide="user-plus"></i>Create User</button>
+                  </div>
+                </div>
+                <div class="admin-toolbar">
+                  <div class="setting-field compact">
+                    <label for="adminUserSearch">Search users</label>
+                    <input id="adminUserSearch" placeholder="email, name, role, tier" />
+                  </div>
+                </div>
+                <div class="backup-toolbar admin-pagination-block">
+                  <div class="backup-toolbar-controls">
+                    <label for="adminUsersPageSize">Users per page
+                      <select id="adminUsersPageSize">
+                        <option value="15">15</option>
+                        <option value="30">30</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                        <option value="200">200</option>
+                        <option value="500">500</option>
+                      </select>
+                    </label>
+                    <div id="adminUsersRangeLabel" class="file-muted">0 users</div>
+                  </div>
+                </div>
+                <div id="adminUserList" class="workspace-list mt-3"></div>
+                <div class="backup-pagination">
+                  <div id="adminUsersPageLabel" class="file-muted">Page 1</div>
+                  <div class="backup-pagination-controls">
+                    <button id="adminUsersPrevPage" type="button">Previous</button>
+                    <button id="adminUsersNextPage" type="button">Next</button>
+                  </div>
+                </div>
+              </div>
+              <div class="panel cloud-panel-wide">
+                <div class="panel-head">
+                  <h2>Backup Manager</h2>
+                  <div class="setting-actions">
+                    <button id="adminImportSnapshot" class="icon-button"><i data-lucide="upload"></i>Import Backup</button>
+                  </div>
+                </div>
+                <div class="admin-toolbar admin-toolbar-grid">
+                  <div class="setting-field compact">
+                    <label for="adminSnapshotSearch">Search backups</label>
+                    <input id="adminSnapshotSearch" placeholder="backup, owner, workspace id" />
+                  </div>
+                  <div class="setting-field compact">
+                    <label for="adminSnapshotUserFilter">Filter by user</label>
+                    <select id="adminSnapshotUserFilter">
+                      <option value="">All users</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="backup-toolbar admin-pagination-block">
+                  <div class="backup-toolbar-controls">
+                    <label for="adminSnapshotsPageSize">Backups per page
+                      <select id="adminSnapshotsPageSize">
+                        <option value="15">15</option>
+                        <option value="30">30</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                        <option value="200">200</option>
+                        <option value="500">500</option>
+                      </select>
+                    </label>
+                    <div id="adminSnapshotsRangeLabel" class="file-muted">0 backups</div>
+                  </div>
+                </div>
+                <div id="adminSnapshotList" class="workspace-list mt-3"></div>
+                <div class="backup-pagination">
+                  <div id="adminSnapshotsPageLabel" class="file-muted">Page 1</div>
+                  <div class="backup-pagination-controls">
+                    <button id="adminSnapshotsPrevPage" type="button">Previous</button>
+                    <button id="adminSnapshotsNextPage" type="button">Next</button>
+                  </div>
+                </div>
+              </div>
+              <div class="panel cloud-panel-full">
+                <div class="panel-head">
+                  <h2>Sharing Link Manager</h2>
+                </div>
+                <div class="admin-toolbar">
+                  <div class="setting-field compact">
+                    <label for="adminShareSearch">Search share links</label>
+                    <input id="adminShareSearch" placeholder="owner, slug, path, mode" />
+                  </div>
+                </div>
+                <div class="backup-toolbar admin-pagination-block">
+                  <div class="backup-toolbar-controls">
+                    <label for="adminSharesPageSize">Share links per page
+                      <select id="adminSharesPageSize">
+                        <option value="15">15</option>
+                        <option value="30">30</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                        <option value="200">200</option>
+                        <option value="500">500</option>
+                      </select>
+                    </label>
+                    <div id="adminSharesRangeLabel" class="file-muted">0 share links</div>
+                  </div>
+                </div>
+                <div id="adminShareList" class="workspace-list mt-3"></div>
+                <div class="backup-pagination">
+                  <div id="adminSharesPageLabel" class="file-muted">Page 1</div>
+                  <div class="backup-pagination-controls">
+                    <button id="adminSharesPrevPage" type="button">Previous</button>
+                    <button id="adminSharesNextPage" type="button">Next</button>
+                  </div>
+                </div>
+              </div>
+              <div class="panel">
+                <h2>Tiers</h2>
+                <div class="setting-actions">
+                  <button id="adminCreateTier" class="icon-button"><i data-lucide="layers-3"></i>Create Tier</button>
+                </div>
+                <div class="backup-toolbar admin-pagination-block">
+                  <div class="backup-toolbar-controls">
+                    <label for="adminTiersPageSize">Tiers per page
+                      <select id="adminTiersPageSize">
+                        <option value="15">15</option>
+                        <option value="30">30</option>
+                        <option value="50">50</option>
+                        <option value="100">100</option>
+                        <option value="200">200</option>
+                        <option value="500">500</option>
+                      </select>
+                    </label>
+                    <div id="adminTiersRangeLabel" class="file-muted">0 tiers</div>
+                  </div>
+                </div>
+                <div id="adminTierList" class="workspace-list mt-3"></div>
+                <div class="backup-pagination">
+                  <div id="adminTiersPageLabel" class="file-muted">Page 1</div>
+                  <div class="backup-pagination-controls">
+                    <button id="adminTiersPrevPage" type="button">Previous</button>
+                    <button id="adminTiersNextPage" type="button">Next</button>
+                  </div>
+                </div>
+              </div>
+              <div class="panel">
+                <h2>Platform Settings</h2>
+                <label class="setting-checkbox"><input id="adminSharingEnabled" type="checkbox" checked /> Sharing enabled globally</label>
+                <label class="setting-checkbox"><input id="adminAppModeEnabled" type="checkbox" checked /> App Mode enabled globally</label>
+                <div class="setting-field mt-3">
+                  <label for="adminCloudNoticeHtml">Cloud notice HTML</label>
+                  <textarea id="adminCloudNoticeHtml" placeholder="<strong>Maintenance</strong><br />Cloud backups will pause at 02:00 UTC."></textarea>
+                </div>
+                <div class="setting-field mt-3">
+                  <label for="adminTosHtml">Terms of Service HTML</label>
+                  <textarea id="adminTosHtml" placeholder="<h3>Terms of Service</h3><p>By creating an EdgeTerm account, you agree to...</p>"></textarea>
+                </div>
+                <button id="adminSaveSettings" class="icon-button"><i data-lucide="save"></i>Save Settings</button>
+              </div>
+              <div class="panel">
+                <h2>Storage Overview</h2>
+                <div id="adminStorage" class="setting-stack"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="settingsView" class="view settings-view">
+          <div class="settings-shell">
+            <aside class="settings-rail" aria-label="Settings navigation">
+              <div class="settings-identity">
+                <div class="workspace-glyph"><i data-lucide="box"></i></div>
+                <div>
+                  <span>Workspace</span>
+                  <strong id="settingsWorkspaceName">Default Workspace</strong>
+                </div>
+              </div>
+              <nav class="settings-nav">
+                <a href="#settingsWorkspaceModule" class="active"><i data-lucide="layout-dashboard"></i>Workspace</a>
+                <a href="#settingsRuntimeModule"><i data-lucide="square-terminal"></i>Runtime</a>
+                <a href="#settingsAppModeModule"><i data-lucide="toggle-right"></i>App Mode</a>
+                <a href="#settingsBrowserModule"><i data-lucide="database"></i>Browser Data</a>
+                <a href="#settingsDangerModule"><i data-lucide="shield-alert"></i>Danger Zone</a>
+              </nav>
+            </aside>
+
+            <div class="settings-main">
+              <header class="settings-hero">
+                <div>
+                  <div class="settings-kicker">Programmable runtime</div>
+                  <h1>Workspace Settings</h1>
+                  <p>Configure the runtime surface, local storage scope, and browser isolation for this workspace.</p>
+                </div>
+                <div class="settings-hero-actions">
+                  <span class="runtime-status"><span></span>Running</span>
+                  <button id="settingsUpdateRootfs" class="icon-button button-secondary"><i data-lucide="refresh-cw"></i>Update RootFS</button>
+                  <button id="settingsExportWorkspace" class="icon-button button-secondary"><i data-lucide="archive"></i>Export</button>
+                  <button id="settingsImportRootfs" class="icon-button button-primary"><i data-lucide="upload-cloud"></i>Import</button>
+                </div>
+              </header>
+
+              <section id="settingsWorkspaceModule" class="settings-module">
+                <div class="module-heading">
+                  <div>
+                    <span>Identity</span>
+                    <h2>Workspace</h2>
+                  </div>
+                  <button id="settingsToggleTheme" class="icon-button button-ghost"><i data-lucide="sun-medium"></i><span id="themeModeLabel">light</span></button>
+                </div>
+                <div class="metadata-grid">
+                  <div>
+                    <span>RootFS</span>
+                    <code id="settingsRootfs">EdgeTerm</code>
+                  </div>
+                  <div>
+                    <span>Storage</span>
+                    <code>/workspace-store</code>
+                  </div>
+                  <div>
+                    <span>Runtime class</span>
+                    <code>browser / pyodide</code>
+                  </div>
+                </div>
+              </section>
+
+              <section id="settingsRuntimeModule" class="settings-module">
+                <div class="module-heading">
+                  <div>
+                    <span>Runtime</span>
+                    <h2>Execution Config</h2>
+                  </div>
+                  <div class="module-actions">
+                    <button id="saveAppModeConfig" class="icon-button button-primary"><i data-lucide="save"></i>Save Config</button>
+                    <button id="launchAppMode" class="icon-button button-secondary"><i data-lucide="play"></i>Launch</button>
+                    <button id="openAppModeConfigEditor" class="icon-button button-ghost"><i data-lucide="file-code-2"></i>Edit JSON</button>
+                  </div>
+                </div>
+                <div class="runtime-config-block">
+                  <div class="setting-field">
+                    <label for="appModeRuntime">Runtime</label>
+                    <select id="appModeRuntime">
+                      <option value="python">Python (Pyodide routes)</option>
+                      <option value="static">Static HTML</option>
+                    </select>
+                  </div>
+                  <div class="setting-field">
+                    <label for="appModeEntrypoint">Entrypoint</label>
+                    <input id="appModeEntrypoint" value="/home/user/app.py" />
+                    <div class="hint">Python resolves a script path. Static mode resolves an HTML file.</div>
+                  </div>
+                  <div class="setting-field">
+                    <label for="appModeWorkingDirectory">Working directory</label>
+                    <input id="appModeWorkingDirectory" value="/home/user" />
+                  </div>
+                  <div class="setting-field">
+                    <label for="appModeStaticRoot">Static root</label>
+                    <input id="appModeStaticRoot" value="/home/user/public" />
+                  </div>
+                </div>
+              </section>
+
+              <section id="settingsAppModeModule" class="settings-module">
+                <div class="module-heading">
+                  <div>
+                    <span>App Mode</span>
+                    <h2>Application Surface</h2>
+                  </div>
+                  <label class="switch-row">
+                    <input id="appModeEnabled" type="checkbox" />
+                    <span></span>
+                    <strong>Enabled</strong>
+                  </label>
+                </div>
+                <div class="toggle-grid">
+                  <label class="setting-checkbox"><input id="appModeFullscreen" type="checkbox" checked /> <span><strong>Fullscreen surface</strong><em>Dedicate the workspace viewport to the app.</em></span></label>
+                  <label class="setting-checkbox"><input id="appModeAutoStart" type="checkbox" checked /> <span><strong>Auto-start</strong><em>Boot the app when the workspace opens.</em></span></label>
+                  <label class="setting-checkbox"><input id="appModePreserveState" type="checkbox" checked /> <span><strong>Preserve state</strong><em>Keep app state when leaving App Mode.</em></span></label>
+                  <label class="setting-checkbox"><input id="appModeShowLoading" type="checkbox" checked /> <span><strong>Loading overlay</strong><em>Show startup progress while routes hydrate.</em></span></label>
+                </div>
+                <details class="advanced-settings">
+                  <summary><span>Advanced options</span><i data-lucide="chevron-down"></i></summary>
+                  <div class="advanced-grid">
+                    <div class="setting-field">
+                      <label for="appModeExitHotkey">Exit hotkey</label>
+                      <input id="appModeExitHotkey" value="Escape" />
+                    </div>
+                    <label class="setting-checkbox compact"><input id="appModeConfirmExit" type="checkbox" /> Confirm before exiting App Mode</label>
+                    <label class="setting-checkbox compact"><input id="appModeHideChrome" type="checkbox" checked /> Hide workspace chrome while app is open</label>
+                    <label class="setting-checkbox compact"><input id="appModeAllowDebugTerminal" type="checkbox" /> Debug terminal hotkey exits to terminal</label>
+                    <div class="setting-field">
+                      <label for="appModeDebugHotkey">Debug terminal hotkey</label>
+                      <input id="appModeDebugHotkey" value="Ctrl+`" />
+                    </div>
+                    <div class="setting-field">
+                      <label for="appModePythonObject">Python app object</label>
+                      <input id="appModePythonObject" value="app" />
+                    </div>
+                    <div class="setting-field">
+                      <label for="appModeRoutePrefix">Python route prefix</label>
+                      <input id="appModeRoutePrefix" value="/" />
+                    </div>
+                    <label class="setting-checkbox compact"><input id="appModePythonFs" type="checkbox" checked /> Allow filesystem access inside Python app</label>
+                    <div class="setting-field">
+                      <label for="appModeStaticIndexFile">Static index file</label>
+                      <input id="appModeStaticIndexFile" value="index.html" />
+                    </div>
+                    <label class="setting-checkbox compact"><input id="appModeAllowInlineScripts" type="checkbox" checked /> Allow inline scripts in static apps</label>
+                  </div>
+                </details>
+              </section>
+
+              <section id="settingsBrowserModule" class="settings-module">
+                <div class="module-heading">
+                  <div>
+                    <span>Diagnostics</span>
+                    <h2>Browser Data</h2>
+                  </div>
+                  <div class="module-actions">
+                    <button id="browserClearCookies" class="icon-button button-ghost"><i data-lucide="cookie"></i>Cookies</button>
+                    <button id="browserClearStorage" class="icon-button button-ghost"><i data-lucide="database"></i>Storage</button>
+                    <button id="browserClearCache" class="icon-button button-ghost"><i data-lucide="eraser"></i>Cache</button>
+                    <button id="browserClearCurrentSite" class="icon-button button-secondary"><i data-lucide="trash-2"></i>Clear Site</button>
+                  </div>
+                </div>
+                <div class="diagnostics-panel">
+                  <div class="diagnostic-wide">
+                    <span>Current site</span>
+                    <strong id="browserSiteCurrentName">No active site</strong>
+                    <code id="browserSiteCurrentScope">No active site</code>
+                  </div>
+                  <div>
+                    <span>Cookies</span>
+                    <strong id="browserSiteCookieCount">0</strong>
+                  </div>
+                  <div>
+                    <span>Local</span>
+                    <strong id="browserSiteLocalStorageCount">0</strong>
+                  </div>
+                  <div>
+                    <span>Session</span>
+                    <strong id="browserSiteSessionStorageCount">0</strong>
+                  </div>
+                </div>
+                <details class="advanced-settings">
+                  <summary><span>Stored data</span><i data-lucide="chevron-down"></i></summary>
+                  <div class="site-data-grid mt-3">
+                    <div class="site-data-section">
+                      <h3>Cookies</h3>
+                      <div id="browserSiteCookies" class="site-data-list"></div>
+                    </div>
+                    <div class="site-data-section">
+                      <h3>Local Storage</h3>
+                      <div id="browserSiteLocalStorage" class="site-data-list"></div>
+                    </div>
+                    <div class="site-data-section">
+                      <h3>Session Storage</h3>
+                      <div id="browserSiteSessionStorage" class="site-data-list"></div>
+                    </div>
+                  </div>
+                  <div class="site-data-section mt-3">
+                    <h3>Stored Sites</h3>
+                    <div id="browserSiteStoredList" class="site-data-list"></div>
+                  </div>
+                </details>
+              </section>
+
+              <section id="settingsDangerModule" class="settings-module danger-module">
+                <div class="module-heading">
+                  <div>
+                    <span>Danger Zone</span>
+                    <h2>Environment Reset</h2>
+                  </div>
+                  <button id="browserClearAllData" class="icon-button button-secondary"><i data-lucide="trash"></i>Delete Browser Data</button>
+                </div>
+                <div class="danger-row">
+                  <div>
+                    <strong>Reset EdgeTerm environment</strong>
+                    <span>Deletes local workspaces, files, users, installed packages, and saved editor settings.</span>
+                  </div>
+                  <button id="settingsResetEnvironment" class="icon-button button-danger"><i data-lucide="bomb"></i>Reset Environment</button>
+                </div>
+              </section>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="appModeShell" class="hidden">
+      <div class="app-mode-frame-wrap">
+        <iframe id="appModeFrame" title="EdgeTerm App Mode" sandbox="allow-scripts allow-same-origin allow-forms allow-downloads"></iframe>
+        <div id="appModeLoading" class="app-mode-overlay hidden">
+          <div class="app-mode-card">
+            <div class="busy-spinner"></div>
+            <h2 id="appModeLoadingTitle">Starting App Mode</h2>
+            <p id="appModeLoadingMessage">Preparing workspace app...</p>
+            <div id="appModeLoadingHint" class="app-mode-hint">Press Escape to leave App Mode.</div>
+          </div>
+        </div>
+        <div id="appModeError" class="app-mode-error hidden">
+          <div class="app-mode-card">
+            <h2>App Mode failed to start</h2>
+            <p id="appModeErrorSummary">The workspace app could not be loaded.</p>
+            <pre id="appModeErrorDetail"></pre>
+            <div class="setting-actions" style="margin-top: 14px;">
+              <button id="appModeErrorBack" class="icon-button"><i data-lucide="corner-left-up"></i>Return to Workspace</button>
+              <button id="appModeErrorOpenConfig" class="icon-button"><i data-lucide="file-code-2"></i>Open Config</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <input id="rootfsPicker" class="hidden" type="file" accept=".zip,application/zip" />
+    <input id="fileUploader" class="hidden" type="file" multiple />
+    <input id="editorUploader" class="hidden" type="file" />
+    <input id="adminSnapshotImportPicker" class="hidden" type="file" accept=".zip,application/zip" />
+    <div id="notice" role="status" aria-live="polite"></div>
+    <div id="dialogHost" class="dialog-backdrop hidden" role="presentation"></div>
+    <div id="contextMenu" class="hidden">
+      <button class="context-item" data-action="open"><i data-lucide="folder-open"></i>Open</button>
+      <button class="context-item" data-action="preview"><i data-lucide="image"></i>Preview</button>
+      <button class="context-item" data-action="download"><i data-lucide="download"></i>Download</button>
+      <button class="context-item" data-action="copy"><i data-lucide="copy"></i>Copy</button>
+      <button class="context-item" data-action="cut"><i data-lucide="scissors"></i>Cut</button>
+      <button class="context-item" data-action="rename"><i data-lucide="pencil"></i>Rename</button>
+      <button class="context-item" data-action="delete"><i data-lucide="trash-2"></i>Delete</button>
+    </div>
+    <div id="editorMenuPopover" class="menu-popover hidden"></div>
+    <div id="editorCommandPalette" class="editor-modal-backdrop hidden">
+      <div class="editor-modal">
+        <input id="commandPaletteInput" placeholder="Type a command or file path" />
+        <div id="commandPaletteList" class="palette-list"></div>
+      </div>
+    </div>
+    <div id="previewModal" class="preview-modal hidden">
+      <div class="preview-shell">
+        <div class="preview-toolbar">
+          <div class="editor-toolbar-group">
+            <button id="previewOpenEditor" class="icon-only" type="button" title="Open in editor" aria-label="Open in editor"><i data-lucide="square-pen"></i></button>
+            <button id="previewDownload" class="icon-only" type="button" title="Download file" aria-label="Download file"><i data-lucide="download"></i></button>
+          </div>
+          <input id="previewPath" class="path" readonly value="/" />
+          <div class="editor-toolbar-group">
+            <button id="closePreview" class="icon-only" type="button" title="Close preview" aria-label="Close preview"><i data-lucide="x"></i></button>
+          </div>
+        </div>
+        <div id="previewStage" class="preview-stage"></div>
+      </div>
+    </div>
+      
+    <script>
+      window.EDGETERM_CLOUD_ENABLED = true;
+      window.EDGETERM_PAGE_KIND = "{{ page_kind }}";
+      window.EDGETERM_ASSET_BASE = "{{ url_for('static', filename='') }}";
+    </script>
+    <script type="module" src="{{ url_for('static', filename='assets/main.js') }}"></script>
+  </body>
+</html>

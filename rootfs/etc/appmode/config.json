@@ -1,0 +1,30 @@
+{
+  "enabled": false,
+  "runtime": "python",
+  "entrypoint": "/home/user/app.py",
+  "staticRoot": "/home/user/public",
+  "workingDirectory": "/home/user",
+  "fullscreen": true,
+  "autoStart": true,
+  "preserveStateOnExit": true,
+  "showLoadingOverlay": true,
+  "exit": {
+    "method": "hotkey",
+    "hotkey": "Escape",
+    "confirmBeforeExit": false
+  },
+  "ui": {
+    "hideWorkspaceChrome": true,
+    "allowDebugTerminal": false,
+    "debugTerminalHotkey": "Ctrl+`"
+  },
+  "python": {
+    "appObject": "app",
+    "routePrefix": "/",
+    "allowFilesystemAccess": true
+  },
+  "static": {
+    "indexFile": "index.html",
+    "allowInlineScripts": true
+  }
+}

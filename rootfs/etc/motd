@@ -1,0 +1,19 @@
+
+
+
+
+Welcome to EdgeTerm
+
+ * GitHub:         https://github.com/EdwardLab
+ * Donate:         https://edwarddev.com/donate
+
+System information:
+
+ Kernel:       EdgeTerm kernel 
+ User:         user
+ Shell:        EdgeTerm shell v0.2
+ Storage:      /overlay upper layer persists changes on /
+
+Looking for the bigbox command? It's in: /bin/bigbox
+
+You can modify this message by editing: /etc/motd

@@ -13,6 +13,11 @@ function debug(message) {
 function patchLauncherSource(source) {
   return String(source)
     .replace(/^#!.*(?:\r?\n|$)/, "")
+    .replace(/^import\s+([A-Za-z_$][\w$]*)\s+from\s+["']([^"']+)["'];\s*/gm, 'const $1 = "$2";\n')
+    .replace(/^export\s+\{[^}]*\};\s*/gm, "")
+    .replace(/^export\s+const\s+/gm, "const ")
+    .replace(/^export\s+function\s+/gm, "function ")
+    .replace(/\bvar wasmBinary;/, 'var wasmBinary=Module["wasmBinary"];')
     .replace(
       /var FS_stdin_getChar=\(\)=>\{[\s\S]*?\};var TTY=/,
       `var FS_stdin_getChar=()=>{if(!FS_stdin_getChar_buffer.length){var result=null;if(globalThis.__edgetermWorkerReadLine){try{var tty=typeof TTY!="undefined"&&TTY.ttys&&TTY.ttys[1];if(tty&&tty.output&&tty.output.length){out(UTF8ArrayToString(tty.output));tty.output=[]}}catch{}result=globalThis.__edgetermWorkerReadLine();if(result!==null&&result!==undefined){result+="\\n"}}else if(ENVIRONMENT_IS_NODE){var BUFSIZE=256;var buf=Buffer.alloc(BUFSIZE);var bytesRead=0;var fd=process.stdin.fd;try{bytesRead=fs.readSync(fd,buf,0,BUFSIZE)}catch(e){if(e.toString().includes("EOF"))bytesRead=0;else throw e}if(bytesRead>0){result=buf.slice(0,bytesRead).toString("utf-8")}}else{}if(result===null||result===undefined){return null}FS_stdin_getChar_buffer=intArrayFromString(result,true)}return FS_stdin_getChar_buffer.shift()};var TTY=`
@@ -24,6 +29,10 @@ function patchLauncherSource(source) {
     .replace(
       /if\(result===null\|\|result===undefined\)break;bytesRead\+\+;buffer\[offset\+i\]=result\}/g,
       "if(result===null||result===undefined)break;bytesRead++;buffer[offset+i]=result;if(result===10)break}"
+    )
+    .replace(
+      /ws\.once\(event,listener\)\}\);const cancel=\(\)=>\{ws\.removeListener\(event,listener\);setTimeout\(resolve\)\}/g,
+      `if(typeof ws.once==="function"){ws.once(event,listener)}else if(typeof ws.addEventListener==="function"){ws.addEventListener(event,listener,{once:true})}else{ws["on"+event]=listener}});const cancel=()=>{if(typeof ws.removeListener==="function"){ws.removeListener(event,listener)}else if(typeof ws.removeEventListener==="function"){ws.removeEventListener(event,listener)}else if(typeof ws.off==="function"){ws.off(event,listener)}else if(ws["on"+event]===listener){ws["on"+event]=null}setTimeout(resolve)}`
     );
 }
 
@@ -47,7 +56,180 @@ if (Module["__edgetermStdinChar"] && Module["__edgetermStdoutChar"] && Module["_
 `;
   const normalizedSource = patchLauncherSource(source)
     .replace(/var Module\s*=\s*typeof Module\s*!=\s*['"]undefined['"]\s*\?\s*Module\s*:\s*\{\s*\}\s*;/, (m) => `${m}${ttyHook}`)
-    .replace(/var Module=typeof Module!=['"]undefined['"]\?Module:\{\};/, (m) => `${m}${ttyHook}`);
+    .replace(/var Module=typeof Module!=['"]undefined['"]\?Module:\{\};/, (m) => `${m}${ttyHook}`)
+    .replace(/var Module=typeof PHPLoader!=['"]undefined['"]\?PHPLoader:\{\};/, (m) => `${m}${ttyHook}`);
+  if (/function init\s*\(\s*RuntimeName\s*,\s*PHPLoader\s*\)/.test(normalizedSource)) {
+    const patchedSource = normalizedSource.replace(
+      /Module\["onRuntimeInitialized"\]\?\.\(\);/,
+      'Module["FS"]=FS;Module["callMain"]=callMain;Module["run"]=run;Module["onRuntimeInitialized"]?.();'
+    );
+    return async (moduleArg = {}) => {
+      const phpRunner = new Function(
+        "moduleArg",
+        "globalThis",
+        `${patchedSource}
+return new Promise((resolve, reject) => {
+  const originalAbort = moduleArg["onAbort"];
+  moduleArg["noExitRuntime"] = true;
+  moduleArg["noInitialRun"] = true;
+  moduleArg["onAbort"] = (what) => {
+    try {
+      if (typeof originalAbort === "function") originalAbort(what);
+    } catch {}
+    reject(new Error(String(what || "aborted")));
+  };
+  moduleArg["onRuntimeInitialized"] = () => resolve(moduleArg);
+  try {
+    const runtimeName = typeof WorkerGlobalScope !== "undefined" && globalThis instanceof WorkerGlobalScope ? "WORKER" : "WEB";
+    init(runtimeName, moduleArg);
+  } catch (err) {
+    reject(err);
+  }
+});`
+      );
+      const phpModule = await phpRunner(moduleArg, globalThis);
+      phpModule.__edgetermRunCli = async (args = []) => {
+        const extensionArgs = [];
+        const extensions = { ...(moduleArg.extensions || {}) };
+        try {
+          if (!extensions.intl && phpModule.FS?.analyzePath?.("/packages/php/intl.so")?.exists) {
+            extensions.intl = "/packages/php/intl.so";
+          }
+        } catch {}
+        for (const extensionPath of Object.values(extensions)) {
+          if (extensionPath) extensionArgs.push("-d", `extension=${extensionPath}`);
+        }
+        const cliArgs = [phpModule.thisProgram || moduleArg.thisProgram || "php", ...extensionArgs, ...args];
+        for (const arg of cliArgs) phpModule.ccall("wasm_add_cli_arg", "number", ["string"], [String(arg)]);
+        try {
+          const result = phpModule.ccall("run_cli", "number", [], [], { async: true });
+          return Number((result && typeof result.then === "function" ? await result : result) || 0);
+        } catch (err) {
+          if (
+            err?.name === "ExitStatus" ||
+            err?.constructor?.name === "ExitStatus" ||
+            typeof err?.status === "number" ||
+            typeof err?.code === "number"
+          ) {
+            return Number(err.status ?? err.code ?? 0);
+          }
+          throw err;
+        }
+      };
+      phpModule.__edgetermRunSapiRequest = async (request = {}) => {
+        if (!phpModule.__edgetermWebSapiInitialized) {
+          try {
+            phpModule.ccall("wasm_set_sapi_name", "number", ["string"], ["apache"]);
+          } catch {}
+          const initResult = phpModule.ccall("php_wasm_init", "number", [], [], { async: true });
+          if (initResult && typeof initResult.then === "function") await initResult;
+          phpModule.__edgetermWebSapiInitialized = true;
+        }
+        const callString = (name, value) => phpModule.ccall(name, "number", ["string"], [String(value ?? "")]);
+        const callNumber = (name, value) => phpModule.ccall(name, "number", ["number"], [Number(value || 0)]);
+        const addServer = (name, value) => phpModule.ccall("wasm_add_SERVER_entry", "number", ["string", "string"], [String(name), String(value ?? "")]);
+        const unlinkIfExists = (path) => {
+          try {
+            if (phpModule.FS?.analyzePath?.(path)?.exists) phpModule.FS.unlink(path);
+          } catch {}
+        };
+        const collectText = (chunks) => {
+          const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+          const bytes = new Uint8Array(length);
+          let offset = 0;
+          for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.length;
+          }
+          return new TextDecoder().decode(bytes);
+        };
+        const stdoutChunks = [];
+        const stderrChunks = [];
+        const headerChunks = [];
+        const previousStdout = phpModule.onStdout;
+        const previousStderr = phpModule.onStderr;
+        const previousHeaders = phpModule.onHeaders;
+        phpModule.onStdout = (chunk) => stdoutChunks.push(new Uint8Array(chunk || []));
+        phpModule.onStderr = (chunk) => stderrChunks.push(new Uint8Array(chunk || []));
+        phpModule.onHeaders = (chunk) => headerChunks.push(new Uint8Array(chunk || []));
+        let bodyPtr = 0;
+        try {
+          unlinkIfExists("/internal/stdout");
+          unlinkIfExists("/internal/stderr");
+          unlinkIfExists("/internal/headers.json");
+          callString("wasm_set_path_translated", request.scriptFilename || "");
+          callString("wasm_set_request_uri", request.requestUri || "/");
+          callString("wasm_set_request_method", request.method || "GET");
+          callString("wasm_set_request_host", request.serverName || "edgeterm.local");
+          callString("wasm_set_query_string", request.query || "");
+          callString("wasm_set_content_type", request.contentType || "");
+          const bodyBytes = request.bodyBase64
+            ? Uint8Array.from(atob(String(request.bodyBase64 || "")), (char) => char.charCodeAt(0))
+            : new TextEncoder().encode(String(request.body || ""));
+          if (bodyBytes.length) {
+            const malloc = phpModule.malloc || phpModule._malloc;
+            bodyPtr = malloc(bodyBytes.length || 1);
+            phpModule.HEAPU8.set(bodyBytes, bodyPtr);
+            callNumber("wasm_set_request_body", bodyPtr);
+          }
+          callNumber("wasm_set_content_length", bodyBytes.length);
+          callString("wasm_set_cookies", request.cookie || "");
+          callNumber("wasm_set_request_port", Number(request.serverPort || 443));
+          addServer("DOCUMENT_ROOT", request.documentRoot || "");
+          addServer("SCRIPT_FILENAME", request.scriptFilename || "");
+          addServer("SCRIPT_NAME", request.scriptName || "");
+          addServer("PHP_SELF", request.scriptName || "");
+          addServer("PATH_INFO", request.pathInfo || "");
+          addServer("PATH_TRANSLATED", request.pathInfo ? `${request.documentRoot || ""}${request.pathInfo}` : "");
+          addServer("REQUEST_URI", request.requestUri || "/");
+          addServer("REQUEST_METHOD", request.method || "GET");
+          addServer("QUERY_STRING", request.query || "");
+          addServer("SERVER_NAME", request.serverName || "edgeterm.local");
+          addServer("SERVER_PORT", request.serverPort || "443");
+          addServer("SERVER_PROTOCOL", "HTTP/1.1");
+          addServer("HTTPS", "on");
+          addServer("REMOTE_ADDR", "127.0.0.1");
+          for (const [name, value] of Object.entries(request.headers || {})) {
+            const lower = String(name).toLowerCase();
+            const key = ["content-type", "content-length"].includes(lower) ? lower.toUpperCase().replace(/-/g, "_") : "HTTP_" + String(name).toUpperCase().replace(/-/g, "_");
+            addServer(key, value);
+          }
+          const result = phpModule.ccall("wasm_sapi_handle_request", "number", [], [], { async: true });
+          const code = Number((result && typeof result.then === "function" ? await result : result) || 0);
+          try {
+            const shutdownResult = phpModule.ccall("wasm_sapi_request_shutdown", "number", [], [], { async: true });
+            if (shutdownResult && typeof shutdownResult.then === "function") await shutdownResult;
+          } catch {}
+          const headersJson = phpModule.FS?.analyzePath?.("/internal/headers.json")?.exists
+            ? new TextDecoder().decode(phpModule.FS.readFile("/internal/headers.json"))
+            : "";
+          const stdoutFile = phpModule.FS?.analyzePath?.("/internal/stdout")?.exists
+            ? new TextDecoder().decode(phpModule.FS.readFile("/internal/stdout"))
+            : "";
+          const stderrFile = phpModule.FS?.analyzePath?.("/internal/stderr")?.exists
+            ? new TextDecoder().decode(phpModule.FS.readFile("/internal/stderr"))
+            : "";
+          return {
+            code,
+            stdout: stdoutFile || collectText(stdoutChunks),
+            stderr: stderrFile || collectText(stderrChunks),
+            headers: collectText(headerChunks),
+            headersJson,
+          };
+        } finally {
+          phpModule.onStdout = previousStdout;
+          phpModule.onStderr = previousStderr;
+          phpModule.onHeaders = previousHeaders;
+          if (bodyPtr) {
+            try {
+              (phpModule.free || phpModule._wasm_free || phpModule._free)?.(bodyPtr);
+            } catch {}
+          }
+        }
+      };
+      return phpModule;
+    };
+  }
   if (/var wasmExports;/.test(normalizedSource) && /createWasm\s*\(\s*\)\s*;/.test(normalizedSource) && /run\s*\(\s*\)\s*;/.test(normalizedSource)) {
     const patchedSource = normalizedSource
       .replace(/var Module\s*=\s*typeof Module\s*!=\s*['"]undefined['"]\s*\?\s*Module\s*:\s*\{\s*\}\s*;/, "var Module = moduleArg || {};")
@@ -198,6 +380,8 @@ self.onmessage = async (event) => {
     let pendingDisplay = "";
     const stdout = [];
     const stderr = [];
+    let streamOutput = data.streamOutput === true && String(data?.env?.EDGETERM_PHP_STREAM || "") !== "0";
+    let streamedOutput = false;
     let stdinQueue = [];
 
     ttyBrokerUrl = data.ttyBrokerUrl || "";
@@ -245,6 +429,10 @@ self.onmessage = async (event) => {
       const chunk = String.fromCharCode(code);
       stdout.push(chunk);
       pendingDisplay += chunk;
+      if (streamOutput) {
+        streamedOutput = true;
+        self.postMessage({ type: "stream", stream: "stdout", text: chunk });
+      }
     };
 
     const stderrOutput = (code) => {
@@ -252,6 +440,10 @@ self.onmessage = async (event) => {
       const chunk = String.fromCharCode(code);
       stderr.push(chunk);
       pendingDisplay += chunk;
+      if (streamOutput) {
+        streamedOutput = true;
+        self.postMessage({ type: "stream", stream: "stderr", text: chunk });
+      }
     };
 
     const factory = createWasmRuntimeModuleFactory(data.launcherSource);
@@ -261,12 +453,19 @@ self.onmessage = async (event) => {
       noInitialRun: true,
       arguments: [...(data.args || [])],
       thisProgram: data.thisProgram,
+      extensions: data.extensions || {},
       ENV: { ...(data.env || {}), PWD: data.cwd || "/" },
       wasmBinary: new Uint8Array(data.wasmBytes),
       locateFile: (path) => `${data.packageRoot}/${path}`,
       __edgetermStdinChar: stdinInput,
       __edgetermStdoutChar: stdoutOutput,
       __edgetermStderrChar: stderrOutput,
+      onStdout: (chunk) => {
+        for (const code of chunk || []) stdoutOutput(code);
+      },
+      onStderr: (chunk) => {
+        for (const code of chunk || []) stderrOutput(code);
+      },
       print: (text) => {
         const chunk = String(text);
         stdout.push(chunk);
@@ -292,7 +491,22 @@ self.onmessage = async (event) => {
     let code = 0;
     try {
       debug(`${command}: callMain`);
-      if (typeof moduleInstance.callMain === "function") moduleInstance.callMain([...(data.args || [])]);
+      if (data.phpRequest && typeof moduleInstance.__edgetermRunSapiRequest === "function") {
+        try {
+          const response = await moduleInstance.__edgetermRunSapiRequest(data.phpRequest || {});
+          stdout.length = 0;
+          stderr.length = 0;
+          stdout.push(JSON.stringify(response));
+          code = Number(response.code || 0);
+        } catch (sapiErr) {
+          stdout.length = 0;
+          stderr.length = 0;
+          stderr.push(`SAPI request failed, falling back to CLI: ${sapiErr?.message || sapiErr}\n`);
+          code = await moduleInstance.__edgetermRunCli([...(data.args || [])]);
+          data.phpRequest = null;
+        }
+      } else if (typeof moduleInstance.__edgetermRunCli === "function") code = await moduleInstance.__edgetermRunCli([...(data.args || [])]);
+      else if (typeof moduleInstance.callMain === "function") moduleInstance.callMain([...(data.args || [])]);
       else if (typeof moduleInstance.main === "function") code = Number(moduleInstance.main([...(data.args || [])]) || 0);
       else throw new Error("package did not expose callMain() or main()");
       debug(`${command}: main returned`);
@@ -322,11 +536,12 @@ self.onmessage = async (event) => {
     self.postMessage({
       type: "done",
       code,
-      stdout: stdout.join(""),
-      stderr: stderr.join(""),
+      stdout: streamedOutput ? "" : stdout.join(""),
+      stderr: streamedOutput ? "" : stderr.join(""),
       fsEntries,
-      tailDisplay: pendingDisplay,
-      streamed: interactiveRequested,
+      tailDisplay: streamedOutput ? "" : pendingDisplay,
+      streamed: interactiveRequested || streamedOutput,
+      sapi: !!data.phpRequest,
     });
   } catch (err) {
     self.postMessage({

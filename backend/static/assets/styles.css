@@ -567,6 +567,85 @@
         background: transparent;
       }
 
+      .file-dropzone {
+        position: absolute;
+        inset: 72px 18px 18px 18px;
+        z-index: 24;
+        display: grid;
+        place-items: center;
+        border: 2px dashed rgba(37, 99, 235, 0.45);
+        border-radius: 20px;
+        background: rgba(243, 247, 251, 0.82);
+        backdrop-filter: blur(10px);
+        pointer-events: none;
+      }
+
+      .file-dropzone-card {
+        display: grid;
+        gap: 6px;
+        justify-items: center;
+        padding: 22px 28px;
+        border: 1px solid rgba(37, 99, 235, 0.16);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.92);
+        box-shadow: 0 18px 48px rgba(37, 99, 235, 0.1);
+        color: var(--text);
+      }
+
+      .file-dropzone-card strong {
+        font-size: 16px;
+        font-weight: 800;
+      }
+
+      .file-dropzone-card span {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      .file-upload-progress {
+        display: grid;
+        gap: 8px;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.86);
+      }
+
+      .file-upload-progress-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .file-upload-progress-head strong {
+        font-size: 13px;
+        font-weight: 800;
+      }
+
+      .file-upload-progress-head span,
+      .file-upload-progress-meta {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .file-upload-progress-track {
+        width: 100%;
+        height: 8px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.24);
+      }
+
+      .file-upload-progress-fill {
+        width: 0%;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #0ea5e9, #2563eb);
+        transition: width 120ms linear;
+      }
+
       .marquee-box {
         position: absolute;
         z-index: 20;
@@ -1620,8 +1699,43 @@
         visibility: hidden;
       }
 
+      #appModeShell.has-address-bar {
+        grid-template-rows: auto 1fr;
+      }
+
       #appModeShell.hidden {
         display: none !important;
+      }
+
+      .app-mode-address-bar {
+        display: grid;
+        grid-template-columns: 36px minmax(0, 1fr) 36px;
+        gap: 8px;
+        align-items: center;
+        min-height: 50px;
+        padding: 8px 12px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+        background: rgba(15, 23, 42, 0.96);
+      }
+
+      .app-mode-address-bar.hidden {
+        display: none !important;
+      }
+
+      .app-mode-address-bar .path {
+        min-width: 0;
+        height: 34px;
+        border-color: rgba(148, 163, 184, 0.3);
+        background: rgba(255, 255, 255, 0.96);
+        color: #0f172a;
+        font: 13px/1.3 "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+
+      .app-mode-address-bar .icon-only {
+        width: 36px;
+        height: 34px;
+        border-color: rgba(148, 163, 184, 0.26);
+        color: #e5e7eb;
       }
 
       .app-mode-frame-wrap {
@@ -1772,11 +1886,56 @@
         opacity: 1;
       }
 
+      #notice.progress {
+        display: grid;
+        gap: 8px;
+      }
+
+      .notice-progress-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .notice-progress-head strong {
+        font-size: 13px;
+        font-weight: 800;
+      }
+
+      .notice-progress-head span,
+      .notice-progress-meta {
+        color: rgba(15, 23, 42, 0.68);
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .notice-progress-track {
+        width: 100%;
+        height: 8px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.24);
+      }
+
+      .notice-progress-fill {
+        width: 0%;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #38bdf8, #2563eb);
+        transition: width 120ms linear;
+      }
+
       body[data-theme="dark"] #notice {
         background: rgba(7, 17, 31, 0.96);
         border-color: rgba(96, 165, 250, 0.34);
         color: #eef5ff;
         box-shadow: 0 18px 40px rgba(2, 6, 23, 0.42);
+      }
+
+      body[data-theme="dark"] .notice-progress-head span,
+      body[data-theme="dark"] .notice-progress-meta {
+        color: rgba(226, 232, 240, 0.78);
       }
 
       .icon-button {
@@ -2113,6 +2272,19 @@
         font: 12px/1.45 "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
       }
 
+      .storage-action-grid {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .storage-action-grid .icon-button {
+        justify-content: center;
+        min-width: 0;
+        white-space: normal;
+        text-align: center;
+      }
+
       .diagnostics-panel {
         grid-template-columns: minmax(260px, 1.6fr) repeat(3, minmax(110px, 0.5fr));
       }
@@ -2139,6 +2311,41 @@
         border: 1px solid var(--line);
         border-radius: 14px;
         background: rgba(255, 255, 255, 0.52);
+      }
+
+      .config-explainer {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 1px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--line);
+      }
+
+      .config-explainer > div {
+        min-width: 0;
+        padding: 16px;
+        background: rgba(255, 255, 255, 0.6);
+      }
+
+      .config-explainer strong {
+        display: block;
+        color: var(--text);
+        font-size: 13px;
+        font-weight: 800;
+      }
+
+      .config-explainer p {
+        margin: 6px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .config-explainer code {
+        color: var(--text);
+        font: 12px/1.45 "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
       }
 
       .runtime-config-block .setting-field:nth-child(2),
@@ -2343,6 +2550,7 @@
       body[data-theme="dark"] .workspace-glyph,
       body[data-theme="dark"] .metadata-grid div,
       body[data-theme="dark"] .diagnostics-panel > div,
+      body[data-theme="dark"] .config-explainer > div,
       body[data-theme="dark"] .runtime-config-block,
       body[data-theme="dark"] .settings-module .setting-checkbox {
         background: rgba(13, 24, 42, 0.62);
@@ -2783,6 +2991,8 @@
 
         .metadata-grid,
         .diagnostics-panel,
+        .config-explainer,
+        .storage-action-grid,
         .runtime-config-block,
         .toggle-grid,
         .advanced-grid {

@@ -16,10 +16,13 @@
   "ui": {
     "hideWorkspaceChrome": true,
     "allowDebugTerminal": false,
-    "debugTerminalHotkey": "Ctrl+`"
+    "debugTerminalHotkey": "Ctrl+`",
+    "showAddressBar": false
   },
   "python": {
     "appObject": "app",
+    "appSpec": "app:app",
+    "framework": "flask",
     "routePrefix": "/",
     "allowFilesystemAccess": true
   },

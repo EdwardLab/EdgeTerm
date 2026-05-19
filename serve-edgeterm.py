@@ -1094,7 +1094,7 @@ class EdgeTermHandler(SimpleHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
-        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
+        self.send_header("Cross-Origin-Embedder-Policy", "credentialless")
         self.send_header("Origin-Agent-Cluster", "?1")
         self.send_header("Permissions-Policy", "cross-origin-isolated=(self)")
         self.send_header("X-Content-Type-Options", "nosniff")

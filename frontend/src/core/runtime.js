@@ -19,7 +19,9 @@ export function bootstrapEdgeTerm() {
       const ISOLATED_WORKSPACE_STORAGE_KEY = "edgeterm.workspaceStorage.isolated.v1";
       const APPMODE_COOKIE_STORE_KEY = "edgeterm.appmode.cookies.v1";
       const APPMODE_SITE_DATA_STORE_KEY = "edgeterm.appmode.siteData.v1";
-        const DEFAULT_ROOTFS_VERSION = "EdgeTerm django-isolate-v57";
+      const ROOTFS_IDB_PRUNE_KEY = "edgeterm.rootfsIdbPruned.v1";
+const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
+      const SYSTEM_ROOTFS_PATH = "/edgeterm-system-rootfs";
       const DEFAULT_APP_MODE_CONFIG = {
         enabled: false,
         runtime: "python",
@@ -39,11 +41,12 @@ export function bootstrapEdgeTerm() {
           hideWorkspaceChrome: true,
           allowDebugTerminal: false,
           debugTerminalHotkey: "Ctrl+`",
+          showAddressBar: false,
         },
         python: {
           appObject: "app",
-          appSpec: "",
-          framework: "edgeterm",
+          appSpec: "app:app",
+          framework: "flask",
           routePrefix: "/",
           allowFilesystemAccess: true,
         },
@@ -58,6 +61,7 @@ export function bootstrapEdgeTerm() {
         "bin",
         "boot",
         "dev",
+        "edgeterm-system-rootfs",
         "etc",
         "home",
         "lib",
@@ -73,6 +77,10 @@ export function bootstrapEdgeTerm() {
       ]);
       const WORKSPACE_JOURNAL_DB = "edgeterm.workspaceJournal.v1";
       const WORKSPACE_JOURNAL_STORE = "entries";
+      const LOCAL_WORKSPACE_HANDLE_DB = "edgeterm.localWorkspaceHandles.v1";
+      const LOCAL_WORKSPACE_HANDLE_STORE = "handles";
+      const LOCAL_WORKSPACE_ARCHIVE = "edgeterm-workspace.zip";
+      const LOCAL_WORKSPACE_META = "edgeterm-workspace.json";
 
         let pyodide;
         let term;
@@ -111,6 +119,8 @@ export function bootstrapEdgeTerm() {
       let workspaceFlushInFlight = null;
       let pendingWorkspaceFlushAfterInFlight = false;
       let workspaceJournalDbPromise = null;
+      let localWorkspaceHandleDbPromise = null;
+      let syncingLocalWorkspaceId = "";
       let workspaceJournalFlushTimeout = null;
       let workspaceJournalFlushInFlight = null;
       let pendingWorkspaceJournalFlushAfterInFlight = false;
@@ -144,7 +154,9 @@ export function bootstrapEdgeTerm() {
       let contextTargetPath = "";
       let marqueeState = null;
       let suppressFileClick = false;
+      let fileDragDepth = 0;
       let displayInputQueue = [];
+      let displayInputPump = null;
       let displayMessageHistory = [];
       let displayState = {
         mode: "empty",
@@ -178,6 +190,7 @@ export function bootstrapEdgeTerm() {
         browserHistoryIndex: -1,
         browserTabs: new Map(),
         activeBrowserTabId: "",
+        webSockets: new Map(),
       };
 
       const DEFAULT_TOS_HTML = `
@@ -210,10 +223,44 @@ export function bootstrapEdgeTerm() {
       let noticeTimer = null;
       function showNotice(message) {
         const notice = $id("notice");
-        notice.textContent = message;
+        const text = String(message ?? "").trim() || "Operation failed. See DevTools console for details.";
+        notice.textContent = text;
+        notice.classList.remove("progress");
         notice.classList.add("show");
         clearTimeout(noticeTimer);
         noticeTimer = setTimeout(() => notice.classList.remove("show"), 2600);
+      }
+
+      function showProgressNotice({ label = "Working...", current = 0, total = 0, detail = "" } = {}) {
+        const notice = $id("notice");
+        const safeCurrent = Math.max(0, Number(current) || 0);
+        const safeTotal = Math.max(safeCurrent, Number(total) || 0);
+        const percent = safeTotal > 0 ? Math.min(100, Math.round((safeCurrent / safeTotal) * 100)) : 0;
+        notice.innerHTML = `
+          <div class="notice-progress-head">
+            <strong></strong>
+            <span></span>
+          </div>
+          <div class="notice-progress-track">
+            <div class="notice-progress-fill"></div>
+          </div>
+          <div class="notice-progress-meta"></div>
+        `;
+        notice.querySelector("strong").textContent = label;
+        notice.querySelector("span").textContent = `${percent}%`;
+        notice.querySelector(".notice-progress-fill").style.width = `${percent}%`;
+        notice.querySelector(".notice-progress-meta").textContent = detail || `${safeCurrent} / ${safeTotal}`;
+        notice.classList.add("progress", "show");
+        clearTimeout(noticeTimer);
+      }
+
+      function hideProgressNotice(afterMs = 500) {
+        clearTimeout(noticeTimer);
+        noticeTimer = setTimeout(() => {
+          const notice = $id("notice");
+          notice.classList.remove("show", "progress");
+          notice.textContent = "";
+        }, afterMs);
       }
 
       function downloadBlobAs(blob, filename) {
@@ -533,7 +580,7 @@ export function bootstrapEdgeTerm() {
           overlay.classList.remove("hidden");
           if (busyCount === 1) resetLoadingTransfer();
           setLoadingMessage(message);
-          showLoadingIndeterminate(message, "Preparing transfer or local processing...");
+          showLoadingIndeterminate(message, "Starting...");
           return;
         }
         busyCount = Math.max(0, busyCount - 1);
@@ -588,6 +635,26 @@ export function bootstrapEdgeTerm() {
           speed.style.visibility = speedText ? "visible" : "hidden";
         }
         if (meta) meta.textContent = detail;
+      }
+
+      function updateLoadingProgress({ current = 0, total = 0, phase = "Working...", detail = "", speedText = "" } = {}) {
+        const wrap = $id("loadingTransfer");
+        const fill = $id("loadingProgressFill");
+        const progress = $id("loadingProgressText");
+        const speed = $id("loadingSpeedText");
+        const meta = $id("loadingTransferMeta");
+        if (!wrap) return;
+        const safeCurrent = Math.max(0, Number(current) || 0);
+        const safeTotal = Math.max(safeCurrent, Number(total) || 0);
+        const percent = safeTotal > 0 ? Math.min(100, Math.round((safeCurrent / safeTotal) * 100)) : 0;
+        wrap.classList.remove("hidden", "indeterminate");
+        if (fill) fill.style.width = `${percent}%`;
+        if (progress) progress.textContent = `${percent}%`;
+        if (speed) {
+          speed.textContent = speedText;
+          speed.style.visibility = speedText ? "visible" : "hidden";
+        }
+        if (meta) meta.textContent = detail || `${phase} ${safeCurrent} / ${safeTotal}`;
       }
 
       function formatRate(bytesPerSecond) {
@@ -830,6 +897,7 @@ export function bootstrapEdgeTerm() {
       function normalizeEdgeServeRouteMode(mode) {
         const value = String(mode || "wsgi").trim().toLowerCase();
         if (value === "fastapi" || value === "starlette" || value === "asgi") return "asgi";
+        if (value === "php") return "php";
         if (value === "static") return "static";
         return "wsgi";
       }
@@ -848,6 +916,34 @@ export function bootstrapEdgeTerm() {
 
       function workspacePath(id, child = "") {
         return `/workspace-store/${id}${child}`;
+      }
+
+      function activeRootfsPath(workspace = activeWorkspace()) {
+        if (workspace?.rootfsVersion === "custom" && activeWorkspaceId) {
+          const customRootfsPath = workspacePath(activeWorkspaceId, "/rootfs");
+          if (rootfsHasEdgeTermRuntime(customRootfsPath)) return customRootfsPath;
+        }
+        return SYSTEM_ROOTFS_PATH;
+      }
+
+      function rootfsHasEdgeTermRuntime(rootfsPath) {
+        const fs = pyodide?.FS;
+        if (!fs || !rootfsPath) return false;
+        return [
+          `${rootfsPath}/bin/shell.py`,
+          `${rootfsPath}/usr/lib/edgeterm_shell.py`,
+          `${rootfsPath}/usr/lib/edgeterm_pip.py`,
+        ].every((path) => fs.analyzePath(path).exists);
+      }
+
+      function ensureWorkspaceMountPoint(id = activeWorkspaceId) {
+        ensureDir("/workspace-store");
+        ensureDir(workspacePath(id));
+        const workspace = workspaces.find((item) => item.id === id);
+        ensureDir(workspacePath(id, "/home"));
+        for (const user of workspace?.users || ["user"]) ensureDir(workspacePath(id, `/home/${user}`));
+        ensureDir(workspacePath(id, "/overlay/upper"));
+        ensureDir(workspacePath(id, "/overlay/work"));
       }
 
       function isWorkspaceStorageMounted(id) {
@@ -880,6 +976,136 @@ export function bootstrapEdgeTerm() {
         } catch {
           return false;
         }
+      }
+
+      function loadRootfsPruneMap() {
+        try {
+          return JSON.parse(localStorage.getItem(ROOTFS_IDB_PRUNE_KEY) || "{}") || {};
+        } catch {
+          return {};
+        }
+      }
+
+      function markRootfsPruned(id) {
+        const map = loadRootfsPruneMap();
+        map[id] = DEFAULT_ROOTFS_VERSION;
+        localStorage.setItem(ROOTFS_IDB_PRUNE_KEY, JSON.stringify(map));
+      }
+
+      function rootfsPruneAlreadyDone(id) {
+        return loadRootfsPruneMap()[id] === DEFAULT_ROOTFS_VERSION;
+      }
+
+      function legacyRootfsKeyMatcher(id) {
+        const escapedId = String(id || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const patterns = [
+          /^\/?rootfs(?:\/|$)/,
+          new RegExp(`^/?${escapedId}/rootfs(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/rootfs(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/?rootfs(?:/|$)`),
+        ];
+        const preservePatterns = [
+          /^\/?rootfs\/home(?:\/|$)/,
+          new RegExp(`^/?${escapedId}/rootfs/home(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/rootfs/home(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/?rootfs/home(?:/|$)`),
+        ];
+        return (key) => {
+          if (typeof key !== "string") return false;
+          const normalized = key.replaceAll("\\", "/").replace(/^\/+/, "");
+          if (preservePatterns.some((pattern) => pattern.test(normalized) || pattern.test(`/${normalized}`))) return false;
+          return patterns.some((pattern) => pattern.test(normalized) || pattern.test(`/${normalized}`));
+        };
+      }
+
+      function idbEntryPath(value) {
+        if (!value || typeof value !== "object") return "";
+        return String(value.path || value.name || value.filename || value.key || "");
+      }
+
+      function idbRequest(request) {
+        return new Promise((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      }
+
+      async function idbDatabaseNamesForWorkspace(id) {
+        const names = new Set([
+          `EM_FS_${workspacePath(id)}`,
+          `EM_FS_/workspace-store`,
+        ]);
+        if (indexedDB.databases) {
+          try {
+            for (const db of await indexedDB.databases()) {
+              if (db?.name && /EM_FS_|workspace-store/.test(db.name)) names.add(db.name);
+            }
+          } catch {}
+        }
+        return [...names];
+      }
+
+      async function pruneRootfsEntriesFromIdbDatabase(dbName, shouldDeleteKey) {
+        const db = await new Promise((resolve) => {
+          const request = indexedDB.open(dbName);
+          request.onerror = () => resolve(null);
+          request.onupgradeneeded = () => {
+            request.transaction?.abort?.();
+            resolve(null);
+          };
+          request.onsuccess = () => resolve(request.result);
+        });
+        if (!db || !db.objectStoreNames.contains("FILE_DATA")) {
+          try {
+            db?.close?.();
+          } catch {}
+          return 0;
+        }
+        try {
+          return await new Promise((resolve, reject) => {
+            let deleted = 0;
+            const tx = db.transaction("FILE_DATA", "readwrite");
+            const store = tx.objectStore("FILE_DATA");
+            const cursorRequest = store.openCursor();
+            cursorRequest.onerror = () => reject(cursorRequest.error);
+            cursorRequest.onsuccess = () => {
+              const cursor = cursorRequest.result;
+              if (!cursor) return;
+              if (shouldDeleteKey(cursor.key) || shouldDeleteKey(idbEntryPath(cursor.value))) {
+                cursor.delete();
+                deleted += 1;
+              }
+              cursor.continue();
+            };
+            tx.oncomplete = () => resolve(deleted);
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error || new Error("IndexedDB rootfs prune aborted"));
+          });
+        } finally {
+          try {
+            db.close();
+          } catch {}
+        }
+      }
+
+      async function prunePersistedDefaultRootfsBeforeMount(id) {
+        const workspace = workspaces.find((item) => item.id === id);
+        if (!id || workspace?.transient || typeof indexedDB === "undefined") return;
+        if (workspace?.rootfsVersion === "custom") {
+          return;
+        }
+        if (rootfsPruneAlreadyDone(id)) return;
+        const shouldDeleteKey = legacyRootfsKeyMatcher(id);
+        let deleted = 0;
+        for (const dbName of await idbDatabaseNamesForWorkspace(id)) {
+          try {
+            deleted += await pruneRootfsEntriesFromIdbDatabase(dbName, shouldDeleteKey);
+          } catch (err) {
+            console.warn(`[BOOT] IndexedDB rootfs prune skipped for ${dbName}:`, err);
+          }
+        }
+        if (deleted) console.info(`[BOOT] Pruned ${deleted} persisted default rootfs entries before workspace mount.`);
+        markRootfsPruned(id);
       }
 
       async function migrateLegacyWorkspaceStorage(id) {
@@ -928,6 +1154,60 @@ export function bootstrapEdgeTerm() {
         markWorkspaceStorageIsolated(id);
       }
 
+      async function recoverLegacyHomesFromSharedStore(id) {
+        if (!id || !isWorkspaceStorageIsolated(id)) return "";
+        const recoveryTempPath = `/tmp/edgeterm-home-recover-${id}`;
+        ensureDir("/tmp");
+        removeTree(recoveryTempPath);
+        ensureDir(recoveryTempPath);
+
+        let copied = false;
+        try {
+          ensureDir("/workspace-store");
+          pyodide.FS.mount(pyodide.FS.filesystems.IDBFS, {}, "/workspace-store");
+          await syncfs(true);
+          const legacyHomeRoots = [
+            workspacePath(id, "/home"),
+            workspacePath(id, "/rootfs/home"),
+            "/workspace-store/home",
+            "/workspace-store/rootfs/home",
+          ];
+          for (const homeRoot of legacyHomeRoots) {
+            if (!pyodide.FS.analyzePath(homeRoot).exists) continue;
+            for (const user of pyodide.FS.readdir(homeRoot)) {
+              if (user === "." || user === "..") continue;
+              copied = copyTreeMissing(`${homeRoot}/${user}`, `${recoveryTempPath}/${user}`) || copied;
+            }
+          }
+        } catch (err) {
+          console.warn("[PERSIST] Legacy home recovery skipped:", err);
+        } finally {
+          try {
+            pyodide.FS.unmount("/workspace-store");
+          } catch (err) {
+            console.warn("[PERSIST] Legacy home recovery unmount skipped:", err);
+          }
+        }
+
+        if (!copied) {
+          removeTree(recoveryTempPath);
+          return "";
+        }
+        return recoveryTempPath;
+      }
+
+      function restoreRecoveredHomes(id, recoveryTempPath) {
+        if (!recoveryTempPath || !pyodide.FS.analyzePath(recoveryTempPath).exists) return false;
+        let copied = false;
+        for (const user of pyodide.FS.readdir(recoveryTempPath)) {
+          if (user === "." || user === "..") continue;
+          copied = copyTreeMissing(`${recoveryTempPath}/${user}`, workspacePath(id, `/home/${user}`)) || copied;
+        }
+        removeTree(recoveryTempPath);
+        if (copied) console.info("[PERSIST] Recovered legacy home files into isolated workspace storage.");
+        return copied;
+      }
+
       async function mountWorkspaceStorage(id, options = {}) {
         const workspace = workspaces.find((item) => item.id === id);
         if (mountedWorkspaceId && mountedWorkspaceId !== id) {
@@ -944,12 +1224,77 @@ export function bootstrapEdgeTerm() {
           return;
         }
         if (isWorkspaceStorageMounted(id)) return;
-        if (options.migrate !== false) await migrateLegacyWorkspaceStorage(id);
+        await prunePersistedDefaultRootfsBeforeMount(id);
+        const recoveredHomesPath = options.recoverLegacy === true ? await recoverLegacyHomesFromSharedStore(id) : "";
+        if (options.migrate === true) await migrateLegacyWorkspaceStorage(id);
         ensureDir("/workspace-store");
         ensureDir(workspacePath(id));
         pyodide.FS.mount(pyodide.FS.filesystems.IDBFS, {}, workspacePath(id));
         mountedWorkspaceId = id;
         if (options.load !== false) await syncfs(true);
+        if (restoreRecoveredHomes(id, recoveredHomesPath)) await syncfs(false);
+      }
+
+      async function ensureActiveWorkspaceMounted(reason = "Loading workspace files...") {
+        if (!activeWorkspaceId || isWorkspaceStorageMounted(activeWorkspaceId)) return true;
+        showNotice(reason);
+        await mountWorkspaceStorage(activeWorkspaceId);
+        await ensureWorkspaceLayout(activeWorkspaceId);
+        await restoreWorkspaceJournal(activeWorkspaceId);
+        await parkShellCwdForMount();
+        prepareActiveMounts();
+        await syncShellCwdAfterWorkspaceMount();
+        renderWorkspaces();
+        scheduleWorkspaceFlush(5000);
+        showNotice("Workspace files loaded");
+        return true;
+      }
+
+      async function parkShellCwdForMount() {
+        try {
+          pyodide?.FS?.chdir?.("/");
+        } catch {}
+        try {
+          await pyodide.runPythonAsync(`
+import builtins
+import os
+
+try:
+    os.chdir("/")
+except Exception:
+    pass
+shell = getattr(builtins, "EDGETERM_SHELL", None)
+if shell is not None:
+    shell.logical_cwd = "/"
+    shell._sync_env()
+`);
+        } catch (err) {
+          console.warn("[PERSIST] Could not park shell cwd before workspace mount:", err);
+        }
+      }
+
+      async function syncShellCwdAfterWorkspaceMount() {
+        if (!pyodide) return;
+        const target = `/home/${activeUser()}`;
+        pyodide.globals.set("__edgeterm_mount_cwd", target);
+        try {
+          await pyodide.runPythonAsync(`
+import builtins
+import os
+
+target = globals().get("__edgeterm_mount_cwd", "/home/user")
+os.makedirs(target, exist_ok=True)
+os.chdir(target)
+shell = getattr(builtins, "EDGETERM_SHELL", None)
+if shell is not None:
+    shell.logical_cwd = target
+    shell._sync_env()
+else:
+    os.environ["PWD"] = target
+`);
+        } catch (err) {
+          console.warn("[PERSIST] Could not sync shell cwd after workspace mount:", err);
+        }
       }
 
       function workspaceJournalKey(workspaceId, relativePath) {
@@ -961,6 +1306,19 @@ export function bootstrapEdgeTerm() {
         const normalizedTarget = normalizePath(target);
         if (!normalizedTarget.startsWith(root)) return "";
         return normalizePath(normalizedTarget.slice(root.length) || "/");
+      }
+
+      function workspaceRelativePathFromRuntimeTarget(target, workspaceId = activeWorkspaceId) {
+        const normalizedTarget = normalizePath(target);
+        const workspaceRelative = workspaceRelativePathFromTarget(normalizedTarget, workspaceId);
+        if (workspaceRelative) return workspaceRelative;
+        const workspace = workspaces.find((item) => item.id === workspaceId);
+        for (const user of workspace?.users || ["user"]) {
+          if (normalizedTarget === `/home/${user}` || normalizedTarget.startsWith(`/home/${user}/`)) return normalizedTarget;
+        }
+        const topLevel = normalizedTarget.split("/").filter(Boolean)[0] || "";
+        if (topLevel && isRootOverlayEntry(topLevel)) return `/overlay/upper${normalizedTarget}`;
+        return "";
       }
 
       function idbTransactionDone(tx) {
@@ -1060,6 +1418,209 @@ export function bootstrapEdgeTerm() {
         await idbTransactionDone(tx);
       }
 
+      function supportsLocalDirectoryStorage() {
+        return typeof window.showDirectoryPicker === "function" && typeof indexedDB !== "undefined";
+      }
+
+      async function openLocalWorkspaceHandleDb() {
+        if (typeof indexedDB === "undefined") return null;
+        if (!localWorkspaceHandleDbPromise) {
+          localWorkspaceHandleDbPromise = new Promise((resolve, reject) => {
+            const request = indexedDB.open(LOCAL_WORKSPACE_HANDLE_DB, 1);
+            request.onupgradeneeded = () => {
+              const db = request.result;
+              if (!db.objectStoreNames.contains(LOCAL_WORKSPACE_HANDLE_STORE)) {
+                db.createObjectStore(LOCAL_WORKSPACE_HANDLE_STORE, { keyPath: "workspaceId" });
+              }
+            };
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => {
+              localWorkspaceHandleDbPromise = null;
+              reject(request.error || new Error("Failed to open local directory handle store"));
+            };
+          }).catch((err) => {
+            console.warn("[LOCAL-DIR] Handle store unavailable:", err);
+            return null;
+          });
+        }
+        return await localWorkspaceHandleDbPromise;
+      }
+
+      async function localWorkspaceHandleRecord(workspaceId) {
+        const db = await openLocalWorkspaceHandleDb();
+        if (!db) return null;
+        const tx = db.transaction(LOCAL_WORKSPACE_HANDLE_STORE, "readonly");
+        const store = tx.objectStore(LOCAL_WORKSPACE_HANDLE_STORE);
+        const record = await new Promise((resolve, reject) => {
+          const request = store.get(workspaceId);
+          request.onsuccess = () => resolve(request.result || null);
+          request.onerror = () => reject(request.error || new Error("Failed to read local directory handle"));
+        });
+        await idbTransactionDone(tx);
+        return record;
+      }
+
+      async function saveLocalWorkspaceHandle(workspaceId, handle) {
+        const db = await openLocalWorkspaceHandleDb();
+        if (!db) return false;
+        const tx = db.transaction(LOCAL_WORKSPACE_HANDLE_STORE, "readwrite");
+        tx.objectStore(LOCAL_WORKSPACE_HANDLE_STORE).put({ workspaceId, handle, name: handle?.name || "Local directory", updatedAt: Date.now() });
+        await idbTransactionDone(tx);
+        return true;
+      }
+
+      async function deleteLocalWorkspaceHandle(workspaceId) {
+        const db = await openLocalWorkspaceHandleDb();
+        if (!db) return;
+        const tx = db.transaction(LOCAL_WORKSPACE_HANDLE_STORE, "readwrite");
+        tx.objectStore(LOCAL_WORKSPACE_HANDLE_STORE).delete(workspaceId);
+        await idbTransactionDone(tx);
+      }
+
+      async function requestDirectoryPermission(handle, write = true) {
+        if (!handle) return false;
+        const options = write ? { mode: "readwrite" } : { mode: "read" };
+        if ((await handle.queryPermission?.(options)) === "granted") return true;
+        return (await handle.requestPermission?.(options)) === "granted";
+      }
+
+      async function getLocalWorkspaceHandle(workspaceId = activeWorkspaceId, options = {}) {
+        const workspace = workspaces.find((item) => item.id === workspaceId);
+        if (!workspace || workspace.storageType !== "local-directory") return null;
+        const record = await localWorkspaceHandleRecord(workspaceId);
+        const handle = record?.handle || null;
+        if (!handle) return null;
+        if (options.permission === false) return handle;
+        const allowed = await requestDirectoryPermission(handle, options.write !== false);
+        return allowed ? handle : null;
+      }
+
+      async function writeLocalDirectoryFile(handle, name, blob) {
+        const fileHandle = await handle.getFileHandle(name, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      }
+
+      async function readLocalDirectoryFile(handle, name) {
+        const fileHandle = await handle.getFileHandle(name, { create: false });
+        return await fileHandle.getFile();
+      }
+
+      async function localDirectoryFileExists(handle, name) {
+        try {
+          await handle.getFileHandle(name, { create: false });
+          return true;
+        } catch (err) {
+          if (err?.name === "NotFoundError" || isNotFoundError(err)) return false;
+          throw err;
+        }
+      }
+
+      async function removeLocalDirectoryEntry(handle, name, options = {}) {
+        try {
+          await handle.removeEntry(name, { recursive: !!options.recursive });
+        } catch (err) {
+          if (err?.name !== "NotFoundError" && !isNotFoundError(err)) throw err;
+        }
+      }
+
+      async function readLocalWorkspaceMeta(handle) {
+        const file = await readLocalDirectoryFile(handle, LOCAL_WORKSPACE_META).catch(() => null);
+        if (!file) return {};
+        try {
+          return JSON.parse(await file.text()) || {};
+        } catch {
+          return {};
+        }
+      }
+
+      async function writeLocalWorkspaceMeta(handle, meta) {
+        await writeLocalDirectoryFile(handle, LOCAL_WORKSPACE_META, new Blob([`${JSON.stringify(meta, null, 2)}\n`], { type: "application/json" }));
+      }
+
+      function joinFsPath(base, name) {
+        return normalizePath(`${base === "/" ? "" : base}/${name}`);
+      }
+
+      async function writeFsTreeToLocalDirectory(sourcePath, handle, progressState = null, options = {}) {
+        const fs = pyodide.FS;
+        const stat = fs.lstat(sourcePath);
+        if (!fs.isDir(stat.mode) || fs.isLink(stat.mode)) return;
+
+        const sourceEntries = fs.readdir(sourcePath).filter((entry) => entry !== "." && entry !== "..");
+        const sourceEntrySet = new Set(sourceEntries);
+        if (options.prune !== false) {
+          for await (const [name] of handle.entries()) {
+            if (name === LOCAL_WORKSPACE_META || name === LOCAL_WORKSPACE_ARCHIVE) continue;
+            if (!sourceEntrySet.has(name)) await removeLocalDirectoryEntry(handle, name, { recursive: true });
+          }
+        }
+
+        for (const entry of sourceEntries) {
+          const childPath = joinFsPath(sourcePath, entry);
+          const childStat = fs.lstat(childPath);
+          if (fs.isDir(childStat.mode) && !fs.isLink(childStat.mode)) {
+            const childHandle = await handle.getDirectoryHandle(entry, { create: true });
+            await writeFsTreeToLocalDirectory(childPath, childHandle, progressState, { prune: true });
+            continue;
+          }
+          const fileHandle = await handle.getFileHandle(entry, { create: true });
+          const writable = await fileHandle.createWritable();
+          const bytes = fs.readFile(childPath);
+          await writable.write(bytes);
+          await writable.close();
+          if (progressState) {
+            progressState.completedFiles = (progressState.completedFiles || 0) + 1;
+            progressState.completedBytes = (progressState.completedBytes || 0) + bytes.byteLength;
+            await renderSyncProgress(progressState, childPath);
+          }
+        }
+      }
+
+      async function countLocalDirectoryTreeStats(handle) {
+        const stats = { entries: 0, files: 0, bytes: 0 };
+        for await (const [name, entryHandle] of handle.entries()) {
+          if (name === LOCAL_WORKSPACE_META || name === LOCAL_WORKSPACE_ARCHIVE) continue;
+          stats.entries += 1;
+          if (entryHandle.kind === "directory") {
+            const child = await countLocalDirectoryTreeStats(entryHandle);
+            stats.entries += child.entries;
+            stats.files += child.files;
+            stats.bytes += child.bytes;
+            continue;
+          }
+          if (entryHandle.kind !== "file") continue;
+          const file = await entryHandle.getFile();
+          stats.files += 1;
+          stats.bytes += Number(file.size) || 0;
+        }
+        return stats;
+      }
+
+      async function readLocalDirectoryTreeIntoFs(handle, targetPath, options = {}) {
+        ensureDir(targetPath);
+        if (options.clear !== false) clearDirectory(targetPath);
+        for await (const [name, entryHandle] of handle.entries()) {
+          if (name === LOCAL_WORKSPACE_META || name === LOCAL_WORKSPACE_ARCHIVE) continue;
+          const childTarget = joinFsPath(targetPath, name);
+          if (entryHandle.kind === "directory") {
+            await readLocalDirectoryTreeIntoFs(entryHandle, childTarget, { clear: false, progressState: options.progressState });
+            continue;
+          }
+          if (entryHandle.kind !== "file") continue;
+          const file = await entryHandle.getFile();
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          ensureDir(childTarget.split("/").slice(0, -1).join("/") || "/");
+          pyodide.FS.writeFile(childTarget, bytes);
+          if (options.progressState) {
+            options.progressState.completedFiles = (options.progressState.completedFiles || 0) + 1;
+            options.progressState.completedBytes = (options.progressState.completedBytes || 0) + bytes.byteLength;
+            await renderSyncProgress(options.progressState, childTarget);
+          }
+        }
+      }
+
       function buildWorkspaceJournalEntriesForTargets(targets, workspaceId = activeWorkspaceId, fileBytesByTarget = null) {
         const workspace = workspaces.find((item) => item.id === workspaceId);
         if (!workspace || workspace.transient) return [];
@@ -1069,7 +1630,7 @@ export function bootstrapEdgeTerm() {
         for (const target of targets.map((value) => normalizePath(value)).filter(Boolean)) {
           if (seen.has(target)) continue;
           seen.add(target);
-          const relativePath = workspaceRelativePathFromTarget(target, workspaceId);
+          const relativePath = workspaceRelativePathFromRuntimeTarget(target, workspaceId);
           if (!relativePath) continue;
           const base = {
             key: workspaceJournalKey(workspaceId, relativePath),
@@ -1101,6 +1662,42 @@ export function bootstrapEdgeTerm() {
         const entries = buildWorkspaceJournalEntriesForTargets(targets, workspaceId, fileBytesByTarget);
         if (!entries.length) return false;
         return await writeWorkspaceJournalEntries(entries);
+      }
+
+      function collectTreeTargets(path) {
+        const fs = pyodide.FS;
+        const target = normalizePath(path);
+        if (!fs.analyzePath(target).exists) return [target];
+        const targets = [target];
+        const stat = fs.lstat(target);
+        if (fs.isDir(stat.mode) && !fs.isLink(stat.mode)) {
+          for (const entry of fs.readdir(target)) {
+            if (entry === "." || entry === "..") continue;
+            targets.push(...collectTreeTargets(`${target}/${entry}`));
+          }
+        }
+        return targets;
+      }
+
+      async function persistWorkspaceHomeJournal(workspaceId = activeWorkspaceId) {
+        const workspace = workspaces.find((item) => item.id === workspaceId);
+        if (!workspace || workspace.transient) return false;
+        const targets = [];
+        for (const user of workspace.users || ["user"]) {
+          const runtimeHome = `/home/${user}`;
+          targets.push(...collectTreeTargets(runtimeHome));
+        }
+        return await persistWorkspaceMirrorTargets(targets, workspaceId);
+      }
+
+      async function persistWorkspaceStoredHomeJournal(workspaceId = activeWorkspaceId) {
+        const workspace = workspaces.find((item) => item.id === workspaceId);
+        if (!workspace || workspace.transient) return false;
+        const targets = [];
+        for (const user of workspace.users || ["user"]) {
+          targets.push(...collectTreeTargets(workspacePath(workspaceId, `/home/${user}`)));
+        }
+        return await persistWorkspaceMirrorTargets(targets, workspaceId);
       }
 
       async function flushQueuedWorkspaceJournalEntries() {
@@ -1169,6 +1766,7 @@ export function bootstrapEdgeTerm() {
         } else {
           schedulePersistActiveWorkspace(750);
         }
+        refreshFilesIfVisible(currentPath);
         return bytes;
       }
 
@@ -1177,7 +1775,8 @@ export function bootstrapEdgeTerm() {
         if (!records.length) return;
         records.sort((left, right) => left.path.localeCompare(right.path));
         for (const record of records) {
-          const target = workspacePath(workspaceId, record.path || "/");
+          const relativePath = normalizePath(record.path || "/");
+          const target = workspacePath(workspaceId, relativePath);
           if (record.kind === "delete") {
             removeTree(target);
             continue;
@@ -1216,7 +1815,7 @@ export function bootstrapEdgeTerm() {
 
         if (workspaces.length === 0) {
           const id = `ws-${Date.now()}`;
-          workspaces = [{ id, name: "Default Workspace", createdAt: Date.now(), rootfsVersion: "", users: ["user"], userName: "user" }];
+          workspaces = [{ id, name: "Default Workspace", createdAt: Date.now(), rootfsVersion: "", users: ["user"], userName: "user", storageType: "browser-storage" }];
           localStorage.setItem(WORKSPACE_KEY, JSON.stringify(workspaces));
           localStorage.setItem(ACTIVE_KEY, id);
         }
@@ -1225,6 +1824,8 @@ export function bootstrapEdgeTerm() {
           ...workspace,
           users: Array.isArray(workspace.users) && workspace.users.length ? workspace.users : ["user"],
           userName: workspace.userName || "user",
+          storageType: workspace.storageType === "local-directory" ? "local-directory" : "browser-storage",
+          localDirectoryName: workspace.localDirectoryName || "",
         }));
 
         workspaceShareOrigins = new Map(
@@ -1285,8 +1886,10 @@ export function bootstrapEdgeTerm() {
 
       function normalizeAppModeConfig(raw = {}) {
         const merged = deepMerge(DEFAULT_APP_MODE_CONFIG, raw || {});
-        merged.runtime = ["python", "static"].includes(merged.runtime) ? merged.runtime : "python";
-        merged.entrypoint = String(merged.entrypoint || (merged.runtime === "static" ? "/home/user/index.html" : "/home/user/app.py"));
+        merged.runtime = ["python", "php", "static"].includes(merged.runtime) ? merged.runtime : "python";
+        merged.entrypoint = String(
+          merged.entrypoint || (merged.runtime === "static" ? "/home/user/index.html" : merged.runtime === "php" ? "/home/user/public/index.php" : "/home/user/app.py")
+        );
         merged.staticRoot = String(merged.staticRoot || "/home/user/public");
         merged.workingDirectory = String(merged.workingDirectory || "/home/user");
         merged.fullscreen = merged.fullscreen !== false;
@@ -1295,16 +1898,29 @@ export function bootstrapEdgeTerm() {
         merged.showLoadingOverlay = merged.showLoadingOverlay !== false;
         merged.exit = deepMerge(DEFAULT_APP_MODE_CONFIG.exit, merged.exit || {});
         merged.ui = deepMerge(DEFAULT_APP_MODE_CONFIG.ui, merged.ui || {});
+        merged.ui.showAddressBar = !!merged.ui.showAddressBar;
         merged.python = deepMerge(DEFAULT_APP_MODE_CONFIG.python, merged.python || {});
         merged.static = deepMerge(DEFAULT_APP_MODE_CONFIG.static, merged.static || {});
         merged.exit.hotkey = String(merged.exit.hotkey || "Escape");
         merged.ui.debugTerminalHotkey = String(merged.ui.debugTerminalHotkey || "Ctrl+`");
         merged.python.appObject = String(merged.python.appObject || "app");
         merged.python.appSpec = String(merged.python.appSpec || "");
-        merged.python.framework = String(merged.python.framework || "edgeterm");
+        merged.python.framework = String(merged.python.framework || "flask");
+        if (merged.runtime === "python" && !merged.python.appSpec && merged.python.framework !== "edgeterm") {
+          const entryModule = pythonModuleNameFromPath(merged.entrypoint);
+          if (entryModule) merged.python.appSpec = `${entryModule}:${merged.python.appObject || "app"}`;
+        }
         merged.python.routePrefix = String(merged.python.routePrefix || "/");
         merged.static.indexFile = String(merged.static.indexFile || "index.html");
         return merged;
+      }
+
+      function pythonModuleNameFromPath(path = "") {
+        const normalized = String(path || "").replace(/\\/g, "/");
+        const filename = normalized.split("/").filter(Boolean).pop() || "";
+        if (!filename.endsWith(".py")) return "";
+        const moduleName = filename.slice(0, -3);
+        return /^[A-Za-z_][A-Za-z0-9_]*$/.test(moduleName) ? moduleName : "";
       }
 
       function ensureAppModeConfigFile() {
@@ -1367,19 +1983,31 @@ export function bootstrapEdgeTerm() {
         frame.srcdoc = "<!doctype html><title>EdgeTerm App Mode</title>";
         appModeState.currentPath = "/";
         appModeState.htmlPath = "";
+        updateAppModeAddressBar("/");
       }
 
       function setAppModeVisible(visible, config = appModeState.config) {
         const shell = $id("appModeShell");
+        const showAddressBar = !!visible && !!config?.ui?.showAddressBar && appModeState.renderTarget !== "display";
         if (appModeState.renderTarget === "display") {
           shell.classList.add("hidden");
           shell.classList.remove("windowed");
+          shell.classList.remove("has-address-bar");
+          $id("appModeAddressBar")?.classList.add("hidden");
           document.body.classList.remove("app-mode-active");
           return;
         }
         shell.classList.toggle("hidden", !visible);
         shell.classList.toggle("windowed", !!visible && config?.fullscreen === false);
+        shell.classList.toggle("has-address-bar", showAddressBar);
+        $id("appModeAddressBar")?.classList.toggle("hidden", !showAddressBar);
         document.body.classList.toggle("app-mode-active", !!visible && !!config?.ui?.hideWorkspaceChrome);
+        if (showAddressBar) updateAppModeAddressBar(appModeState.currentPath || "/");
+      }
+
+      function updateAppModeAddressBar(path = appModeState.currentPath || "/") {
+        const input = $id("appModeUrlInput");
+        if (input) input.value = String(path || "/");
       }
 
       function showAppModeError(summary, detail = "") {
@@ -1615,6 +2243,11 @@ export function bootstrapEdgeTerm() {
           scope.staticRoot = normalizePath(resolved.staticRoot || "/home/user/public");
           scope.entrypoint = String(resolved.entrypoint || "");
           label = `static ${scope.entrypoint || scope.staticRoot}`;
+        } else if (resolved.runtime === "php") {
+          scope.kind = "php";
+          scope.staticRoot = normalizePath(resolved.staticRoot || "/home/user/public");
+          scope.entrypoint = String(resolved.entrypoint || "");
+          label = `php ${scope.entrypoint || scope.staticRoot}`;
         } else {
           scope.kind = "python";
           scope.framework = String(resolved.python?.framework || instance?.mode || "edgeterm");
@@ -1767,12 +2400,22 @@ export function bootstrapEdgeTerm() {
         const currentIdentity = currentAppModeSiteIdentity();
         const currentKey = String(currentIdentity?.key || appModeState.siteKey || "");
         const store = readAppModeSiteDataStore();
-        const currentRecord = currentKey ? (store[currentKey] || normalizeAppModeSiteRecord(currentKey, {
+        const activeCookies = serializeSiteDataMap(appModeState.cookieJar);
+        const activeLocalStorage = serializeSiteDataMap(appModeState.siteLocalStorage);
+        const activeSessionStorage = serializeSiteDataMap(appModeState.siteSessionStorage);
+        const activeHasData = activeCookies.length || activeLocalStorage.length || activeSessionStorage.length;
+        const currentRecord = currentKey && activeHasData ? normalizeAppModeSiteRecord(currentKey, {
           label: currentIdentity?.label || appModeState.siteLabel || "Site",
           scope: currentIdentity?.scope || appModeState.siteScope || {},
-          cookies: serializeSiteDataMap(appModeState.cookieJar),
-          localStorage: serializeSiteDataMap(appModeState.siteLocalStorage),
-          sessionStorage: serializeSiteDataMap(appModeState.siteSessionStorage),
+          cookies: activeCookies,
+          localStorage: activeLocalStorage,
+          sessionStorage: activeSessionStorage,
+        }) : currentKey ? (store[currentKey] || normalizeAppModeSiteRecord(currentKey, {
+          label: currentIdentity?.label || appModeState.siteLabel || "Site",
+          scope: currentIdentity?.scope || appModeState.siteScope || {},
+          cookies: activeCookies,
+          localStorage: activeLocalStorage,
+          sessionStorage: activeSessionStorage,
         })) : null;
         const currentLabel = currentRecord?.label || currentIdentity?.label || "No active site";
         const currentScope = currentRecord?.scope || currentIdentity?.scope || {};
@@ -1828,6 +2471,31 @@ export function bootstrapEdgeTerm() {
         if (appModeState.cookieJar.get(name) === value) return false;
         appModeState.cookieJar.set(name, value);
         return true;
+      }
+
+      function splitCombinedSetCookieHeader(value) {
+        const source = String(value || "");
+        if (!source) return [];
+        const parts = [];
+        let start = 0;
+        let inExpires = false;
+        for (let index = 0; index < source.length; index += 1) {
+          const char = source[index];
+          if (char === ",") {
+            const tail = source.slice(start, index).toLowerCase();
+            if (!inExpires && /=/.test(source.slice(index + 1, index + 80).split(";", 1)[0] || "")) {
+              parts.push(source.slice(start, index).trim());
+              start = index + 1;
+              continue;
+            }
+          } else if (char === ";") {
+            inExpires = false;
+          } else if (!inExpires && source.slice(index, index + 8).toLowerCase() === "expires=") {
+            inExpires = true;
+          }
+        }
+        parts.push(source.slice(start).trim());
+        return parts.filter(Boolean);
       }
 
       function applySyncedSiteData(payload = {}) {
@@ -1915,6 +2583,27 @@ export function bootstrapEdgeTerm() {
         fs.writeFile(target, fs.readFile(source));
       }
 
+      function copyTreeMissing(source, target) {
+        const fs = pyodide.FS;
+        if (!fs.analyzePath(source).exists) return false;
+
+        const stat = fs.stat(source);
+        if (fs.isDir(stat.mode)) {
+          ensureDir(target);
+          let copied = false;
+          for (const entry of fs.readdir(source)) {
+            if (entry === "." || entry === "..") continue;
+            copied = copyTreeMissing(`${source}/${entry}`, `${target}/${entry}`) || copied;
+          }
+          return copied;
+        }
+
+        if (fs.analyzePath(target).exists) return false;
+        ensureDir(target.split("/").slice(0, -1).join("/") || "/");
+        fs.writeFile(target, fs.readFile(source));
+        return true;
+      }
+
       function syncTree(source, target) {
         const fs = pyodide.FS;
         if (!fs.analyzePath(source).exists) {
@@ -1999,7 +2688,6 @@ export function bootstrapEdgeTerm() {
 
       function removeTree(path) {
         const fs = pyodide.FS;
-        if (!fs.analyzePath(path).exists) return;
 
         let stat;
         try {
@@ -2035,6 +2723,261 @@ export function bootstrapEdgeTerm() {
         }
       }
 
+      function countTreeEntries(path) {
+        const fs = pyodide.FS;
+        if (!fs.analyzePath(path).exists) return 0;
+        let stat;
+        try {
+          stat = fs.lstat(path);
+        } catch (err) {
+          if (isNotFoundError(err)) return 0;
+          throw err;
+        }
+        if (!(fs.isDir(stat.mode) && !fs.isLink(stat.mode))) return 1;
+        let total = 1;
+        let entries = [];
+        try {
+          entries = fs.readdir(path);
+        } catch (err) {
+          if (isNotFoundError(err)) return 0;
+          throw err;
+        }
+        for (const entry of entries) {
+          if (entry === "." || entry === "..") continue;
+          total += countTreeEntries(`${path}/${entry}`);
+        }
+        return total;
+      }
+
+      function countTreeStats(path) {
+        const fs = pyodide.FS;
+        if (!fs.analyzePath(path).exists) return { entries: 0, files: 0, bytes: 0 };
+        let stat;
+        try {
+          stat = fs.lstat(path);
+        } catch (err) {
+          if (isNotFoundError(err)) return { entries: 0, files: 0, bytes: 0 };
+          throw err;
+        }
+        if (!(fs.isDir(stat.mode) && !fs.isLink(stat.mode))) {
+          return {
+            entries: 1,
+            files: 1,
+            bytes: Math.max(0, Number(stat.size) || 0),
+          };
+        }
+        let total = { entries: 1, files: 0, bytes: 0 };
+        let children = [];
+        try {
+          children = fs.readdir(path);
+        } catch (err) {
+          if (isNotFoundError(err)) return { entries: 0, files: 0, bytes: 0 };
+          throw err;
+        }
+        for (const entry of children) {
+          if (entry === "." || entry === "..") continue;
+          const child = countTreeStats(`${path}/${entry}`);
+          total.entries += child.entries;
+          total.files += child.files;
+          total.bytes += child.bytes;
+        }
+        return total;
+      }
+
+      function sumTreeStats(paths = []) {
+        return paths.reduce((total, path) => {
+          const next = countTreeStats(path);
+          total.entries += next.entries;
+          total.files += next.files;
+          total.bytes += next.bytes;
+          return total;
+        }, { entries: 0, files: 0, bytes: 0 });
+      }
+
+      async function syncTreeWithProgress(source, target, progressState = null) {
+        const fs = pyodide.FS;
+        if (!fs.analyzePath(source).exists) {
+          removeTree(target);
+          return;
+        }
+
+        let sourceStat;
+        try {
+          sourceStat = fs.lstat(source);
+        } catch (err) {
+          if (isNotFoundError(err)) return;
+          throw err;
+        }
+        const sourceIsDir = fs.isDir(sourceStat.mode) && !fs.isLink(sourceStat.mode);
+        const targetInfo = fs.analyzePath(target);
+        if (sourceIsDir) {
+          if (targetInfo.exists) {
+            let targetStat = null;
+            try {
+              targetStat = fs.lstat(target);
+            } catch (err) {
+              if (!isNotFoundError(err)) throw err;
+            }
+            if (!targetStat) {
+              ensureDir(target);
+            } else if (!fs.isDir(targetStat.mode) || fs.isLink(targetStat.mode)) {
+              removeTree(target);
+              ensureDir(target);
+            }
+          } else {
+            ensureDir(target);
+          }
+
+          let sourceEntryList = [];
+          try {
+            sourceEntryList = fs.readdir(source);
+          } catch (err) {
+            if (isNotFoundError(err)) return;
+            throw err;
+          }
+          const sourceEntries = new Set(sourceEntryList.filter((entry) => entry !== "." && entry !== ".."));
+          let targetEntries = [];
+          try {
+            targetEntries = fs.readdir(target);
+          } catch (err) {
+            if (!isNotFoundError(err)) throw err;
+            ensureDir(target);
+            targetEntries = [];
+          }
+          for (const entry of targetEntries) {
+            if (entry === "." || entry === "..") continue;
+            if (!sourceEntries.has(entry)) removeTree(`${target}/${entry}`);
+          }
+          for (const entry of sourceEntries) {
+            await syncTreeWithProgress(`${source}/${entry}`, `${target}/${entry}`, progressState);
+          }
+          return;
+        }
+
+        ensureDir(target.split("/").slice(0, -1).join("/") || "/");
+        if (targetInfo.exists) {
+          try {
+            const targetStat = fs.lstat(target);
+            if (fs.isDir(targetStat.mode) && !fs.isLink(targetStat.mode)) {
+              removeTree(target);
+            } else if (targetStat.size === sourceStat.size && Number(targetStat.mtime) >= Number(sourceStat.mtime)) {
+              if (progressState) {
+                progressState.completedFiles = (progressState.completedFiles || 0) + 1;
+                progressState.completedBytes = (progressState.completedBytes || 0) + Math.max(0, Number(sourceStat.size) || 0);
+                await renderSyncProgress(progressState, source);
+              }
+              return;
+            }
+          } catch (err) {
+            if (!isNotFoundError(err)) throw err;
+          }
+        }
+        let bytes;
+        try {
+          bytes = fs.readFile(source);
+        } catch (err) {
+          if (isNotFoundError(err)) return;
+          throw err;
+        }
+        fs.writeFile(target, bytes);
+        if (progressState) {
+          progressState.completedFiles = (progressState.completedFiles || 0) + 1;
+          progressState.completedBytes = (progressState.completedBytes || 0) + bytes.byteLength;
+          await renderSyncProgress(progressState, source);
+        }
+      }
+
+      async function renderSyncProgress(progressState, currentPath = "") {
+        const totalFiles = Math.max(progressState.completedFiles || 0, Number(progressState.totalFiles) || 0);
+        const totalBytes = Math.max(progressState.completedBytes || 0, Number(progressState.totalBytes) || 0);
+        const shouldRender =
+          progressState.completedFiles === totalFiles ||
+          (progressState.completedFiles || 0) - (progressState.lastRenderedFiles || 0) >= 20;
+        if (!shouldRender) return;
+        progressState.lastRenderedFiles = progressState.completedFiles || 0;
+        const phase = progressState.phase || "Syncing workspace files...";
+        const byteDetail = totalBytes > 0
+          ? `${formatBytes(progressState.completedBytes || 0)} / ${formatBytes(totalBytes)}`
+          : `${progressState.completedFiles || 0} files`;
+        updateLoadingProgress({
+          current: totalBytes > 0 ? progressState.completedBytes || 0 : progressState.completedFiles || 0,
+          total: totalBytes > 0 ? totalBytes : totalFiles,
+          phase,
+          detail: `${phase} ${progressState.completedFiles || 0} of ${totalFiles || progressState.completedFiles || 0} files (${byteDetail})${currentPath ? ` - ${currentPath}` : ""}`,
+        });
+        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      }
+
+      function workspacePersistSources() {
+        const workspace = activeWorkspace();
+        const sources = [];
+        for (const entry of pyodide.FS.readdir("/").filter(isRootOverlayEntry)) {
+          sources.push({
+            source: `/${entry}`,
+            target: `${workspacePath(activeWorkspaceId, "/overlay/upper")}/${entry}`,
+          });
+        }
+        for (const user of workspace.users) {
+          const source = `/home/${user}`;
+          if (!pyodide.FS.analyzePath(source).exists) continue;
+          if (runtimeHomeUsesWorkspaceLink(user)) continue;
+          sources.push({
+            source,
+            target: workspacePath(activeWorkspaceId, `/home/${user}`),
+          });
+        }
+        return sources;
+      }
+
+      async function deleteTreeWithProgress(path, state) {
+        const fs = pyodide.FS;
+        if (!fs.analyzePath(path).exists) return;
+
+        let stat;
+        try {
+          stat = fs.lstat(path);
+        } catch (err) {
+          if (isNotFoundError(err)) return;
+          throw err;
+        }
+        if (fs.isDir(stat.mode) && !fs.isLink(stat.mode)) {
+          let entries = [];
+          try {
+            entries = fs.readdir(path);
+          } catch (err) {
+            if (isNotFoundError(err)) return;
+            throw err;
+          }
+          for (const entry of entries) {
+            if (entry === "." || entry === "..") continue;
+            await deleteTreeWithProgress(`${path}/${entry}`, state);
+          }
+          try {
+            fs.rmdir(path);
+          } catch (err) {
+            if (!isNotFoundError(err)) throw err;
+          }
+        } else {
+          try {
+            fs.unlink(path);
+          } catch (err) {
+            if (!isNotFoundError(err)) throw err;
+          }
+        }
+
+        state.deleted += 1;
+        if (state.deleted === state.total || state.deleted - state.lastRendered >= 25) {
+          state.lastRendered = state.deleted;
+          showProgressNotice({
+            label: "Deleting files...",
+            current: state.deleted,
+            total: state.total,
+            detail: `${state.deleted} of ${state.total} removed`,
+          });
+          await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+        }
+      }
+
       function clearDirectory(path) {
         const fs = pyodide.FS;
         ensureDir(path);
@@ -2064,6 +3007,17 @@ export function bootstrapEdgeTerm() {
         }
       }
 
+      function runtimeHomeUsesWorkspaceLink(user) {
+        const source = `/home/${user}`;
+        const target = workspacePath(activeWorkspaceId, `/home/${user}`);
+        try {
+          const stat = pyodide.FS.lstat(source);
+          return pyodide.FS.isLink(stat.mode) && pyodide.FS.readlink(source) === target;
+        } catch {
+          return false;
+        }
+      }
+
       function syncRootOverlayToWorkspace() {
         const upperPath = workspacePath(activeWorkspaceId, "/overlay/upper");
         ensureDir(upperPath);
@@ -2085,6 +3039,7 @@ export function bootstrapEdgeTerm() {
         for (const user of workspace.users) {
           const source = `/home/${user}`;
           if (!pyodide.FS.analyzePath(source).exists) continue;
+          if (runtimeHomeUsesWorkspaceLink(user)) continue;
           const target = workspacePath(activeWorkspaceId, `/home/${user}`);
           syncTree(source, target);
         }
@@ -2116,6 +3071,12 @@ export function bootstrapEdgeTerm() {
         }
         syncTree(source, target);
         return true;
+      }
+
+      async function ensureWorkspaceMountedForRuntimePath(path, reason = "Loading workspace files...") {
+        const workspace = activeWorkspace();
+        if (!workspace || isWorkspaceStorageMounted(activeWorkspaceId)) return true;
+        return await ensureActiveWorkspaceMounted(reason);
       }
 
       function scheduleWorkspaceFlush(delay = 250) {
@@ -2154,11 +3115,32 @@ export function bootstrapEdgeTerm() {
         while (persistInFlight) {
           await persistInFlight;
         }
-        syncRootOverlayToWorkspace();
-        syncHomeToWorkspace();
+        const persistSources = workspacePersistSources();
+        const persistStats = sumTreeStats(persistSources.map((entry) => entry.source));
+        if (persistSources.length) {
+          showLoadingIndeterminate("Scanning workspace files...", "Calculating local changes...");
+          const progressState = {
+            phase: "Syncing workspace files...",
+            totalFiles: persistStats.files,
+            totalBytes: persistStats.bytes,
+            completedFiles: 0,
+            completedBytes: 0,
+            lastRenderedFiles: 0,
+          };
+          for (const { source, target } of persistSources) {
+            await syncTreeWithProgress(source, target, progressState);
+          }
+        } else {
+          syncRootOverlayToWorkspace();
+          syncHomeToWorkspace();
+        }
         await flushQueuedWorkspaceJournalEntries();
+        showLoadingIndeterminate("Saving workspace index...", "Writing workspace changes to browser storage...");
         await syncfs(false);
         await clearWorkspaceJournal(activeWorkspaceId);
+        if (activeWorkspace()?.storageType === "local-directory" && syncingLocalWorkspaceId !== activeWorkspaceId) {
+          await syncActiveWorkspaceToLocalDirectory({ silent: true, persist: false });
+        }
       }
 
       function schedulePersistActiveWorkspace(delay = 120) {
@@ -2183,19 +3165,11 @@ export function bootstrapEdgeTerm() {
         }, delay);
       }
 
-      async function extractZipTo(zip, target) {
-        ensureDir(target);
-        for (const [path, entry] of Object.entries(zip.files)) {
-          const normalized = path.replaceAll("\\", "/").replace(/^\/+/, "");
-          if (!normalized) continue;
-          const fullPath = `${target}/${normalized}`;
-          if (entry.dir) {
-            ensureDir(fullPath);
-          } else {
-            ensureDir(fullPath.split("/").slice(0, -1).join("/"));
-            pyodide.FS.writeFile(fullPath, await entry.async("uint8array"));
-          }
-        }
+      async function extractZipTo(zip, target, options = {}) {
+        return await extractZipEntries(zip, target, {
+          phase: options.phase || "Extracting files...",
+          prefix: options.prefix || "",
+        });
       }
 
       function normalizeZipEntries(zip) {
@@ -2213,29 +3187,64 @@ export function bootstrapEdgeTerm() {
         }
         for (const prefix of candidates) {
           const base = prefix ? `${prefix}/` : "";
-          const hasRootfs = entries.some((entry) => entry.startsWith(`${base}rootfs/`));
           const hasHome = entries.some((entry) => entry.startsWith(`${base}home/`));
           const hasOverlay = entries.some((entry) => entry.startsWith(`${base}overlay/`));
-          if (hasRootfs && (hasHome || hasOverlay)) return prefix;
+          const hasRootfs = entries.some((entry) => entry.startsWith(`${base}rootfs/`));
+          const hasWorkspaceMeta = entries.some((entry) => entry === `${base}${LOCAL_WORKSPACE_META}` || entry === `${base}.edgeterm-workspace.json`);
+          if ((hasHome || hasOverlay) && (hasRootfs || hasWorkspaceMeta || prefix || entries.length > 1)) return prefix;
         }
         return null;
       }
 
       async function extractWorkspaceArchive(zip, workspaceRoot, prefix = "") {
+        return await extractZipEntries(zip, workspaceRoot, {
+          phase: "Restoring workspace files...",
+          prefix,
+        });
+      }
+
+      function collectZipEntries(zip, prefix = "") {
         const base = prefix ? `${prefix}/` : "";
-        ensureDir(workspaceRoot);
-        for (const [path, entry] of Object.entries(zip.files)) {
-          const normalized = path.replaceAll("\\", "/").replace(/^\/+/, "");
-          if (!normalized) continue;
-          if (base && !normalized.startsWith(base)) continue;
-          const relative = base ? normalized.slice(base.length) : normalized;
-          if (!relative) continue;
-          const fullPath = `${workspaceRoot}/${relative}`;
+        return Object.entries(zip.files)
+          .map(([path, entry]) => {
+            const normalized = path.replaceAll("\\", "/").replace(/^\/+/, "");
+            if (!normalized) return null;
+            if (base && !normalized.startsWith(base)) return null;
+            const relative = base ? normalized.slice(base.length) : normalized;
+            if (!relative) return null;
+            return { relative, entry };
+          })
+          .filter(Boolean);
+      }
+
+      async function extractZipEntries(zip, target, { phase = "Extracting files...", prefix = "" } = {}) {
+        const entries = collectZipEntries(zip, prefix);
+        ensureDir(target);
+        const total = entries.length;
+        if (!total) {
+          updateLoadingProgress({ current: 1, total: 1, phase, detail: `${phase} Nothing to process` });
+          return;
+        }
+        let completed = 0;
+        let lastRendered = -1;
+        for (const { relative, entry } of entries) {
+          const fullPath = `${target}/${relative}`;
           if (entry.dir) {
             ensureDir(fullPath);
           } else {
             ensureDir(fullPath.split("/").slice(0, -1).join("/"));
             pyodide.FS.writeFile(fullPath, await entry.async("uint8array"));
+          }
+          completed += 1;
+          if (completed === total || completed - lastRendered >= 20) {
+            lastRendered = completed;
+            updateLoadingProgress({
+              current: completed,
+              total,
+              phase,
+              detail: `${phase} ${completed} of ${total} items (${relative})`,
+            });
+            await new Promise((resolve) => requestAnimationFrame(() => resolve()));
           }
         }
       }
@@ -2289,6 +3298,38 @@ export function bootstrapEdgeTerm() {
         return /^text\//i.test(mime) || /json|javascript|xml|svg/i.test(mime);
       }
 
+      function sniffTextResponseMime(body = "", requestPath = "") {
+        const path = String(requestPath || "").toLowerCase();
+        const text = String(body || "");
+        const trimmed = text.trimStart();
+        if (!trimmed) return "";
+        if (/^<!doctype\s+html\b|^<html[\s>]/i.test(trimmed)) return "text/html; charset=utf-8";
+        if (/^<\?xml\b/i.test(trimmed) || /^<svg[\s>]/i.test(trimmed)) return "image/svg+xml";
+        if (/^\s*[{[]/.test(trimmed)) {
+          try {
+            JSON.parse(trimmed);
+            return "application/json; charset=utf-8";
+          } catch {}
+        }
+        if (path.endsWith(".css") || /\/css(?:\/|$)/i.test(path)) return "text/css; charset=utf-8";
+        if (path.endsWith(".js") || /\/js(?:\/|$)/i.test(path)) return "text/javascript; charset=utf-8";
+        if (
+          /^@(?:charset|import|media|font-face|keyframes)\b/i.test(trimmed) ||
+          /^(?:html|body|:root|[.#][\w-]+|\*)\s*[{,{]/.test(trimmed) ||
+          /^[.#][\w-]+[\s.#:[\]\w-]*\s*\{/.test(trimmed)
+        ) {
+          return "text/css; charset=utf-8";
+        }
+        if (
+          /^(?:import|export)\s+/i.test(trimmed) ||
+          /^(?:var|let|const|function|class)\s+[\w$]/.test(trimmed) ||
+          /^(?:\(\s*function|!\s*function|\(\s*\(\s*\)\s*=>)/.test(trimmed)
+        ) {
+          return "text/javascript; charset=utf-8";
+        }
+        return "";
+      }
+
       function encodeHtml(value) {
         return String(value)
           .replaceAll("&", "&amp;")
@@ -2330,7 +3371,11 @@ export function bootstrapEdgeTerm() {
 
       function resolveAppRequestUrl(input, currentPath = "/") {
         const raw = typeof input === "string" ? input : input?.url || "/";
-        const url = new URL(raw, `https://edgeterm.local${currentPath || "/"}`);
+        const basePath = String(currentPath || "/").split("#", 1)[0].split("?", 1)[0] || "/";
+        const baseDir = basePath.endsWith("/") || /\.[^/]+$/.test(basePath)
+          ? basePath
+          : `${basePath}/`;
+        const url = new URL(raw, `https://edgeterm.local${baseDir}`);
         return { path: url.pathname || "/", query: url.search.replace(/^\?/, "") };
       }
 
@@ -2379,10 +3424,16 @@ export function bootstrapEdgeTerm() {
 
       function validateAppModeConfig(config) {
         if (!config.enabled) return;
-        if (!["python", "static"].includes(config.runtime)) throw new Error(`Unsupported App Mode runtime: ${config.runtime}`);
+        if (!["python", "php", "static"].includes(config.runtime)) throw new Error(`Unsupported App Mode runtime: ${config.runtime}`);
         if (!pyodide.FS.analyzePath(config.workingDirectory).exists) throw new Error(`Working directory does not exist: ${config.workingDirectory}`);
         if (config.runtime === "python" && !config.python?.appSpec && !pyodide.FS.analyzePath(config.entrypoint).exists) {
           throw new Error(`Python entrypoint does not exist: ${config.entrypoint}`);
+        }
+        if (config.runtime === "php") {
+          const target = resolvePhpAppTarget(config);
+          if (!fsPathExists(target)) throw new Error(`PHP entrypoint or document root does not exist: ${target}`);
+          if (!fsIsFile(target) && !fsIsDir(target)) throw new Error(`PHP target is not a file or directory: ${target}`);
+          if (fsIsFile(target) && !/\.php$/i.test(target)) throw new Error(`PHP entrypoint must be a .php file: ${target}`);
         }
         if (config.runtime === "static") {
           const staticCandidate = resolveStaticEntrypoint(config, config.entrypoint);
@@ -2395,6 +3446,12 @@ export function bootstrapEdgeTerm() {
         if (input && /\.(html?|xhtml)$/i.test(input)) return normalizePath(input);
         const root = normalizePath(config.staticRoot || "/home/user/public");
         return resolveWorkspacePath(`${root}/${config.static.indexFile}`, input || config.static.indexFile || "index.html");
+      }
+
+      function resolvePhpAppTarget(config) {
+        const entrypoint = String(config.entrypoint || "").trim();
+        if (entrypoint) return normalizePath(entrypoint);
+        return normalizePath(config.staticRoot || config.workingDirectory || "/home/user/public");
       }
 
       function staticRoutePathForFsPath(fsPath, config) {
@@ -2413,6 +3470,30 @@ export function bootstrapEdgeTerm() {
 
       function readFsBytes(path) {
         return pyodide.FS.readFile(path);
+      }
+
+      function fsPathExists(path) {
+        try {
+          return pyodide.FS.analyzePath(path).exists;
+        } catch {
+          return false;
+        }
+      }
+
+      function fsIsDir(path) {
+        try {
+          return pyodide.FS.isDir(pyodide.FS.stat(path).mode);
+        } catch {
+          return false;
+        }
+      }
+
+      function fsIsFile(path) {
+        try {
+          return pyodide.FS.isFile(pyodide.FS.stat(path).mode);
+        } catch {
+          return false;
+        }
       }
 
       function registerAppModeBlob(blob) {
@@ -2439,13 +3520,14 @@ export function bootstrapEdgeTerm() {
         return resolveWorkspacePath(documentFsPath, rawUrl);
       }
 
-      function buildAppModeClientScript({ currentPath, exitHotkey, debugHotkey, allowDebugTerminal, siteData }) {
+      function buildAppModeClientScript({ currentPath, exitHotkey, debugHotkey, allowDebugTerminal, siteData, edgeServeDebug }) {
         return `
 (() => {
   const currentPath = ${JSON.stringify(currentPath || "/")};
   const exitHotkey = ${JSON.stringify(exitHotkey || "Escape")};
   const debugHotkey = ${JSON.stringify(debugHotkey || "Ctrl+`")};
   const allowDebugTerminal = ${allowDebugTerminal ? "true" : "false"};
+  const edgeServeDebug = ${JSON.stringify(edgeServeDebug || null)};
   const initialSiteData = ${JSON.stringify({
     cookies: serializeSiteDataMap(siteData?.cookies),
     localStorage: serializeSiteDataMap(siteData?.localStorage),
@@ -2460,6 +3542,16 @@ export function bootstrapEdgeTerm() {
   });
   const syncSiteData = (extra = {}) => {
     parent.EdgeTermAppModeBridge.syncSiteData({ ...serializeStorageData(), ...extra });
+  };
+  const edgeServeLog = (event, details = {}) => {
+    const payload = { event, time: new Date().toISOString(), ...details };
+    try {
+      console.info("[EdgeServe]", payload);
+    } catch {}
+    try {
+      parent.EdgeTermAppModeBridge.edgeServeLog(payload);
+    } catch {}
+    return payload;
   };
   const createStorageProxy = (backingStore) => new Proxy({
     get length() {
@@ -2548,49 +3640,371 @@ export function bootstrapEdgeTerm() {
   const shouldIntercept = (url) => {
     if (!url) return false;
     if (url.startsWith("#") || url.startsWith("data:") || url.startsWith("blob:") || url.startsWith("javascript:") || url.startsWith("mailto:")) return false;
+    if (/^\\/\\//.test(url)) {
+      try {
+        const parsed = new URL("https:" + url);
+        return parsed.hostname === "edgeterm.local" || parsed.hostname === window.location.hostname;
+      } catch {
+        return false;
+      }
+    }
     if (/^https?:\\/\\//i.test(url)) {
       try {
         const parsed = new URL(url);
-        return parsed.hostname === "edgeterm.local";
+        return parsed.hostname === "edgeterm.local" || parsed.hostname === window.location.hostname;
       } catch {
         return false;
       }
     }
     return true;
   };
+  const shouldInterceptWebSocket = (url) => {
+    if (!url) return false;
+    if (/^(data|blob|javascript|mailto):/i.test(url)) return false;
+    if (/^wss?:\\/\\/\\//i.test(url)) return true;
+    if (/^wss?:\\/\\//i.test(url)) {
+      try {
+        const parsed = new URL(url);
+        return ["edgeterm.local", "localhost", "127.0.0.1", "::1", "ws", window.location.hostname].includes(parsed.hostname);
+      } catch {
+        return false;
+      }
+    }
+    if (/^https?:\\/\\//i.test(url)) return shouldIntercept(url);
+    return true;
+  };
+  let virtualUrl = new URL(currentPath || "/", "https://edgeterm.local");
+  const virtualPath = () => \`\${virtualUrl.pathname || "/"}\${virtualUrl.search || ""}\`;
+  const virtualLocation = {};
+  Object.defineProperties(virtualLocation, {
+    href: { configurable: true, get: () => virtualUrl.href },
+    protocol: { configurable: true, get: () => virtualUrl.protocol },
+    host: { configurable: true, get: () => virtualUrl.host },
+    hostname: { configurable: true, get: () => virtualUrl.hostname },
+    port: { configurable: true, get: () => virtualUrl.port },
+    pathname: { configurable: true, get: () => virtualUrl.pathname },
+    search: { configurable: true, get: () => virtualUrl.search },
+    hash: { configurable: true, get: () => virtualUrl.hash },
+    origin: { configurable: true, get: () => virtualUrl.origin },
+  });
+  virtualLocation.assign = (url) => parent.EdgeTermAppModeBridge.navigate(normalizeBridgeRequestUrl(String(url || "/")));
+  virtualLocation.replace = virtualLocation.assign;
+  virtualLocation.reload = () => parent.EdgeTermAppModeBridge.navigate(virtualPath());
+  const updateVirtualUrl = (url) => {
+    if (url == null || url === "") return;
+    try {
+      virtualUrl = new URL(normalizeBridgeRequestUrl(String(url)), virtualUrl.href);
+    } catch {}
+  };
+  const patchBackboneHistory = () => {
+    const backbone = window.Backbone;
+    if (!backbone?.history || backbone.history.__edgetermVirtualLocation) return;
+    backbone.history.location = virtualLocation;
+    backbone.history.history = history;
+    backbone.history.__edgetermVirtualLocation = true;
+    edgeServeLog("virtual-history", { url: virtualUrl.href });
+  };
+  let backboneHistoryPatchAttempts = 0;
+  const backboneHistoryTimer = setInterval(() => {
+    patchBackboneHistory();
+    backboneHistoryPatchAttempts += 1;
+    if (window.Backbone?.history?.__edgetermVirtualLocation || backboneHistoryPatchAttempts > 400) clearInterval(backboneHistoryTimer);
+  }, 25);
   const originalFetch = window.fetch.bind(window);
+  const normalizeBridgeRequestUrl = (url) => {
+    const value = String(url || "");
+    const lowerValue = value.toLowerCase();
+    if (/^\\/\\//.test(value)) {
+      try {
+        const parsed = new URL("https:" + value);
+        if (parsed.hostname === "edgeterm.local" || parsed.hostname === window.location.hostname) {
+          return (parsed.pathname || "/") + (parsed.search || "") + (parsed.hash || "");
+        }
+      } catch {}
+    }
+    if (/^https?:\\/\\//i.test(value)) {
+      try {
+        const parsed = new URL(value);
+        if (parsed.hostname === "edgeterm.local" || parsed.hostname === window.location.hostname) {
+          return (parsed.pathname || "/") + (parsed.search || "") + (parsed.hash || "");
+        }
+      } catch {}
+    }
+    if (lowerValue.startsWith("about://undefined/") || lowerValue.startsWith("about://undefined:")) {
+      try {
+        const parsed = new URL(value);
+        return (parsed.pathname || "/") + (parsed.search || "") + (parsed.hash || "");
+      } catch {
+        const marker = value.indexOf("/", "about://undefined".length);
+        return marker >= 0 ? value.slice(marker) : "/";
+      }
+    }
+    return value;
+  };
   const bridgeFetch = async (url, init = {}) => {
+    const requestUrl = normalizeBridgeRequestUrl(url);
+    const headers = { ...(init.headers || {}) };
+    const cookieKey = Object.keys(headers).find((key) => key.toLowerCase() === "cookie");
+    const cookieHeader = cookieString();
+    if (cookieHeader && (!cookieKey || !String(headers[cookieKey] || "").trim())) {
+      if (cookieKey) headers[cookieKey] = cookieHeader;
+      else headers.cookie = cookieHeader;
+    }
+    if (cookieStore.size && !Object.keys(headers).some((key) => key.toLowerCase() === "cookie")) {
+      headers.cookie = cookieString();
+    }
+    headers.host ||= "edgeterm.local";
+    headers.origin ||= "https://edgeterm.local";
+    headers.referer ||= virtualUrl.href;
+    headers["x-requested-with"] ||= "XMLHttpRequest";
     const result = await parent.EdgeTermAppModeBridge.fetch({
-      url,
+      url: requestUrl,
       method: (init.method || "GET").toUpperCase(),
-      headers: init.headers || {},
+      headers,
       body: init.body ?? null,
-      currentPath,
+      currentPath: virtualPath(),
     });
+    const debugKind = result?.headers?.["x-edgeterm-debug-kind"] || result?.headers?.["X-EdgeTerm-Debug-Kind"] || "";
+    if (debugKind) {
+      edgeServeLog("fetch", {
+        method: (init.method || "GET").toUpperCase(),
+        url: requestUrl,
+        status: result.status,
+        kind: debugKind,
+        path: result.headers["x-edgeterm-request-path"] || result.headers["X-EdgeTerm-Request-Path"] || "",
+        script: result.headers["x-edgeterm-php-script"] || result.headers["X-EdgeTerm-Php-Script"] || "",
+        durationMs: result.headers["x-edgeterm-duration-ms"] || result.headers["X-EdgeTerm-Duration-Ms"] || result.headers["x-edgeterm-php-duration-ms"] || result.headers["X-EdgeTerm-Php-Duration-Ms"] || "",
+        location: result.headers.location || result.headers.Location || "",
+      });
+    }
     const payload = result.bodyBase64
       ? Uint8Array.from(atob(result.bodyBase64), (char) => char.charCodeAt(0))
       : result.body;
     return new Response(payload, { status: result.status, headers: result.headers });
   };
-  const hydrateAssets = () => {
-    const targets = [...document.querySelectorAll("[data-edgeterm-asset-url], img[src], script[src], link[rel~='stylesheet'][href], source[src], video[src], audio[src], video[poster]")];
-    for (const node of targets) {
-      const attr = node.getAttribute("data-edgeterm-asset-attr") || (node.hasAttribute("href") ? "href" : node.hasAttribute("poster") ? "poster" : "src");
-      const url = node.getAttribute("data-edgeterm-asset-url") || node.getAttribute(attr);
-      if (!shouldIntercept(url)) continue;
+  const originalPushState = history.pushState.bind(history);
+  const originalReplaceState = history.replaceState.bind(history);
+  const safeHistoryState = (mode, state, title, url) => {
+    const original = mode === "replace" ? originalReplaceState : originalPushState;
+    updateVirtualUrl(url);
+    patchBackboneHistory();
+    try {
+      original(state, title, url);
+    } catch (err) {
+      if (err?.name !== "SecurityError") throw err;
+      edgeServeLog("history-security-suppressed", { mode, url: String(url || "") });
+    }
+  };
+  history.pushState = (state, title, url) => safeHistoryState("push", state, title, url);
+  history.replaceState = (state, title, url) => safeHistoryState("replace", state, title, url);
+  window.open = (url = "", target = "", features = "") => {
+    const destination = normalizeBridgeRequestUrl(String(url || "about:blank"));
+    parent.EdgeTermAppModeBridge.openTab(destination, { target: String(target || ""), features: String(features || "") });
+    return null;
+  };
+  const cssUrlBase = (url) => {
+    try {
+      return new URL(String(url || ""), \`https://edgeterm.local\${currentPath || "/"}\`).href;
+    } catch {
+      return \`https://edgeterm.local\${currentPath || "/"}\`;
+    }
+  };
+  const rewriteCssUrls = async (cssText, stylesheetUrl) => {
+    const text = String(cssText || "");
+    const replacements = new Map();
+    const tasks = [];
+    const pattern = /url\\(\\s*(['"]?)([^'")]+)\\1\\s*\\)/gi;
+    for (const match of text.matchAll(pattern)) {
+      const rawUrl = String(match[2] || "").trim();
+      if (!rawUrl || /^(data|blob|javascript|mailto):/i.test(rawUrl) || rawUrl.startsWith("#")) continue;
+      let resolved = rawUrl;
+      try {
+        resolved = new URL(rawUrl, cssUrlBase(stylesheetUrl)).href;
+      } catch {}
+      if (!shouldIntercept(resolved)) continue;
+      tasks.push(
+        bridgeFetch(resolved)
+          .then((response) => response.ok ? response.blob() : null)
+          .then((blob) => {
+            if (blob) replacements.set(match[0], \`url("\${URL.createObjectURL(blob)}")\`);
+          })
+          .catch(() => {})
+      );
+    }
+    await Promise.all(tasks);
+    let rewritten = text;
+    for (const [source, target] of replacements) rewritten = rewritten.split(source).join(target);
+    return rewritten;
+  };
+  const srcsetFirstUrl = (value) => {
+    const first = String(value || "").split(",")[0]?.trim() || "";
+    return first.split(/\\s+/)[0] || "";
+  };
+  const assetSelector = "[data-edgeterm-asset-url], img[src], img[srcset], script[src], link[rel~='stylesheet'][href], source[src], source[srcset], video[src], audio[src], video[poster]";
+  const assetAttrForNode = (node, attrName = "") => {
+    if (!(node instanceof Element)) return "";
+    const attr = String(attrName || "").toLowerCase();
+    const tag = node.tagName;
+    if (tag === "SCRIPT" && attr === "src") return "src";
+    if (tag === "IMG" && (attr === "src" || attr === "srcset")) return attr;
+    if (tag === "SOURCE" && (attr === "src" || attr === "srcset")) return attr;
+    if ((tag === "VIDEO" || tag === "AUDIO") && attr === "src") return "src";
+    if (tag === "VIDEO" && attr === "poster") return "poster";
+    if (tag === "LINK" && attr === "href" && /(?:^|\\s)stylesheet(?:\\s|$)/i.test(node.getAttribute("rel") || "")) return "href";
+    return "";
+  };
+  const prepareBridgeAssetNode = (node, attr, rawUrl) => {
+    const targetAttr = assetAttrForNode(node, attr);
+    if (!targetAttr || !shouldIntercept(String(rawUrl || ""))) return false;
+    node.dataset.edgetermAssetUrl = normalizeBridgeRequestUrl(String(rawUrl || ""));
+    node.dataset.edgetermAssetAttr = targetAttr;
+    try {
+      originalRemoveAttribute.call(node, targetAttr);
+      if (targetAttr !== "srcset" && node.hasAttribute("srcset")) originalRemoveAttribute.call(node, "srcset");
+    } catch {}
+    scheduleHydrateAssets();
+    return true;
+  };
+  const hydrateInlineStyleUrl = (node) => {
+    if (!(node instanceof Element)) return;
+    const styleText = node.getAttribute("style") || "";
+    if (!/url\\(/i.test(styleText) || node.dataset.edgetermStyleHydrating === "true") return;
+    node.dataset.edgetermStyleHydrating = "true";
+    rewriteCssUrls(styleText, currentPath)
+      .then((rewritten) => {
+        if (rewritten && rewritten !== styleText) node.setAttribute("style", rewritten);
+      })
+      .finally(() => {
+        node.removeAttribute("data-edgeterm-style-hydrating");
+      });
+  };
+  const hydrateAssetNode = (node) => {
+    if (!(node instanceof Element)) return;
+    hydrateInlineStyleUrl(node);
+    if (!node.matches?.(assetSelector)) return;
+    if (node.dataset.edgetermHydrating === "true") return;
+    const attr = node.getAttribute("data-edgeterm-asset-attr")
+      || (node.hasAttribute("href")
+        ? "href"
+        : node.hasAttribute("poster")
+          ? "poster"
+          : node.tagName === "SOURCE" && node.hasAttribute("srcset") && !node.hasAttribute("src")
+            ? "srcset"
+            : "src");
+    const url = node.getAttribute("data-edgeterm-asset-url") || node.getAttribute(attr) || srcsetFirstUrl(node.getAttribute("srcset"));
+    if (!shouldIntercept(url)) return;
+    node.dataset.edgetermHydrating = "true";
+    if (node.matches?.("link[rel~='stylesheet']")) {
       bridgeFetch(url)
-        .then((response) => response.ok ? response.blob() : null)
-        .then((blob) => {
-          if (!blob) return;
-          node.setAttribute(attr, URL.createObjectURL(blob));
+        .then((response) => response.ok ? response.text() : "")
+        .then((cssText) => cssText ? rewriteCssUrls(cssText, url) : "")
+        .then((cssText) => {
+          if (!cssText) return;
+          const blobUrl = URL.createObjectURL(new Blob([cssText], { type: "text/css; charset=utf-8" }));
+          node.setAttribute("href", blobUrl);
           node.removeAttribute("data-edgeterm-asset-url");
           node.removeAttribute("data-edgeterm-asset-attr");
         })
-        .catch(() => {});
+        .finally(() => {
+          node.removeAttribute("data-edgeterm-hydrating");
+        });
+      return;
+    }
+    bridgeFetch(url)
+      .then((response) => response.ok ? response.blob() : null)
+      .then((blob) => {
+        if (!blob) return;
+        node.setAttribute(attr, URL.createObjectURL(blob));
+        if (attr !== "srcset" && node.hasAttribute("srcset")) node.removeAttribute("srcset");
+        node.removeAttribute("data-edgeterm-asset-url");
+        node.removeAttribute("data-edgeterm-asset-attr");
+      })
+      .finally(() => {
+        node.removeAttribute("data-edgeterm-hydrating");
+      });
+  };
+  const hydrateAssets = () => {
+    document.querySelectorAll(assetSelector + ", [style*='url('], [style*='URL(']").forEach(hydrateAssetNode);
+  };
+  let hydrateAssetsTimer = 0;
+  const scheduleHydrateAssets = () => {
+    clearTimeout(hydrateAssetsTimer);
+    hydrateAssetsTimer = setTimeout(hydrateAssets, 25);
+  };
+  const originalSetAttribute = Element.prototype.setAttribute;
+  const originalRemoveAttribute = Element.prototype.removeAttribute;
+  const navigationSelector = "a[href], area[href], form[action]";
+  const prepareBridgeNavigationNode = (node, attrName = "", rawUrl = null) => {
+    if (!(node instanceof Element)) return false;
+    const tag = node.tagName;
+    const attr = String(attrName || "").toLowerCase();
+    const isLink = (tag === "A" || tag === "AREA") && attr === "href";
+    const isForm = tag === "FORM" && attr === "action";
+    if (!isLink && !isForm) return false;
+    const source = rawUrl == null ? node.getAttribute(attr) : rawUrl;
+    const destination = normalizeBridgeRequestUrl(String(source || ""));
+    if (!shouldIntercept(destination)) return false;
+    originalSetAttribute.call(node, "data-edgeterm-nav-url", destination);
+    originalSetAttribute.call(node, attr, isLink ? "#" : "");
+    return true;
+  };
+  const hydrateNavigationNode = (node) => {
+    if (!(node instanceof Element)) return;
+    if (node.matches?.(navigationSelector)) {
+      prepareBridgeNavigationNode(node, node.hasAttribute("href") ? "href" : "action");
+    }
+    for (const child of Array.from(node.querySelectorAll?.(navigationSelector) || [])) {
+      prepareBridgeNavigationNode(child, child.hasAttribute("href") ? "href" : "action");
     }
   };
+  const patchNavigationUrlProperty = (proto, property, attr) => {
+    if (!proto) return;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, property);
+    if (!descriptor?.set || !descriptor?.get) return;
+    Object.defineProperty(proto, property, {
+      configurable: true,
+      enumerable: descriptor.enumerable,
+      get: descriptor.get,
+      set(value) {
+        if (prepareBridgeNavigationNode(this, attr, value)) return;
+        descriptor.set.call(this, value);
+      },
+    });
+  };
+  Element.prototype.setAttribute = function(name, value) {
+    const attr = String(name || "");
+    if (!/^data-edgeterm-/i.test(attr) && prepareBridgeNavigationNode(this, attr, value)) return;
+    if (!/^data-edgeterm-/i.test(attr) && prepareBridgeAssetNode(this, attr, value)) return;
+    return originalSetAttribute.call(this, name, value);
+  };
+  const patchUrlProperty = (proto, property, attr) => {
+    if (!proto) return;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, property);
+    if (!descriptor?.set || !descriptor?.get) return;
+    Object.defineProperty(proto, property, {
+      configurable: true,
+      enumerable: descriptor.enumerable,
+      get: descriptor.get,
+      set(value) {
+        if (prepareBridgeAssetNode(this, attr, value)) return;
+        descriptor.set.call(this, value);
+      },
+    });
+  };
+  patchUrlProperty(window.HTMLScriptElement?.prototype, "src", "src");
+  patchUrlProperty(window.HTMLImageElement?.prototype, "src", "src");
+  patchUrlProperty(window.HTMLImageElement?.prototype, "srcset", "srcset");
+  patchUrlProperty(window.HTMLSourceElement?.prototype, "src", "src");
+  patchUrlProperty(window.HTMLSourceElement?.prototype, "srcset", "srcset");
+  patchUrlProperty(window.HTMLLinkElement?.prototype, "href", "href");
+  patchUrlProperty(window.HTMLVideoElement?.prototype, "src", "src");
+  patchUrlProperty(window.HTMLVideoElement?.prototype, "poster", "poster");
+  patchUrlProperty(window.HTMLAudioElement?.prototype, "src", "src");
+  patchNavigationUrlProperty(window.HTMLAnchorElement?.prototype, "href", "href");
+  patchNavigationUrlProperty(window.HTMLAreaElement?.prototype, "href", "href");
+  patchNavigationUrlProperty(window.HTMLFormElement?.prototype, "action", "action");
   window.fetch = async (input, init = {}) => {
-    const url = typeof input === "string" ? input : input?.url || "";
+    const url = normalizeBridgeRequestUrl(typeof input === "string" ? input : input?.url || "");
     if (!shouldIntercept(url)) return originalFetch(input, init);
     const headers = Object.fromEntries(new Headers(init.headers || (typeof input === "string" ? {} : input.headers || {})).entries());
     const method = (init.method || (typeof input === "string" ? "GET" : input.method) || "GET").toUpperCase();
@@ -2605,21 +4019,405 @@ export function bootstrapEdgeTerm() {
     }
     return bridgeFetch(url, { method, headers, body });
   };
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", hydrateAssets, { once: true });
-  else hydrateAssets();
-  document.addEventListener("click", (event) => {
-    const link = event.target.closest("a[href]");
+  const OriginalXMLHttpRequest = window.XMLHttpRequest;
+  class EdgeTermUploadTarget extends EventTarget {
+    constructor() {
+      super();
+      this.onloadstart = null;
+      this.onprogress = null;
+      this.onload = null;
+      this.onerror = null;
+      this.onloadend = null;
+      this.onabort = null;
+    }
+    emit(type, init = {}) {
+      const loaded = Number(init.loaded || 0);
+      const total = Number(init.total || 0);
+      const event = new ProgressEvent(type, {
+        lengthComputable: !!init.lengthComputable,
+        loaded,
+        total,
+      });
+      this.dispatchEvent(event);
+      const handler = this["on" + type];
+      if (typeof handler === "function") handler.call(this, event);
+    }
+  }
+  class EdgeTermXMLHttpRequest extends EventTarget {
+    static UNSENT = 0;
+    static OPENED = 1;
+    static HEADERS_RECEIVED = 2;
+    static LOADING = 3;
+    static DONE = 4;
+    constructor() {
+      super();
+      this.readyState = EdgeTermXMLHttpRequest.UNSENT;
+      this.response = "";
+      this.responseText = "";
+      this.responseType = "";
+      this.responseURL = "";
+      this.responseXML = null;
+      this.status = 0;
+      this.statusText = "";
+      this.timeout = 0;
+      this.withCredentials = false;
+      this.onreadystatechange = null;
+      this.onload = null;
+      this.onerror = null;
+      this.onloadend = null;
+      this.onloadstart = null;
+      this.onabort = null;
+      this.ontimeout = null;
+      this.onprogress = null;
+      this.upload = new EdgeTermUploadTarget();
+      this._method = "GET";
+      this._url = "";
+      this._async = true;
+      this._headers = {};
+      this._responseHeaders = {};
+      this._responseHeaderLines = "";
+      this._aborted = false;
+      this._native = null;
+    }
+    open(method, url, async = true) {
+      this._method = String(method || "GET").toUpperCase();
+      this._url = normalizeBridgeRequestUrl(url);
+      this._async = async !== false;
+      this._headers = {};
+      this._setReadyState(EdgeTermXMLHttpRequest.OPENED);
+    }
+    setRequestHeader(name, value) {
+      this._headers[String(name)] = String(value);
+    }
+    overrideMimeType() {}
+    abort() {
+      this._aborted = true;
+      try {
+        this._native?.abort?.();
+      } catch {}
+      this.status = 0;
+      this.statusText = "";
+      this._setReadyState(EdgeTermXMLHttpRequest.DONE);
+      this.upload.emit("abort");
+      this.upload.emit("loadend");
+      this._emit("abort");
+      this._emit("loadend");
+    }
+    getAllResponseHeaders() {
+      return this.readyState < EdgeTermXMLHttpRequest.HEADERS_RECEIVED ? "" : this._responseHeaderLines;
+    }
+    getResponseHeader(name) {
+      if (this.readyState < EdgeTermXMLHttpRequest.HEADERS_RECEIVED) return null;
+      return this._responseHeaders[String(name || "").toLowerCase()] || null;
+    }
+    async send(body = null) {
+      if (!this._async) throw new DOMException("Synchronous XMLHttpRequest is not supported in EdgeServe preview.", "NotSupportedError");
+      if (!shouldIntercept(this._url) && OriginalXMLHttpRequest) {
+        const native = new OriginalXMLHttpRequest();
+        this._native = native;
+        native.open(this._method, this._url, true);
+        native.responseType = this.responseType || "";
+        native.withCredentials = this.withCredentials;
+        native.timeout = this.timeout;
+        for (const [name, value] of Object.entries(this._headers)) native.setRequestHeader(name, value);
+        for (const type of ["loadstart", "progress", "load", "error", "abort", "timeout", "loadend"]) {
+          native.upload?.addEventListener?.(type, (event) => this.upload.emit(type, event));
+        }
+        native.onreadystatechange = () => {
+          this.readyState = native.readyState;
+          this._emit("readystatechange");
+        };
+        native.onload = () => {
+          this.status = native.status;
+          this.statusText = native.statusText;
+          this.response = native.response;
+          try {
+            this.responseText = native.responseText;
+          } catch {
+            this.responseText = "";
+          }
+          this.responseURL = native.responseURL;
+          this._responseHeaderLines = native.getAllResponseHeaders();
+          this._setReadyState(EdgeTermXMLHttpRequest.DONE);
+          this._emit("load");
+          this._emit("loadend");
+        };
+        native.onerror = () => {
+          this.status = native.status || 0;
+          this._setReadyState(EdgeTermXMLHttpRequest.DONE);
+          this._emit("error");
+          this._emit("loadend");
+        };
+        native.send(body);
+        return;
+      }
+      this._aborted = false;
+      this._emit("loadstart");
+      let uploadTotal = 0;
+      try {
+        if (body instanceof Blob) uploadTotal = Number(body.size || 0);
+        else if (body instanceof ArrayBuffer) uploadTotal = body.byteLength;
+        else if (ArrayBuffer.isView(body)) uploadTotal = body.byteLength;
+        else uploadTotal = String(body || "").length;
+      } catch {}
+      this.upload.emit("loadstart", { loaded: 0, total: uploadTotal, lengthComputable: uploadTotal > 0 });
+      try {
+        const response = await bridgeFetch(this._url, { method: this._method, headers: this._headers, body });
+        if (this._aborted) return;
+        this.upload.emit("progress", { loaded: uploadTotal, total: uploadTotal, lengthComputable: uploadTotal > 0 });
+        this.upload.emit("load", { loaded: uploadTotal, total: uploadTotal, lengthComputable: uploadTotal > 0 });
+        this.upload.emit("loadend", { loaded: uploadTotal, total: uploadTotal, lengthComputable: uploadTotal > 0 });
+        this.status = response.status;
+        this.statusText = response.statusText || "";
+        this.responseURL = new URL(this._url, virtualUrl.href).href;
+        this._responseHeaders = {};
+        this._responseHeaderLines = "";
+        response.headers.forEach((value, name) => {
+          this._responseHeaders[String(name).toLowerCase()] = value;
+          this._responseHeaderLines += \`\${name}: \${value}\\r\\n\`;
+        });
+        this._setReadyState(EdgeTermXMLHttpRequest.HEADERS_RECEIVED);
+        this._setReadyState(EdgeTermXMLHttpRequest.LOADING);
+        if (this.responseType === "blob") {
+          this.response = await response.blob();
+          this.responseText = "";
+        } else if (this.responseType === "arraybuffer") {
+          this.response = await response.arrayBuffer();
+          this.responseText = "";
+        } else if (this.responseType === "json") {
+          this.responseText = await response.text();
+          try {
+            this.response = this.responseText ? JSON.parse(this.responseText) : null;
+          } catch {
+            this.response = null;
+          }
+        } else {
+          this.responseText = await response.text();
+          this.response = this.responseText;
+        }
+        this._setReadyState(EdgeTermXMLHttpRequest.DONE);
+        this._emit("load");
+        this._emit("loadend");
+      } catch (err) {
+        if (this._aborted) return;
+        this.upload.emit("error", { loaded: 0, total: uploadTotal, lengthComputable: uploadTotal > 0 });
+        this.upload.emit("loadend", { loaded: 0, total: uploadTotal, lengthComputable: uploadTotal > 0 });
+        this.status = 0;
+        this.statusText = "";
+        this._setReadyState(EdgeTermXMLHttpRequest.DONE);
+        this._emit("error");
+        this._emit("loadend");
+      }
+    }
+    _setReadyState(state) {
+      this.readyState = state;
+      this._emit("readystatechange");
+    }
+    _emit(type) {
+      const event = new Event(type);
+      this.dispatchEvent(event);
+      const handler = this["on" + type];
+      if (typeof handler === "function") {
+        try {
+          handler.call(this, event);
+        } catch (err) {
+          setTimeout(() => { throw err; }, 0);
+        }
+      }
+    }
+  }
+  EdgeTermXMLHttpRequest.prototype.UNSENT = EdgeTermXMLHttpRequest.UNSENT;
+  EdgeTermXMLHttpRequest.prototype.OPENED = EdgeTermXMLHttpRequest.OPENED;
+  EdgeTermXMLHttpRequest.prototype.HEADERS_RECEIVED = EdgeTermXMLHttpRequest.HEADERS_RECEIVED;
+  EdgeTermXMLHttpRequest.prototype.LOADING = EdgeTermXMLHttpRequest.LOADING;
+  EdgeTermXMLHttpRequest.prototype.DONE = EdgeTermXMLHttpRequest.DONE;
+  window.XMLHttpRequest = EdgeTermXMLHttpRequest;
+  const OriginalWebSocket = window.WebSocket;
+  const toBase64 = async (value) => {
+    let bytes;
+    if (value instanceof Blob) {
+      bytes = new Uint8Array(await value.arrayBuffer());
+    } else if (value instanceof ArrayBuffer) {
+      bytes = new Uint8Array(value);
+    } else if (ArrayBuffer.isView(value)) {
+      bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    } else {
+      return { kind: "text", data: String(value ?? "") };
+    }
+    let text = "";
+    for (let index = 0; index < bytes.length; index += 32768) {
+      text += String.fromCharCode(...bytes.subarray(index, index + 32768));
+    }
+    return { kind: "bytes", dataBase64: btoa(text) };
+  };
+  const fromBase64 = (value, binaryType) => {
+    const bytes = Uint8Array.from(atob(value || ""), (char) => char.charCodeAt(0));
+    if (binaryType === "arraybuffer") return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    return new Blob([bytes]);
+  };
+  const bridgedWebSockets = new Set();
+  class EdgeTermWebSocket extends EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+    constructor(url, protocols = []) {
+      super();
+      if (!shouldInterceptWebSocket(String(url || "")) && OriginalWebSocket) {
+        return new OriginalWebSocket(url, protocols);
+      }
+      this.url = String(url || "");
+      this.protocol = "";
+      this.extensions = "";
+      this.binaryType = "blob";
+      this.bufferedAmount = 0;
+      this.readyState = EdgeTermWebSocket.CONNECTING;
+      this._id = \`ws-\${Date.now().toString(36)}-\${Math.random().toString(36).slice(2)}\`;
+      this._closed = false;
+      this._pollTimer = 0;
+      this._protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
+      bridgedWebSockets.add(this);
+      this._open();
+    }
+    async _open() {
+      try {
+        const result = await parent.EdgeTermAppModeBridge.websocketOpen({
+          id: this._id,
+          url: this.url,
+          protocols: this._protocols,
+          currentPath: virtualPath(),
+        });
+        if (!result?.ok) {
+          this._finishClose(result?.status || 1006, result?.reason || "WebSocket connection failed");
+          return;
+        }
+        this.protocol = result.subprotocol || "";
+        this.readyState = EdgeTermWebSocket.OPEN;
+        this.dispatchEvent(new Event("open"));
+        this._poll();
+      } catch (err) {
+        this.dispatchEvent(new Event("error"));
+        this._finishClose(1006, err?.message || "WebSocket connection failed");
+      }
+    }
+    async _poll() {
+      if (this._closed || this.readyState === EdgeTermWebSocket.CLOSED) return;
+      try {
+        const result = await parent.EdgeTermAppModeBridge.websocketPoll({ id: this._id });
+        for (const event of result?.events || []) {
+          if (event.type === "message") {
+            const data = event.kind === "bytes" ? fromBase64(event.dataBase64 || "", this.binaryType) : String(event.data || "");
+            this.dispatchEvent(new MessageEvent("message", { data, origin: "edgeterm.local" }));
+          } else if (event.type === "close") {
+            this._finishClose(event.code || 1000, event.reason || "");
+            return;
+          }
+        }
+      } catch (err) {
+        this.dispatchEvent(new Event("error"));
+        this._finishClose(1006, err?.message || "WebSocket polling failed");
+        return;
+      }
+      this._pollTimer = setTimeout(() => this._poll(), 0);
+    }
+    async send(data) {
+      if (this.readyState !== EdgeTermWebSocket.OPEN) throw new DOMException("WebSocket is not open", "InvalidStateError");
+      const payload = await toBase64(data);
+      await parent.EdgeTermAppModeBridge.websocketSend({ id: this._id, ...payload });
+    }
+    close(code = 1000, reason = "") {
+      if (this.readyState === EdgeTermWebSocket.CLOSING || this.readyState === EdgeTermWebSocket.CLOSED) return;
+      this.readyState = EdgeTermWebSocket.CLOSING;
+      parent.EdgeTermAppModeBridge.websocketClose({ id: this._id, code, reason }).catch(() => {});
+      this._finishClose(code, reason);
+    }
+    _finishClose(code = 1000, reason = "") {
+      if (this._closed) return;
+      this._closed = true;
+      bridgedWebSockets.delete(this);
+      clearTimeout(this._pollTimer);
+      this.readyState = EdgeTermWebSocket.CLOSED;
+      this.dispatchEvent(new CloseEvent("close", { code: Number(code) || 1000, reason: String(reason || ""), wasClean: Number(code) === 1000 }));
+    }
+    set onopen(handler) { this._setHandler("open", handler); }
+    get onopen() { return this._onopen || null; }
+    set onmessage(handler) { this._setHandler("message", handler); }
+    get onmessage() { return this._onmessage || null; }
+    set onerror(handler) { this._setHandler("error", handler); }
+    get onerror() { return this._onerror || null; }
+    set onclose(handler) { this._setHandler("close", handler); }
+    get onclose() { return this._onclose || null; }
+    _setHandler(type, handler) {
+      const key = \`_on\${type}\`;
+      if (this[key]) this.removeEventListener(type, this[key]);
+      this[key] = typeof handler === "function" ? handler : null;
+      if (this[key]) this.addEventListener(type, this[key]);
+    }
+  }
+  EdgeTermWebSocket.prototype.CONNECTING = EdgeTermWebSocket.CONNECTING;
+  EdgeTermWebSocket.prototype.OPEN = EdgeTermWebSocket.OPEN;
+  EdgeTermWebSocket.prototype.CLOSING = EdgeTermWebSocket.CLOSING;
+  EdgeTermWebSocket.prototype.CLOSED = EdgeTermWebSocket.CLOSED;
+  window.WebSocket = EdgeTermWebSocket;
+  if (edgeServeDebug?.enabled) {
+    edgeServeLog("document", edgeServeDebug);
+  }
+  const hydrateBridgeDocument = () => {
+    hydrateAssets();
+    hydrateNavigationNode(document.documentElement);
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", hydrateBridgeDocument, { once: true });
+  else hydrateBridgeDocument();
+  try {
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        if (mutation.type === "attributes") {
+          hydrateNavigationNode(mutation.target);
+          hydrateAssetNode(mutation.target);
+          continue;
+        }
+        for (const node of mutation.addedNodes || []) {
+          if (!(node instanceof Element)) continue;
+          hydrateNavigationNode(node);
+          hydrateAssetNode(node);
+          if (node.querySelector?.(assetSelector + ", [style*='url('], [style*='URL(']")) {
+            scheduleHydrateAssets();
+          }
+        }
+      }
+    });
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["src", "srcset", "href", "action", "poster", "style", "data-edgeterm-asset-url"],
+    });
+  } catch {}
+  const handleInternalLinkClick = (event) => {
+    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+    const link = target?.closest?.("a[href], area[href]");
     if (!link) return;
-    const href = link.getAttribute("href");
-    if (!shouldIntercept(href) || link.target === "_blank" || event.defaultPrevented) return;
+    const href = link.getAttribute("data-edgeterm-nav-url") || link.getAttribute("href");
+    if (event.defaultPrevented) return;
+    if (!shouldIntercept(href)) return;
+    const destination = normalizeBridgeRequestUrl(href);
+    if (link.target === "_blank" || event.button === 1 || event.metaKey || event.ctrlKey) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      parent.EdgeTermAppModeBridge.openTab(destination);
+      return;
+    }
     event.preventDefault();
-    parent.EdgeTermAppModeBridge.navigate(href);
-  });
+    event.stopImmediatePropagation();
+    parent.EdgeTermAppModeBridge.navigate(destination);
+  };
+  document.addEventListener("click", handleInternalLinkClick, true);
+  document.addEventListener("auxclick", handleInternalLinkClick, true);
   document.addEventListener("submit", async (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
     event.preventDefault();
-    const action = form.getAttribute("action") || currentPath;
+    const action = normalizeBridgeRequestUrl(form.getAttribute("data-edgeterm-nav-url") || form.getAttribute("action") || virtualPath());
     const method = (form.getAttribute("method") || "GET").toUpperCase();
     const formData = new URLSearchParams(new FormData(form)).toString();
     if (method === "GET") {
@@ -2654,7 +4452,12 @@ export function bootstrapEdgeTerm() {
       allowDebugTerminal,
     });
   }, true);
-  window.addEventListener("beforeunload", () => syncSiteData());
+  window.addEventListener("beforeunload", () => {
+    syncSiteData();
+    for (const socket of bridgedWebSockets) {
+      parent.EdgeTermAppModeBridge.websocketClose({ id: socket._id, code: 1001, reason: "Frame unloaded" }).catch(() => {});
+    }
+  });
 })();
 `;
       }
@@ -2758,14 +4561,1211 @@ json.dumps(result)
 
       function appModeRequestHeaders(headers = {}) {
         const normalized = { ...headers };
-        if (appModeState.cookieJar?.size && !Object.keys(normalized).some((key) => key.toLowerCase() === "cookie")) {
-          normalized.cookie = [...appModeState.cookieJar.entries()].map(([key, value]) => `${key}=${value}`).join("; ");
+        const cookieKey = Object.keys(normalized).find((key) => key.toLowerCase() === "cookie");
+        const cookieHeader = appModeState.cookieJar?.size
+          ? [...appModeState.cookieJar.entries()].map(([key, value]) => `${key}=${value}`).join("; ")
+          : "";
+        if (cookieHeader && (!cookieKey || !String(normalized[cookieKey] || "").trim())) {
+          if (cookieKey) normalized[cookieKey] = cookieHeader;
+          else normalized.cookie = cookieHeader;
         }
         return normalized;
       }
 
+      function responseFromFsFile(fsPath) {
+        const mime = mimeTypeForPath(fsPath);
+        if (isTextMimeType(mime)) {
+          return {
+            status: 200,
+            headers: { "content-type": mime, "x-edgeterm-fs-path": fsPath },
+            body: readFsText(fsPath),
+            bodyBase64: "",
+          };
+        }
+        return {
+          status: 200,
+          headers: { "content-type": mime, "x-edgeterm-fs-path": fsPath },
+          body: "",
+          bodyBase64: bytesToBase64(readFsBytes(fsPath)),
+        };
+      }
+
+      function edgeServePhpLog(event, details = {}) {
+        const entry = { event, time: new Date().toISOString(), ...details };
+        window.EdgeTermServeLogs ||= [];
+        window.EdgeTermServeLogs.push(entry);
+        window.EdgeTermServeLogs = window.EdgeTermServeLogs.slice(-250);
+        if (["response", "document", "browser", "fetch", "redirect-missing-location"].includes(String(event))) {
+          window.EdgeTermServePageInfo = entry;
+        }
+        try {
+          console.info("[EdgeServe]", entry);
+        } catch {}
+        renderEdgeServeLiveLog();
+        return entry;
+      }
+
+      function edgeServeLogLine(entry = {}) {
+        const time = new Date(entry.time || Date.now()).toLocaleTimeString();
+        if (entry.event === "response") {
+          const method = entry.method || "";
+          const path = entry.path || entry.dispatchPath || entry.url || "";
+          const status = entry.status ?? "";
+          const duration = entry.durationMs !== "" && entry.durationMs != null ? ` ${entry.durationMs}ms` : "";
+          const kind = entry.kind || "";
+          const target = entry.script || entry.contentType || "";
+          const location = entry.location ? ` -> ${entry.location}` : "";
+          const stderr = entry.stderr ? ` stderr=${String(entry.stderr).replace(/\s+/g, " ").slice(0, 160)}` : "";
+          return `${time} ${method} ${path} ${status}${duration} ${kind}${target ? ` ${target}` : ""}${location}${stderr}`.trim();
+        }
+        if (entry.event === "request") {
+          return `${time} ${entry.method || ""} ${entry.dispatchPath || entry.url || ""} -> ${entry.script || entry.documentRoot || ""}`.trim();
+        }
+        if (entry.event === "fetch") {
+          const location = entry.location ? ` -> ${entry.location}` : "";
+          return `${time} fetch ${entry.method || "GET"} ${entry.url || ""} ${entry.status ?? ""} ${entry.durationMs || ""}ms ${entry.kind || ""}${location}`.trim();
+        }
+        if (entry.event === "browser" || entry.event === "document") {
+          return `${time} browser ${entry.kind || ""} ${entry.routePath || entry.path || ""} ${entry.status ?? ""}`.trim();
+        }
+        return `${time} ${entry.event || "log"} ${JSON.stringify(entry)}`;
+      }
+
+      function renderEdgeServeLiveLog() {
+        if (appModeState.renderTarget !== "display") return;
+        let panel = $id("edgeServeLiveLog");
+        const content = $id("browserContent");
+        if (!content && !document.body) return;
+        if (!panel) {
+          panel = document.createElement("section");
+          panel.id = "edgeServeLiveLog";
+          panel.dataset.open = "false";
+          panel.style.cssText = "position:fixed;left:0;top:50%;transform:translateY(-50%);z-index:2147483647;font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;pointer-events:none;";
+          const handle = document.createElement("button");
+          handle.id = "edgeServeLiveLogHandle";
+          handle.type = "button";
+          handle.title = "Show EdgeServe tools";
+          handle.setAttribute("aria-label", "Show EdgeServe tools");
+          handle.textContent = "›";
+          handle.style.cssText = "pointer-events:auto;width:26px;height:54px;border:1px solid #3f3f46;border-left:0;border-radius:0 3px 3px 0;background:#2f2f2f;color:#e5e7eb;padding:0;display:grid;place-items:center;cursor:grab;box-shadow:0 10px 24px rgba(0,0,0,.28);font:700 17px/1 system-ui,sans-serif;";
+          const drawer = document.createElement("div");
+          drawer.id = "edgeServeLiveLogDrawer";
+          drawer.style.cssText = "pointer-events:auto;position:fixed;left:42px;top:96px;width:min(720px,calc(100vw - 64px));max-height:min(580px,76vh);display:none;background:#020617;color:#dbeafe;border:1px solid #334155;border-radius:8px;box-shadow:0 18px 48px rgba(0,0,0,.42);overflow:hidden;";
+          const header = document.createElement("div");
+          header.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 10px;background:#0f172a;color:#bfdbfe;border-bottom:1px solid #1e293b;cursor:move;user-select:none;";
+          const title = document.createElement("strong");
+          title.textContent = "EdgeServe Tools";
+          title.style.cssText = "font-size:12px;font-weight:700;";
+          const close = document.createElement("button");
+          close.type = "button";
+          close.textContent = "Close";
+          close.style.cssText = "border:1px solid #334155;border-radius:6px;background:#111827;color:#e5e7eb;padding:4px 8px;cursor:pointer;font:12px system-ui,sans-serif;";
+          const tabs = document.createElement("div");
+          tabs.id = "edgeServeToolTabs";
+          tabs.style.cssText = "display:flex;gap:4px;padding:8px;background:#0b1220;border-bottom:1px solid #1e293b;";
+          const liveTab = document.createElement("button");
+          liveTab.type = "button";
+          liveTab.dataset.edgeServeToolTab = "log";
+          liveTab.textContent = "Live Log";
+          const pageTab = document.createElement("button");
+          pageTab.type = "button";
+          pageTab.dataset.edgeServeToolTab = "info";
+          pageTab.textContent = "Page Information";
+          const tabStyle = "border:1px solid #334155;border-radius:6px;background:#111827;color:#cbd5e1;padding:5px 9px;cursor:pointer;font:12px system-ui,sans-serif;";
+          liveTab.style.cssText = tabStyle;
+          pageTab.style.cssText = tabStyle;
+          const pre = document.createElement("pre");
+          pre.id = "edgeServeLiveLogLines";
+          pre.dataset.edgeServePanel = "log";
+          pre.style.cssText = "margin:0;padding:10px;max-height:calc(min(560px,76vh) - 86px);overflow:auto;white-space:pre-wrap;";
+          const info = document.createElement("pre");
+          info.id = "edgeServePageInformation";
+          info.dataset.edgeServePanel = "info";
+          info.style.cssText = "display:none;margin:0;padding:10px;max-height:calc(min(560px,76vh) - 86px);overflow:auto;white-space:pre-wrap;color:#e2e8f0;";
+          const setToolTab = (name = "log") => {
+            panel.dataset.toolTab = name;
+            for (const button of [liveTab, pageTab]) {
+              const active = button.dataset.edgeServeToolTab === name;
+              button.style.background = active ? "#1d4ed8" : "#111827";
+              button.style.borderColor = active ? "#60a5fa" : "#334155";
+              button.style.color = active ? "#fff" : "#cbd5e1";
+            }
+            pre.style.display = name === "log" ? "block" : "none";
+            info.style.display = name === "info" ? "block" : "none";
+          };
+          const setOpen = (open) => {
+            panel.dataset.open = open ? "true" : "false";
+            drawer.style.display = open ? "block" : "none";
+            handle.textContent = open ? "‹" : "›";
+            handle.setAttribute("aria-label", open ? "Hide EdgeServe tools" : "Show EdgeServe tools");
+            handle.title = open ? "Hide EdgeServe tools" : "Show EdgeServe tools";
+            if (open) setTimeout(() => {
+              const lines = $id("edgeServeLiveLogLines");
+              if (lines) lines.scrollTop = lines.scrollHeight;
+            }, 0);
+          };
+          const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
+          const moveHandle = (clientY) => {
+            const height = handle.offsetHeight || 54;
+            const nextTop = clamp(clientY - height / 2, 8, window.innerHeight - height - 8);
+            panel.style.top = `${nextTop}px`;
+            panel.style.transform = "none";
+          };
+          let handleDrag = null;
+          handle.addEventListener("pointerdown", (event) => {
+            handleDrag = {
+              pointerId: event.pointerId,
+              startY: event.clientY,
+              moved: false,
+            };
+            handle.style.cursor = "grabbing";
+            handle.setPointerCapture?.(event.pointerId);
+            event.preventDefault();
+          });
+          handle.addEventListener("pointermove", (event) => {
+            if (!handleDrag || handleDrag.pointerId !== event.pointerId) return;
+            if (Math.abs(event.clientY - handleDrag.startY) > 3) handleDrag.moved = true;
+            moveHandle(event.clientY);
+          });
+          const finishHandleDrag = (event) => {
+            if (!handleDrag || handleDrag.pointerId !== event.pointerId) return;
+            const wasDrag = handleDrag.moved;
+            handleDrag = null;
+            handle.style.cursor = "grab";
+            if (!wasDrag) setOpen(panel.dataset.open !== "true");
+          };
+          handle.addEventListener("pointerup", finishHandleDrag);
+          handle.addEventListener("pointercancel", finishHandleDrag);
+          let drawerDrag = null;
+          header.addEventListener("pointerdown", (event) => {
+            if (event.target === close) return;
+            const rect = drawer.getBoundingClientRect();
+            drawerDrag = {
+              pointerId: event.pointerId,
+              offsetX: event.clientX - rect.left,
+              offsetY: event.clientY - rect.top,
+            };
+            header.setPointerCapture?.(event.pointerId);
+            event.preventDefault();
+          });
+          header.addEventListener("pointermove", (event) => {
+            if (!drawerDrag || drawerDrag.pointerId !== event.pointerId) return;
+            const rect = drawer.getBoundingClientRect();
+            const nextLeft = clamp(event.clientX - drawerDrag.offsetX, 8, window.innerWidth - rect.width - 8);
+            const nextTop = clamp(event.clientY - drawerDrag.offsetY, 8, window.innerHeight - rect.height - 8);
+            drawer.style.left = `${nextLeft}px`;
+            drawer.style.top = `${nextTop}px`;
+          });
+          const finishDrawerDrag = (event) => {
+            if (!drawerDrag || drawerDrag.pointerId !== event.pointerId) return;
+            drawerDrag = null;
+          };
+          header.addEventListener("pointerup", finishDrawerDrag);
+          header.addEventListener("pointercancel", finishDrawerDrag);
+          close.addEventListener("click", () => setOpen(false));
+          liveTab.addEventListener("click", () => setToolTab("log"));
+          pageTab.addEventListener("click", () => setToolTab("info"));
+          header.append(title, close);
+          tabs.append(liveTab, pageTab);
+          drawer.append(header, tabs, pre, info);
+          panel.append(handle, drawer);
+          document.body.appendChild(panel);
+          setToolTab("log");
+        }
+        const pre = $id("edgeServeLiveLogLines");
+        const info = $id("edgeServePageInformation");
+        if (!pre || !info) return;
+        const entries = (window.EdgeTermServeLogs || []).slice(-80);
+        pre.textContent = entries.map(edgeServeLogLine).join("\n");
+        const latest = window.EdgeTermServePageInfo || entries.slice().reverse().find((entry) => ["response", "document", "browser", "fetch", "redirect-missing-location"].includes(String(entry.event))) || {};
+        info.textContent = JSON.stringify(latest, null, 2);
+        if (panel.dataset.open === "true") pre.scrollTop = pre.scrollHeight;
+      }
+
+      function edgeServeDebugHeaders(details = {}) {
+        const headers = {
+          "x-edgeterm-debug-kind": String(details.kind || "app"),
+          "x-edgeterm-request-id": String(details.requestId || ""),
+          "x-edgeterm-request-method": String(details.method || ""),
+          "x-edgeterm-request-path": String(details.path || ""),
+          "x-edgeterm-route-prefix": String(details.routePrefix || ""),
+        };
+        if (details.durationMs != null) headers["x-edgeterm-duration-ms"] = String(details.durationMs);
+        return headers;
+      }
+
+      function edgeServePhpDebugHeaders(details = {}) {
+        const headers = {
+          "x-edgeterm-debug-kind": "php",
+          "x-edgeterm-php-request-id": String(details.requestId || ""),
+          "x-edgeterm-php-dispatch-path": String(details.dispatchPath || ""),
+          "x-edgeterm-php-script": String(details.scriptFsPath || ""),
+          "x-edgeterm-php-script-name": String(details.scriptName || ""),
+          "x-edgeterm-php-path-info": String(details.pathInfo || ""),
+        };
+        if (details.durationMs != null) headers["x-edgeterm-php-duration-ms"] = String(details.durationMs);
+        if (details.exitCode != null) headers["x-edgeterm-php-exit-code"] = String(details.exitCode);
+        return headers;
+      }
+
+      function parseRawPhpHeaderText(rawHeaders = "") {
+        const assoc = {};
+        const list = [];
+        let status = null;
+        for (const rawLine of String(rawHeaders || "").split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          if (/^HTTP\/\d(?:\.\d)?\s+\d{3}\b/i.test(line)) {
+            const match = line.match(/\s(\d{3})\b/);
+            if (match) status = Number(match[1]);
+            continue;
+          }
+          const index = line.indexOf(":");
+          if (index <= 0) continue;
+          const name = line.slice(0, index).trim();
+          const value = line.slice(index + 1).trimStart();
+          if (/^Status$/i.test(name)) {
+            const match = value.match(/^(\d{3})\b/);
+            if (match) status = Number(match[1]);
+          }
+          list.push([name, value]);
+          if (assoc[name]) {
+            if (Array.isArray(assoc[name])) assoc[name].push(value);
+            else assoc[name] = [assoc[name], value];
+          } else {
+            assoc[name] = value;
+          }
+        }
+        return { headers: assoc, headerList: list, status };
+      }
+
+      function parsePhpSapiHeaders(headersJson = "", rawHeaders = "") {
+        const rawText = String(rawHeaders || "");
+        const jsonText = String(headersJson || "").trim() || (/^\s*[{[]/.test(rawText) ? rawText.trim() : "");
+        const parsed = jsonText && jsonText === rawText.trim() ? { headers: {}, headerList: [], status: null } : parseRawPhpHeaderText(rawHeaders);
+        const addHeader = (name, value) => {
+          if (!name) return;
+          const headerName = String(name);
+          if (/^Status$/i.test(headerName)) {
+            const match = String(value || "").match(/^(\d{3})\b/);
+            if (match) parsed.status = Number(match[1]);
+          }
+          parsed.headerList.push([headerName, String(value ?? "")]);
+          if (parsed.headers[headerName]) {
+            if (Array.isArray(parsed.headers[headerName])) parsed.headers[headerName].push(String(value ?? ""));
+            else parsed.headers[headerName] = [parsed.headers[headerName], String(value ?? "")];
+          } else {
+            parsed.headers[headerName] = String(value ?? "");
+          }
+        };
+        if (!jsonText) return parsed;
+        try {
+          const decoded = JSON.parse(jsonText);
+          const status = Number(decoded?.status || decoded?.statusCode || decoded?.httpStatus || 0);
+          if (status) parsed.status = status;
+          const headerSource = decoded?.headers || decoded?.responseHeaders || decoded;
+          if (Array.isArray(headerSource)) {
+            for (const item of headerSource) {
+              if (Array.isArray(item)) addHeader(item[0], item[1]);
+              else if (typeof item === "string") {
+                const line = item.trim();
+                if (/^HTTP\/\d(?:\.\d)?\s+\d{3}\b/i.test(line)) {
+                  const match = line.match(/\s(\d{3})\b/);
+                  if (match) parsed.status = Number(match[1]);
+                  continue;
+                }
+                const index = line.indexOf(":");
+                if (index > 0) addHeader(line.slice(0, index).trim(), line.slice(index + 1).trimStart());
+              }
+              else if (item && typeof item === "object") addHeader(item.name || item.key, item.value);
+            }
+          } else if (headerSource && typeof headerSource === "object") {
+            for (const [name, value] of Object.entries(headerSource)) {
+              if (["status", "statusCode", "httpStatus", "headers", "responseHeaders"].includes(name)) continue;
+              if (Array.isArray(value)) {
+                for (const entry of value) addHeader(name, entry);
+              } else {
+                addHeader(name, value);
+              }
+            }
+          }
+        } catch {
+          const statusMatch = jsonText.match(/["']?status["']?\s*:\s*(\d{3})\b/i);
+          if (statusMatch) parsed.status = Number(statusMatch[1]);
+          for (const match of jsonText.matchAll(/"([^"\r\n]+:\s*(?:\\.|[^"])*)"/g)) {
+            const line = match[1].replace(/\\"/g, '"').trim();
+            const index = line.indexOf(":");
+            if (index > 0) addHeader(line.slice(0, index).trim(), line.slice(index + 1).trimStart());
+          }
+          if (parsed.headerList.length) return parsed;
+          const extra = parseRawPhpHeaderText(rawText || headersJson);
+          if (extra.status) parsed.status = extra.status;
+          for (const [name, value] of extra.headerList) addHeader(name, value);
+        }
+        return parsed;
+      }
+
+      function addResponseHeader(response, name, value) {
+        response.headers ||= {};
+        response.headerList ||= [];
+        response.headerList.push([name, value]);
+        if (response.headers[name]) {
+          if (Array.isArray(response.headers[name])) response.headers[name].push(value);
+          else response.headers[name] = [response.headers[name], value];
+        } else {
+          response.headers[name] = value;
+        }
+      }
+
+      function attachEdgeServeDebug(response = {}, details = {}) {
+        response.headers ||= {};
+        const headers = edgeServeDebugHeaders(details);
+        for (const [key, value] of Object.entries(headers)) {
+          if (!response.headers[key]) response.headers[key] = value;
+        }
+        edgeServePhpLog("response", {
+          kind: response.headers["x-edgeterm-debug-kind"] || details.kind || "app",
+          requestId: response.headers["x-edgeterm-request-id"] || details.requestId || "",
+          method: details.method || response.headers["x-edgeterm-request-method"] || "",
+          path: details.path || response.headers["x-edgeterm-request-path"] || "",
+          status: response.status,
+          durationMs: response.headers["x-edgeterm-duration-ms"] || details.durationMs || "",
+          location: response.headers.location || response.headers.Location || "",
+          contentType: response.headers["content-type"] || response.headers["Content-Type"] || "",
+        });
+        return response;
+      }
+
+      function edgeServeDebugForResponse(response = {}, routePath = "/") {
+        const headers = response.headers || {};
+        const kind = headers["x-edgeterm-debug-kind"] || headers["X-EdgeTerm-Debug-Kind"] || "";
+        if (!kind) return null;
+        return {
+          enabled: true,
+          kind,
+          routePath,
+          status: response.status,
+          requestId: headers["x-edgeterm-request-id"] || headers["X-EdgeTerm-Request-Id"] || headers["x-edgeterm-php-request-id"] || headers["X-EdgeTerm-Php-Request-Id"] || "",
+          method: headers["x-edgeterm-request-method"] || headers["X-EdgeTerm-Request-Method"] || "",
+          requestPath: headers["x-edgeterm-request-path"] || headers["X-EdgeTerm-Request-Path"] || "",
+          routePrefix: headers["x-edgeterm-route-prefix"] || headers["X-EdgeTerm-Route-Prefix"] || "",
+          dispatchPath: headers["x-edgeterm-php-dispatch-path"] || headers["X-EdgeTerm-Php-Dispatch-Path"] || "",
+          script: headers["x-edgeterm-php-script"] || headers["X-EdgeTerm-Php-Script"] || headers["x-edgeterm-fs-path"] || "",
+          scriptName: headers["x-edgeterm-php-script-name"] || headers["X-EdgeTerm-Php-Script-Name"] || "",
+          pathInfo: headers["x-edgeterm-php-path-info"] || headers["X-EdgeTerm-Php-Path-Info"] || "",
+          durationMs: headers["x-edgeterm-duration-ms"] || headers["X-EdgeTerm-Duration-Ms"] || headers["x-edgeterm-php-duration-ms"] || headers["X-EdgeTerm-Php-Duration-Ms"] || "",
+          exitCode: headers["x-edgeterm-php-exit-code"] || headers["X-EdgeTerm-Php-Exit-Code"] || "",
+          location: headers.location || headers.Location || "",
+          inferredLocation: headers["x-edgeterm-inferred-location"] || headers["X-EdgeTerm-Inferred-Location"] || "",
+          contentType: headers["content-type"] || headers["Content-Type"] || "",
+          stderr: headers["x-edgeterm-php-stderr"] || headers["X-EdgeTerm-Php-Stderr"] || "",
+          setCookie: headers["set-cookie"] || headers["Set-Cookie"] || response.headerList?.filter?.(([key]) => String(key).toLowerCase() === "set-cookie").map(([, value]) => value) || "",
+          responseHeaders: headers,
+          headerList: response.headerList || [],
+        };
+      }
+
+      function resolvePhpRequestTarget(instance, requestPath = "/") {
+        const routePath = normalizePath(requestPath || "/");
+        const documentRoot = normalizePath(instance.target || instance.workingDirectory || `/home/${activeUser()}`);
+        const entryScript = instance.entryScript ? normalizePath(instance.entryScript) : "";
+        if (entryScript) {
+          return {
+            kind: "php",
+            documentRoot,
+            scriptFsPath: entryScript,
+            scriptName: `/${entryScript.split("/").filter(Boolean).pop()}`,
+            pathInfo: routePath === "/" ? "" : routePath,
+            requestPath: routePath,
+          };
+        }
+
+        const candidate = routePath === "/" ? documentRoot : resolveWorkspaceDirectory(documentRoot, `.${routePath}`);
+        if (fsIsFile(candidate)) {
+          if (/\.php$/i.test(candidate)) {
+            return {
+              kind: "php",
+              documentRoot,
+              scriptFsPath: candidate,
+              scriptName: routePath,
+              pathInfo: "",
+              requestPath: routePath,
+            };
+          }
+          return { kind: "static", documentRoot, fsPath: candidate, requestPath: routePath };
+        }
+
+        if (fsIsDir(candidate)) {
+          const phpIndex = resolveWorkspaceDirectory(candidate, "index.php");
+          if (fsIsFile(phpIndex)) {
+            let scriptName = routePath;
+            if (!scriptName.endsWith("/")) scriptName += "/";
+            scriptName += "index.php";
+            return {
+              kind: "php",
+              documentRoot,
+              scriptFsPath: phpIndex,
+              scriptName,
+              pathInfo: "",
+              requestPath: routePath,
+            };
+          }
+          const htmlIndex = resolveWorkspaceDirectory(candidate, "index.html");
+          if (fsIsFile(htmlIndex)) return { kind: "static", documentRoot, fsPath: htmlIndex, requestPath: routePath };
+        }
+
+        const parts = routePath.split("/").filter(Boolean);
+        for (let index = parts.length; index >= 1; index -= 1) {
+          const scriptPath = `/${parts.slice(0, index).join("/")}`;
+          if (!scriptPath.endsWith(".php")) continue;
+          const scriptFsPath = resolveWorkspaceDirectory(documentRoot, `.${scriptPath}`);
+          if (!fsIsFile(scriptFsPath)) continue;
+          const remainder = parts.slice(index).join("/");
+          return {
+            kind: "php",
+            documentRoot,
+            scriptFsPath,
+            scriptName: scriptPath,
+            pathInfo: remainder ? `/${remainder}` : "",
+            requestPath: routePath,
+          };
+        }
+
+        const frontController = resolveWorkspacePath(documentRoot, "index.php");
+        if (fsIsFile(frontController)) {
+          return {
+            kind: "php",
+            documentRoot,
+            scriptFsPath: frontController,
+            scriptName: "/index.php",
+            pathInfo: routePath === "/" ? "" : routePath,
+            requestPath: routePath,
+          };
+        }
+
+        return null;
+      }
+
+      function phpRequestWrapperSource() {
+        return `<?php
+error_reporting(E_ALL);
+ini_set('html_errors', '0');
+ini_set('display_errors', 'stderr');
+
+$requestFile = $argv[1] ?? '';
+if (!$requestFile || !is_file($requestFile)) {
+    fwrite(STDERR, "EdgeTerm PHP request file missing\\n");
+    exit(1);
+}
+
+$request = json_decode(file_get_contents($requestFile), true);
+if (!is_array($request)) {
+    fwrite(STDERR, "EdgeTerm PHP request payload invalid\\n");
+    exit(1);
+}
+
+function edge_parse_cookie_header($header) {
+    $cookies = [];
+    foreach (preg_split('/;\\s*/', (string) $header) as $chunk) {
+        if ($chunk === '' || strpos($chunk, '=') === false) continue;
+        [$name, $value] = explode('=', $chunk, 2);
+        $cookies[$name] = urldecode($value);
+    }
+    return $cookies;
+}
+
+function edge_parse_header_lines() {
+    $list = [];
+    $assoc = [];
+    $status = null;
+    foreach (headers_list() as $line) {
+        if (strpos($line, ':') === false) continue;
+        [$name, $value] = explode(':', $line, 2);
+        $name = trim($name);
+        $value = ltrim($value);
+        if (strcasecmp($name, 'Status') === 0 && preg_match('/^\\s*(\\d{3})\\b/', $value, $match)) {
+            $status = (int) $match[1];
+        }
+        $list[] = [$name, $value];
+        if (isset($assoc[$name])) {
+            if (is_array($assoc[$name])) $assoc[$name][] = $value;
+            else $assoc[$name] = [$assoc[$name], $value];
+        } else {
+            $assoc[$name] = $value;
+        }
+    }
+    return [$assoc, $list, $status];
+}
+
+function edge_parse_multipart($body, $contentType) {
+    $result = ['post' => [], 'files' => []];
+    if (!preg_match('/boundary=(?:"([^"]+)"|([^;]+))/i', (string) $contentType, $match)) return $result;
+    $boundary = $match[1] !== '' ? $match[1] : trim($match[2]);
+    if ($boundary === '') return $result;
+    $marker = '--' . $boundary;
+    $parts = explode($marker, (string) $body);
+    $uploadDir = rtrim(sys_get_temp_dir(), '/\\\\') . '/edgeterm-uploads';
+    if (!is_dir($uploadDir)) @mkdir($uploadDir, 0777, true);
+    foreach ($parts as $part) {
+        $part = ltrim($part, "\\r\\n");
+        $part = rtrim($part, "\\r\\n");
+        if ($part === '' || $part === '--') continue;
+        if (substr($part, -2) === '--') $part = substr($part, 0, -2);
+        $separator = strpos($part, "\\r\\n\\r\\n");
+        if ($separator === false) continue;
+        $rawHeaders = substr($part, 0, $separator);
+        $content = substr($part, $separator + 4);
+        $headers = [];
+        foreach (explode("\\r\\n", $rawHeaders) as $line) {
+            if (strpos($line, ':') === false) continue;
+            [$name, $value] = explode(':', $line, 2);
+            $headers[strtolower(trim($name))] = trim($value);
+        }
+        $disposition = $headers['content-disposition'] ?? '';
+        if (!preg_match('/name="([^"]+)"/', $disposition, $nameMatch)) continue;
+        $fieldName = $nameMatch[1];
+        if (preg_match('/filename="([^"]*)"/', $disposition, $fileMatch)) {
+            $filename = $fileMatch[1];
+            $tmp = tempnam($uploadDir, 'php');
+            file_put_contents($tmp, $content);
+            $result['files'][$fieldName] = [
+                'name' => $filename,
+                'type' => $headers['content-type'] ?? 'application/octet-stream',
+                'tmp_name' => $tmp,
+                'error' => 0,
+                'size' => strlen($content),
+            ];
+        } else {
+            $result['post'][$fieldName] = $content;
+        }
+    }
+    return $result;
+}
+
+$requestMethod = strtoupper((string) ($request['method'] ?? 'GET'));
+$queryString = (string) ($request['query'] ?? '');
+$requestUri = (string) ($request['requestUri'] ?? '/');
+$contentType = (string) ($request['contentType'] ?? '');
+$body = '';
+if (!empty($request['bodyBase64'])) $body = base64_decode((string) $request['bodyBase64']);
+elseif (array_key_exists('body', $request)) $body = (string) $request['body'];
+$cookieHeader = (string) ($request['cookie'] ?? '');
+
+parse_str($queryString, $_GET);
+$_POST = [];
+$_FILES = [];
+$_COOKIE = edge_parse_cookie_header($cookieHeader);
+if ($requestMethod === 'POST' || $requestMethod === 'PUT' || $requestMethod === 'PATCH' || $requestMethod === 'DELETE') {
+    if (stripos($contentType, 'application/x-www-form-urlencoded') === 0) {
+        parse_str($body, $_POST);
+    } elseif (stripos($contentType, 'multipart/form-data') === 0) {
+        $parsed = edge_parse_multipart($body, $contentType);
+        $_POST = $parsed['post'];
+        $_FILES = $parsed['files'];
+    }
+}
+$_REQUEST = array_merge($_GET, $_POST, $_COOKIE);
+
+$documentRoot = (string) ($request['documentRoot'] ?? getcwd());
+$scriptFile = (string) ($request['scriptFilename'] ?? '');
+$scriptName = (string) ($request['scriptName'] ?? '/index.php');
+$pathInfo = (string) ($request['pathInfo'] ?? '');
+$serverName = (string) ($request['serverName'] ?? 'edgeterm.local');
+$serverPort = (string) ($request['serverPort'] ?? '443');
+$hostHeader = (string) (($request['headers']['host'] ?? $request['headers']['Host'] ?? '') ?: $serverName);
+$webSocketEvent = (string) ($request['webSocketEvent'] ?? '');
+$webSocketId = (string) ($request['webSocketId'] ?? '');
+$webSocketProtocol = (string) ($request['webSocketProtocol'] ?? '');
+$webSocketProtocols = is_array($request['webSocketProtocols'] ?? null) ? $request['webSocketProtocols'] : [];
+
+$_SERVER = [
+    'DOCUMENT_ROOT' => $documentRoot,
+    'GATEWAY_INTERFACE' => 'CGI/1.1',
+    'HTTPS' => 'on',
+    'HTTP_ACCEPT' => (string) (($request['headers']['accept'] ?? $request['headers']['Accept'] ?? '') ?: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'),
+    'HTTP_COOKIE' => $cookieHeader,
+    'HTTP_HOST' => $hostHeader,
+    'HTTP_ORIGIN' => (string) (($request['headers']['origin'] ?? $request['headers']['Origin'] ?? '') ?: 'https://' . $hostHeader),
+    'HTTP_REFERER' => (string) (($request['headers']['referer'] ?? $request['headers']['Referer'] ?? '') ?: 'https://' . $hostHeader . $requestUri),
+    'HTTP_USER_AGENT' => (string) (($request['headers']['user-agent'] ?? $request['headers']['User-Agent'] ?? '') ?: 'EdgeServe PHP-WASM'),
+    'HTTP_X_REQUESTED_WITH' => (string) (($request['headers']['x-requested-with'] ?? $request['headers']['X-Requested-With'] ?? '') ?: 'XMLHttpRequest'),
+    'PATH_INFO' => $pathInfo,
+    'PATH_TRANSLATED' => $pathInfo ? $documentRoot . $pathInfo : '',
+    'PHP_SELF' => $scriptName,
+    'QUERY_STRING' => $queryString,
+    'REMOTE_ADDR' => '127.0.0.1',
+    'REMOTE_PORT' => '0',
+    'REQUEST_METHOD' => $requestMethod,
+    'REQUEST_SCHEME' => 'https',
+    'REQUEST_TIME' => time(),
+    'REQUEST_TIME_FLOAT' => microtime(true),
+    'REQUEST_URI' => $requestUri,
+    'SCRIPT_FILENAME' => $scriptFile,
+    'SCRIPT_NAME' => $scriptName,
+    'SERVER_ADDR' => '127.0.0.1',
+    'SERVER_NAME' => $serverName,
+    'SERVER_PORT' => $serverPort,
+    'SERVER_PROTOCOL' => 'HTTP/1.1',
+    'SERVER_SIGNATURE' => '',
+    'SERVER_SOFTWARE' => 'EdgeServe/PHP-WASM',
+    'EDGETERM_WEBSOCKET_EVENT' => $webSocketEvent,
+    'EDGETERM_WEBSOCKET_ID' => $webSocketId,
+];
+
+foreach (($request['headers'] ?? []) as $name => $value) {
+    $key = 'HTTP_' . strtoupper(str_replace('-', '_', (string) $name));
+    $_SERVER[$key] = (string) $value;
+}
+if ($contentType !== '') $_SERVER['CONTENT_TYPE'] = $contentType;
+if ($body !== '') $_SERVER['CONTENT_LENGTH'] = (string) strlen($body);
+
+$_ENV['EDGETERM_PHP_BODY_BASE64'] = base64_encode($body);
+$GLOBALS['HTTP_RAW_POST_DATA'] = $body;
+$GLOBALS['EDGETERM_WEBSOCKET'] = [
+    'event' => $webSocketEvent,
+    'id' => $webSocketId,
+    'protocol' => $webSocketProtocol,
+    'protocols' => $webSocketProtocols,
+];
+$GLOBALS['EDGETERM_WEBSOCKET_MESSAGES'] = [];
+$GLOBALS['EDGETERM_WEBSOCKET_CLOSE'] = null;
+
+if (!function_exists('edgeterm_ws_event')) {
+    function edgeterm_ws_event() {
+        return $GLOBALS['EDGETERM_WEBSOCKET'] ?? ['event' => '', 'id' => '', 'protocol' => '', 'protocols' => []];
+    }
+}
+if (!function_exists('edgeterm_ws_send')) {
+    function edgeterm_ws_send($data, $kind = null) {
+        if ($kind === null) $kind = is_string($data) ? 'text' : 'json';
+        if ($kind === 'bytes') {
+            $GLOBALS['EDGETERM_WEBSOCKET_MESSAGES'][] = [
+                'type' => 'message',
+                'kind' => 'bytes',
+                'dataBase64' => base64_encode((string) $data),
+            ];
+            return;
+        }
+        if ($kind === 'json') $data = json_encode($data, JSON_UNESCAPED_SLASHES);
+        $GLOBALS['EDGETERM_WEBSOCKET_MESSAGES'][] = [
+            'type' => 'message',
+            'kind' => 'text',
+            'data' => (string) $data,
+        ];
+    }
+}
+if (!function_exists('edgeterm_ws_close')) {
+    function edgeterm_ws_close($code = 1000, $reason = '') {
+        $GLOBALS['EDGETERM_WEBSOCKET_CLOSE'] = [
+            'type' => 'close',
+            'code' => (int) $code,
+            'reason' => (string) $reason,
+        ];
+    }
+}
+
+http_response_code(200);
+$responseMeta = ['status' => 200];
+$emitted = false;
+ob_start();
+
+register_shutdown_function(function () use (&$emitted, &$responseMeta) {
+    if ($emitted) return;
+    $emitted = true;
+    $output = ob_get_contents();
+    if (ob_get_level() > 0) ob_end_clean();
+    $fatal = error_get_last();
+    if ($fatal && in_array($fatal['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        $responseMeta['status'] = max(500, (int) http_response_code());
+        $output .= ($output !== '' ? "\\n" : '') . $fatal['message'];
+    } else {
+        $responseMeta['status'] = (int) http_response_code();
+    }
+    [$headers, $headerList, $headerStatus] = edge_parse_header_lines();
+    if ($headerStatus !== null) {
+        $responseMeta['status'] = $headerStatus;
+    } elseif (($headers['Location'] ?? $headers['location'] ?? '') !== '' && $responseMeta['status'] < 300) {
+        $responseMeta['status'] = 302;
+    }
+    if (($GLOBALS['EDGETERM_WEBSOCKET']['event'] ?? '') !== '') {
+        $wsEvents = $GLOBALS['EDGETERM_WEBSOCKET_MESSAGES'] ?? [];
+        if (($GLOBALS['EDGETERM_WEBSOCKET_CLOSE'] ?? null) !== null) $wsEvents[] = $GLOBALS['EDGETERM_WEBSOCKET_CLOSE'];
+        $output = json_encode([
+            'ok' => $responseMeta['status'] < 400,
+            'subprotocol' => (string) ($GLOBALS['EDGETERM_WEBSOCKET']['protocol'] ?? ''),
+            'events' => $wsEvents,
+            'output' => $output,
+        ], JSON_UNESCAPED_SLASHES);
+        $headers['Content-Type'] = 'application/json; charset=utf-8';
+    }
+    if (!isset($headers['Content-Type'])) $headers['Content-Type'] = 'text/html; charset=utf-8';
+    echo json_encode([
+        'status' => $responseMeta['status'],
+        'headers' => $headers,
+        'headerList' => $headerList,
+        'body' => '',
+        'bodyBase64' => base64_encode($output),
+    ], JSON_UNESCAPED_SLASHES);
+});
+
+try {
+    if ($documentRoot && is_dir($documentRoot)) chdir($documentRoot);
+    if ($scriptFile === '' || !is_file($scriptFile)) {
+        http_response_code(404);
+        echo "PHP entry script not found";
+        return;
+    }
+    require $scriptFile;
+    $responseMeta['status'] = (int) http_response_code();
+} catch (Throwable $error) {
+    http_response_code(500);
+    echo $error->getMessage() . "\\n" . $error->getTraceAsString();
+}
+?>`;
+      }
+
+      async function dispatchPhpAppRequest(url, options, config, preferredInstance = null) {
+        const { path, query } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
+        let dispatchPath = path || "/";
+        const requestMethod = String(options.method || "GET").toUpperCase();
+        const matchedInstance = preferredInstance || findEdgeServeInstanceForPath(dispatchPath);
+        const activeTab = appModeState.renderTarget === "display" ? activeDisplayBrowserTab() : null;
+        const activeInstanceId = matchedInstance?.id || activeTab?.instanceId || config.python?.instanceId || "";
+        const activeInstance = matchedInstance || window.EdgeTermServe?.instances?.get(activeInstanceId) || null;
+        if (!activeInstance) {
+          return {
+            status: 500,
+            headers: { "content-type": "text/plain; charset=utf-8" },
+            body: "PHP EdgeServe instance is not available.",
+            bodyBase64: "",
+          };
+        }
+
+        const routePrefix = normalizePath(activeInstance.routePrefix || activeTab?.routePrefix || config.python?.routePrefix || "/");
+        if (routePrefix !== "/" && dispatchPath.startsWith(routePrefix)) {
+          dispatchPath = dispatchPath.slice(routePrefix.length) || "/";
+          if (!dispatchPath.startsWith("/")) dispatchPath = `/${dispatchPath}`;
+        }
+
+          const target = resolvePhpRequestTarget(activeInstance, dispatchPath);
+        if (!target) {
+          edgeServePhpLog("not-found", {
+            method: requestMethod,
+            url: String(url || ""),
+            routePrefix,
+            dispatchPath,
+            documentRoot: activeInstance.target || activeInstance.workingDirectory || "",
+          });
+          return {
+            status: 404,
+            headers: {
+              "content-type": "text/html; charset=utf-8",
+              ...edgeServePhpDebugHeaders({ dispatchPath }),
+            },
+            body: `<h1>404 Not Found</h1><p>No PHP app file for <code>${encodeHtml(dispatchPath)}</code>.</p>`,
+            bodyBase64: "",
+          };
+        }
+        if (target.kind === "static") return responseFromFsFile(target.fsPath);
+
+        const serialized = await serializeAppModeRequestBody(
+          requestMethod,
+          appModeRequestHeaders(options.headers || {}),
+          options.body ?? null
+        );
+        const requestId = `${activeInstance.id || "php"}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const requestFile = `/tmp/edgeterm-php-request-${requestId}.json`;
+        const wrapperFile = `/tmp/edgeterm-php-dispatch-${requestId}.php`;
+        const startedAt = performance.now();
+        const payload = {
+          method: requestMethod,
+          query,
+          requestUri: `${target.requestPath || dispatchPath}${query ? `?${query}` : ""}`,
+          headers: serialized.headers,
+          cookie: serialized.headers.cookie || serialized.headers.Cookie || "",
+          contentType: serialized.headers["content-type"] || serialized.headers["Content-Type"] || "",
+          body: serialized.body,
+          bodyBase64: serialized.bodyBase64,
+          documentRoot: target.documentRoot,
+          scriptFilename: target.scriptFsPath,
+          scriptName: target.scriptName,
+          pathInfo: target.pathInfo || "",
+          serverName: "edgeterm.local",
+          serverPort: "443",
+          webSocketEvent: options.webSocketEvent || "",
+          webSocketId: options.webSocketId || "",
+          webSocketProtocol: options.webSocketProtocol || "",
+          webSocketProtocols: Array.isArray(options.webSocketProtocols) ? options.webSocketProtocols : [],
+        };
+
+        const bridgedResponse = await maybeHandleWordPressThemeDirectoryAjax({
+          requestId,
+          requestMethod,
+          query,
+          dispatchPath,
+          routePrefix,
+          target,
+          serialized,
+          startedAt,
+        });
+        if (bridgedResponse) return bridgedResponse;
+
+        pyodide.FS.writeFile(requestFile, JSON.stringify(payload));
+        pyodide.FS.writeFile(wrapperFile, phpRequestWrapperSource());
+        try {
+          edgeServePhpLog("request", {
+            requestId,
+            method: requestMethod,
+            url: String(url || ""),
+            routePrefix,
+            dispatchPath,
+            requestUri: payload.requestUri,
+            documentRoot: target.documentRoot,
+            script: target.scriptFsPath,
+            scriptName: target.scriptName,
+            pathInfo: target.pathInfo || "",
+            cookieNames: String(payload.cookie || "").split(/;\s*/).map((item) => item.split("=", 1)[0]).filter(Boolean),
+            contentType: payload.contentType,
+            bodyBytes: payload.bodyBase64 ? Math.ceil((payload.bodyBase64.length * 3) / 4) : String(payload.body || "").length,
+          });
+          const raw = await window.EdgeTermWasmCLI.runCommandJSON(
+            "php",
+            JSON.stringify([wrapperFile, requestFile]),
+            "",
+            target.documentRoot,
+            JSON.stringify({
+              EDGETERM_PHP_STREAM: "0",
+              EDGETERM_PHP_SAPI_REQUEST: JSON.stringify(payload),
+              EDGETERM_WASM_TIMEOUT_MS: "120000",
+              EDGETERM_WASM_SYNC_ROOTS: JSON.stringify([
+                target.documentRoot,
+                "/tmp",
+                "/var",
+                "/etc",
+                "/packages",
+                "/packages/php",
+              ]),
+            })
+          );
+          const durationMs = Math.round(performance.now() - startedAt);
+          const result = JSON.parse(String(raw || "{}"));
+          schedulePersistActiveWorkspace(750);
+          if (!result?.found) {
+            edgeServePhpLog("runtime-missing", { requestId, durationMs, command: "php" });
+            return {
+              status: 500,
+              headers: {
+                "content-type": "text/plain; charset=utf-8",
+                ...edgeServePhpDebugHeaders({
+                  requestId,
+                  dispatchPath,
+                  scriptFsPath: target.scriptFsPath,
+                  scriptName: target.scriptName,
+                  pathInfo: target.pathInfo || "",
+                  durationMs,
+                }),
+              },
+              body: "PHP runtime is not available.",
+              bodyBase64: "",
+            };
+          }
+          if (result.code !== 0 && !String(result.stdout || "").trim()) {
+            edgeServePhpLog("failed", {
+              requestId,
+              durationMs,
+              exitCode: result.code,
+              stderr: String(result.stderr || "").slice(0, 2000),
+            });
+            return {
+              status: 500,
+              headers: {
+                "content-type": "text/plain; charset=utf-8",
+                ...edgeServePhpDebugHeaders({
+                  requestId,
+                  dispatchPath,
+                  scriptFsPath: target.scriptFsPath,
+                  scriptName: target.scriptName,
+                  pathInfo: target.pathInfo || "",
+                  durationMs,
+                  exitCode: result.code,
+                }),
+                "x-edgeterm-php-stderr": String(result.stderr || "").slice(0, 1200),
+              },
+              body: String(result.stderr || "PHP request failed."),
+              bodyBase64: "",
+            };
+          }
+          let response;
+          try {
+            const sapiResponse = result.sapi ? JSON.parse(String(result.stdout || "{}")) : null;
+            if (sapiResponse) {
+              const parsedHeaders = parsePhpSapiHeaders(sapiResponse.headersJson || "", sapiResponse.headers || "");
+              response = {
+                status: parsedHeaders.status || Number(sapiResponse.status || sapiResponse.code || 200) || 200,
+                headers: parsedHeaders.headers,
+                headerList: parsedHeaders.headerList,
+                body: sapiResponse.stdout || "",
+                bodyBase64: "",
+              };
+            } else {
+              response = JSON.parse(String(result.stdout || "{}"));
+            }
+          } catch (err) {
+            edgeServePhpLog("parse-failed", {
+              requestId,
+              durationMs,
+              exitCode: result.code,
+              stderr: String(result.stderr || "").slice(0, 2000),
+              stdout: String(result.stdout || "").slice(0, 2000),
+            });
+            return {
+              status: 500,
+              headers: {
+                "content-type": "text/plain; charset=utf-8",
+                ...edgeServePhpDebugHeaders({
+                  requestId,
+                  dispatchPath,
+                  scriptFsPath: target.scriptFsPath,
+                  scriptName: target.scriptName,
+                  pathInfo: target.pathInfo || "",
+                  durationMs,
+                  exitCode: result.code,
+                }),
+                "x-edgeterm-php-stderr": String(result.stderr || "").slice(0, 1200),
+              },
+              body: `PHP response parse failed.\n${String(result.stderr || "")}${String(result.stdout || "")}`,
+              bodyBase64: "",
+            };
+          }
+          response.headers ||= {};
+          const responseLocation = response.headers.location || response.headers.Location;
+          if (responseLocation && Number(response.status || 200) < 300) {
+            response.status = 302;
+          }
+          if (
+            Number(response.status || 200) >= 400 &&
+            !response.body &&
+            !response.bodyBase64 &&
+            String(result.stderr || "").trim()
+          ) {
+            response.headers["Content-Type"] ||= "text/plain; charset=utf-8";
+            response.body = result.stderr;
+          }
+          if (!response.headers?.["x-edgeterm-fs-path"]) {
+            response.headers["x-edgeterm-fs-path"] = target.scriptFsPath;
+          }
+          Object.assign(
+            response.headers,
+            edgeServePhpDebugHeaders({
+              requestId,
+              dispatchPath,
+              scriptFsPath: target.scriptFsPath,
+              scriptName: target.scriptName,
+              pathInfo: target.pathInfo || "",
+              durationMs,
+              exitCode: result.code,
+            })
+          );
+          if (String(result.stderr || "").trim()) {
+            response.headers["x-edgeterm-php-stderr"] = String(result.stderr || "").slice(0, 1200);
+          }
+          let responseContentType = String(response.headers?.["content-type"] || response.headers?.["Content-Type"] || "");
+          if (response.bodyBase64 && isTextMimeType(responseContentType || "text/html")) {
+            response.body = responseBodyText(response);
+            response.bodyBase64 = "";
+          }
+          if (/^text\/html\b/i.test(responseContentType || "") && !response.headerList?.length && response.body) {
+            const sniffedContentType = sniffTextResponseMime(response.body, `${target.requestPath || dispatchPath}${query ? `?${query}` : ""}`);
+            if (sniffedContentType && sniffedContentType !== responseContentType) {
+              response.headers["Content-Type"] = sniffedContentType;
+              response.headers["x-edgeterm-sniffed-content-type"] = sniffedContentType;
+              responseContentType = sniffedContentType;
+            }
+          }
+          edgeServePhpLog("response", {
+            kind: "php",
+            method: requestMethod,
+            path: `${target.requestPath || dispatchPath}${query ? `?${query}` : ""}`,
+            dispatchPath,
+            script: target.scriptFsPath,
+            requestId,
+            status: response.status,
+            durationMs,
+            exitCode: result.code,
+            location: response.headers.location || response.headers.Location || "",
+            contentType: responseContentType,
+            bodyBytes: response.bodyBase64 ? Math.ceil((response.bodyBase64.length * 3) / 4) : String(response.body || "").length,
+            bodyPreview: responseLogBodyPreview(response, responseContentType),
+            stderr: String(result.stderr || "").slice(0, 2000),
+          });
+          return response;
+        } finally {
+          try {
+            if (fsPathExists(requestFile)) pyodide.FS.unlink(requestFile);
+          } catch {}
+          try {
+            if (fsPathExists(wrapperFile)) pyodide.FS.unlink(wrapperFile);
+          } catch {}
+        }
+      }
+
       function appModeRequestMayMutateWorkspace(method = "GET") {
         return !["GET", "HEAD", "OPTIONS", "TRACE"].includes(String(method || "GET").toUpperCase());
+      }
+
+      async function maybeHandleWordPressThemeDirectoryAjax({
+        requestId,
+        requestMethod,
+        query,
+        dispatchPath,
+        target,
+        serialized,
+        startedAt,
+      }) {
+        if (requestMethod !== "POST" || dispatchPath !== "/wp-admin/admin-ajax.php") return null;
+        const params = formParamsFromSerializedRequest(serialized, query);
+        const action = params.get("action") || "";
+        if (action !== "query-themes" && action !== "themes_api") return null;
+
+        const apiParams = new URLSearchParams();
+        apiParams.set("action", action === "themes_api" ? (params.get("request[action]") || "query_themes") : "query_themes");
+        let hasRequestArgs = false;
+        for (const [key, value] of params.entries()) {
+          if (!key.startsWith("request[")) continue;
+          hasRequestArgs = true;
+          apiParams.append(key, value);
+        }
+        if (!hasRequestArgs) {
+          const browse = params.get("browse") || params.get("tab") || "popular";
+          const search = params.get("s") || params.get("search") || "";
+          apiParams.set("request[page]", params.get("page") || "1");
+          apiParams.set("request[per_page]", params.get("per_page") || "36");
+          if (search) apiParams.set("request[search]", search);
+          else apiParams.set("request[browse]", browse);
+        }
+
+        const apiUrl = `https://api.wordpress.org/themes/info/1.2/?${apiParams.toString()}`;
+        const durationMs = () => Math.round(performance.now() - startedAt);
+        edgeServePhpLog("wordpress-theme-api", {
+          requestId,
+          dispatchPath,
+          action,
+          url: apiUrl,
+        });
+        try {
+          const apiResponse = await fetch(apiUrl, {
+            credentials: "omit",
+            cache: "no-store",
+            headers: { Accept: "application/json" },
+          });
+          const text = await apiResponse.text();
+          let data = null;
+          try {
+            data = JSON.parse(text);
+          } catch {}
+          const ok = apiResponse.ok && data && typeof data === "object";
+          const body = JSON.stringify(ok
+            ? { success: true, data }
+            : {
+                success: false,
+                data: {
+                  errorMessage: `WordPress.org theme API returned ${apiResponse.status}.`,
+                },
+              });
+          const headers = {
+            "content-type": "application/json; charset=UTF-8",
+            ...edgeServePhpDebugHeaders({
+              requestId,
+              dispatchPath,
+              scriptFsPath: target.scriptFsPath,
+              scriptName: target.scriptName,
+              pathInfo: target.pathInfo || "",
+              durationMs: durationMs(),
+              exitCode: 0,
+            }),
+            "x-edgeterm-fs-path": target.scriptFsPath,
+            "x-edgeterm-wordpress-theme-api": ok ? "1" : "error",
+          };
+          const response = {
+            status: ok ? 200 : 502,
+            headers,
+            headerList: Object.entries(headers),
+            body,
+            bodyBase64: "",
+          };
+          edgeServePhpLog("response", {
+            kind: "php",
+            method: requestMethod,
+            path: `${target.requestPath || dispatchPath}${query ? `?${query}` : ""}`,
+            dispatchPath,
+            script: target.scriptFsPath,
+            requestId,
+            status: response.status,
+            durationMs: durationMs(),
+            exitCode: 0,
+            location: "",
+            contentType: response.headers["content-type"],
+            bodyBytes: body.length,
+            bodyPreview: responseLogBodyPreview(response, response.headers["content-type"]),
+            bridged: "wordpress-theme-api",
+          });
+          return response;
+        } catch (err) {
+          const body = JSON.stringify({
+            success: false,
+            data: {
+              errorMessage: `WordPress.org theme API request failed: ${err?.message || err}`,
+            },
+          });
+          const headers = {
+            "content-type": "application/json; charset=UTF-8",
+            ...edgeServePhpDebugHeaders({
+              requestId,
+              dispatchPath,
+              scriptFsPath: target.scriptFsPath,
+              scriptName: target.scriptName,
+              pathInfo: target.pathInfo || "",
+              durationMs: durationMs(),
+              exitCode: 0,
+            }),
+            "x-edgeterm-fs-path": target.scriptFsPath,
+            "x-edgeterm-wordpress-theme-api": "error",
+          };
+          const response = { status: 502, headers, headerList: Object.entries(headers), body, bodyBase64: "" };
+          edgeServePhpLog("response", {
+            kind: "php",
+            method: requestMethod,
+            path: `${target.requestPath || dispatchPath}${query ? `?${query}` : ""}`,
+            dispatchPath,
+            script: target.scriptFsPath,
+            requestId,
+            status: response.status,
+            durationMs: durationMs(),
+            exitCode: 0,
+            contentType: response.headers["content-type"],
+            bodyBytes: body.length,
+            bodyPreview: responseLogBodyPreview(response, response.headers["content-type"]),
+            bridged: "wordpress-theme-api",
+            stderr: String(err?.message || err).slice(0, 2000),
+          });
+          return response;
+        }
+      }
+
+      function formParamsFromSerializedRequest(serialized = {}, query = "") {
+        const params = new URLSearchParams(query || "");
+        const contentType = Object.entries(serialized.headers || {})
+          .find(([key]) => key.toLowerCase() === "content-type")?.[1] || "";
+        if (serialized.body && /application\/x-www-form-urlencoded/i.test(String(contentType))) {
+          const bodyParams = new URLSearchParams(serialized.body);
+          for (const [key, value] of bodyParams.entries()) params.append(key, value);
+        }
+        return params;
+      }
+
+      function responseLogBodyPreview(response, contentType = "") {
+        if (!isTextMimeType(contentType || "text/plain")) return "";
+        return responseBodyText(response).slice(0, 1000);
       }
 
       function bytesToBase64(bytes) {
@@ -2813,12 +5813,14 @@ json.dumps(result)
           return { headers: normalizedHeaders, body: body.toString(), bodyBase64: "" };
         }
         if (isFormDataLike(body) || isBlobLike(body) || isArrayBufferLike(body) || isArrayBufferViewLike(body)) {
+          const preservedCookieHeader = Object.entries(normalizedHeaders).find(([key]) => key.toLowerCase() === "cookie")?.[1] || "";
           const request = new Request("https://edgeterm.local/__edgeflask__", {
             method: upperMethod,
             headers: new Headers(normalizedHeaders),
             body,
           });
           const requestHeaders = Object.fromEntries(request.headers.entries());
+          if (preservedCookieHeader) requestHeaders.cookie = String(preservedCookieHeader);
           const bytes = new Uint8Array(await request.arrayBuffer());
           return { headers: requestHeaders, body: "", bodyBase64: bytesToBase64(bytes) };
         }
@@ -2826,13 +5828,25 @@ json.dumps(result)
       }
 
       function rememberAppModeCookies(response) {
-        const raw = response.headers?.["set-cookie"] || response.headers?.["Set-Cookie"] || response.headerList?.filter?.(([key]) => String(key).toLowerCase() === "set-cookie").map(([, value]) => value);
-        const cookies = Array.isArray(raw) ? raw : raw ? [raw] : [];
+        const headerCookies = response.headerList
+          ?.filter?.(([key]) => String(key).toLowerCase() === "set-cookie")
+          .map(([, value]) => value) || [];
+        const raw = [
+          ...headerCookies,
+          response.headers?.["set-cookie"],
+          response.headers?.["Set-Cookie"],
+        ].filter(Boolean);
+        const cookies = raw.flatMap((value) => Array.isArray(value) ? value : splitCombinedSetCookieHeader(value));
         let changed = false;
         for (const cookie of cookies) changed = applyAppModeCookieString(cookie) || changed;
         if (changed) {
+          edgeServePhpLog("cookies", {
+            count: appModeState.cookieJar.size,
+            names: [...appModeState.cookieJar.keys()],
+          });
           if (appModeState.renderTarget === "display") saveDisplayBrowserTabState();
           else persistAppModeSiteData();
+          renderBrowserSiteSettings();
         }
       }
 
@@ -2869,8 +5883,274 @@ json.dumps(result)
 
       async function dispatchAppModeRequest(url, options = {}) {
         const config = appModeState.config || readAppModeConfig();
-        if (config.runtime === "python") return await dispatchPythonAppRequest(url, options, config);
-        return await dispatchStaticRequest(url, options, config);
+        const { path } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
+        const matchedInstance = findEdgeServeInstanceForPath(path);
+        const serveMode = matchedInstance?.mode || config.python?.serveMode || "";
+        const method = String(options.method || "GET").toUpperCase();
+        const routePrefix = normalizePath(matchedInstance?.routePrefix || config.python?.routePrefix || "/");
+        const requestId = `app-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const startedAt = performance.now();
+        let response;
+        let kind = config.runtime || "static";
+        if (serveMode === "php" || config.runtime === "php") {
+          kind = "php";
+          response = await dispatchPhpAppRequest(url, options, config, matchedInstance);
+        } else if (config.runtime === "python") {
+          kind = "python";
+          response = await dispatchPythonAppRequest(url, options, config);
+        } else {
+          kind = "static";
+          response = await dispatchStaticRequest(url, options, config);
+        }
+        const durationMs = Math.round(performance.now() - startedAt);
+        return attachEdgeServeDebug(response, {
+          kind,
+          requestId,
+          method,
+          path,
+          routePrefix,
+          durationMs,
+        });
+      }
+
+      function resolveAppWebSocketUrl(input, currentPath = "/") {
+        const raw = String(input || "/");
+        const normalized = /^wss?:\/\/ws\/?$/i.test(raw)
+          ? "ws"
+          : /^wss?:\/\/\//i.test(raw)
+          ? raw.replace(/^wss?:\/\//i, "")
+          : raw.replace(/^wss?:\/\//i, "https://");
+        const url = new URL(normalized, `https://edgeterm.local${currentPath || "/"}`);
+        return { path: url.pathname || "/", query: url.search.replace(/^\?/, "") };
+      }
+
+      function normalizeWebSocketEvents(events = []) {
+        return Array.isArray(events)
+          ? events
+              .filter((event) => event && typeof event === "object")
+              .map((event) => ({
+                ...event,
+                type: event.type || "message",
+                kind: event.kind || (event.dataBase64 ? "bytes" : "text"),
+              }))
+          : [];
+      }
+
+      async function dispatchPhpWebSocketEvent(connection, eventName, message = {}) {
+        const requestBody = eventName === "message"
+          ? JSON.stringify({
+              kind: message.kind || "text",
+              data: message.data || "",
+              dataBase64: message.dataBase64 || "",
+            })
+          : JSON.stringify({
+              protocols: connection.protocols || [],
+              code: message.code || 1000,
+              reason: message.reason || "",
+            });
+        const response = await dispatchPhpAppRequest(
+          `${connection.path || "/"}${connection.query ? `?${connection.query}` : ""}`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-edgeterm-websocket-event": eventName,
+              "x-edgeterm-websocket-id": connection.id,
+            },
+            body: requestBody,
+            currentPath: connection.path || "/",
+            webSocketEvent: eventName,
+            webSocketId: connection.id,
+            webSocketProtocol: connection.subprotocol || "",
+            webSocketProtocols: connection.protocols || [],
+          },
+          appModeState.config || readAppModeConfig(),
+          connection.instance || null
+        );
+        const body = responseBodyText(response);
+        let parsed = {};
+        try {
+          parsed = body ? JSON.parse(body) : {};
+        } catch {
+          parsed = { ok: Number(response.status || 200) < 400, events: [] };
+        }
+        return {
+          ok: parsed.ok !== false && Number(response.status || 200) < 400,
+          status: Number(response.status || 200) < 400 ? 1000 : 1011,
+          reason: parsed.reason || (Number(response.status || 200) < 400 ? "" : `PHP WebSocket ${eventName} failed`),
+          subprotocol: parsed.subprotocol || connection.subprotocol || "",
+          events: normalizeWebSocketEvents(parsed.events || []),
+          output: parsed.output || "",
+        };
+      }
+
+      async function dispatchAppModeWebSocketOpen(request = {}) {
+        const config = appModeState.config || readAppModeConfig();
+        let { path, query } = resolveAppWebSocketUrl(request.url || "/", request.currentPath || appModeState.currentPath || "/");
+        const matchedInstance = findEdgeServeInstanceForPath(path);
+        const activeTab = appModeState.renderTarget === "display" ? activeDisplayBrowserTab() : null;
+        const activeInstanceId = matchedInstance?.id || activeTab?.instanceId || config.python?.instanceId || "";
+        const routePrefix = normalizePath(matchedInstance?.routePrefix || activeTab?.routePrefix || config.python?.routePrefix || "/");
+        if (routePrefix !== "/" && path.startsWith(routePrefix)) {
+          path = path.slice(routePrefix.length) || "/";
+          if (!path.startsWith("/")) path = `/${path}`;
+        }
+        const activeInstance = matchedInstance || window.EdgeTermServe?.instances?.get(activeInstanceId) || null;
+        if ((activeInstance?.mode || matchedInstance?.mode || config.python?.serveMode || config.runtime || "") === "php") {
+          const requestedProtocols = Array.isArray(request.protocols) ? request.protocols : [];
+          const connection = {
+            id: String(request.id || ""),
+            mode: "php",
+            instanceId: activeInstanceId,
+            instance: activeInstance,
+            path,
+            query,
+            protocols: requestedProtocols,
+            subprotocol: requestedProtocols[0] || "",
+            events: [],
+          };
+          const result = await dispatchPhpWebSocketEvent(connection, "open");
+          if (result.ok) {
+            connection.subprotocol = result.subprotocol || connection.subprotocol || "";
+            connection.events.push(...normalizeWebSocketEvents(result.events || []));
+            appModeState.webSockets.set(connection.id, connection);
+          }
+          return result;
+        }
+        if (config.runtime !== "python") {
+          return { ok: false, status: 1002, reason: `${config.runtime === "static" ? "Static" : config.runtime} App Mode does not support WebSocket backends.` };
+        }
+        const payload = {
+          id: String(request.id || ""),
+          path,
+          query_string: query,
+          headers: appModeRequestHeaders(request.headers || {}),
+          protocols: Array.isArray(request.protocols) ? request.protocols : [],
+          instanceId: activeInstanceId,
+        };
+        pyodide.globals.set("__edgeterm_ws_request_json", JSON.stringify(payload));
+        const raw = await pyodide.runPythonAsync(`
+import json
+import os
+import sys
+
+rootfs_lib = globals().get("__edgeterm_rootfs_lib", "") or os.environ.get("EDGETERM_ROOTFS_LIB", "")
+if rootfs_lib and os.path.isdir(rootfs_lib) and rootfs_lib not in sys.path:
+    sys.path.insert(0, rootfs_lib)
+if os.path.isdir("/usr/lib") and "/usr/lib" not in sys.path:
+    sys.path.insert(0, "/usr/lib")
+
+import edgeterm_wsgi
+
+request_data = json.loads(__edgeterm_ws_request_json)
+result = await edgeterm_wsgi.open_websocket_instance(
+    request_data.get("instanceId") or "",
+    request_data.get("id") or "",
+    path=request_data.get("path") or "/",
+    query_string=request_data.get("query_string") or "",
+    headers=request_data.get("headers") or {},
+    protocols=request_data.get("protocols") or [],
+)
+json.dumps(result)
+`);
+        const result = JSON.parse(String(raw));
+        if (result.ok) appModeState.webSockets.set(payload.id, { instanceId: activeInstanceId, path });
+        return result;
+      }
+
+      async function dispatchAppModeWebSocketSend(request = {}) {
+        const existing = appModeState.webSockets.get(String(request.id || ""));
+        if (existing?.instance?.mode === "php" || existing?.mode === "php") {
+          const result = await dispatchPhpWebSocketEvent(existing, "message", request);
+          existing.events.push(...normalizeWebSocketEvents(result.events || []));
+          return { ok: result.ok, status: result.status, reason: result.reason || "" };
+        }
+        pyodide.globals.set("__edgeterm_ws_send_json", JSON.stringify(request || {}));
+        const raw = await pyodide.runPythonAsync(`
+import json
+import os
+import sys
+
+rootfs_lib = globals().get("__edgeterm_rootfs_lib", "") or os.environ.get("EDGETERM_ROOTFS_LIB", "")
+if rootfs_lib and os.path.isdir(rootfs_lib) and rootfs_lib not in sys.path:
+    sys.path.insert(0, rootfs_lib)
+if os.path.isdir("/usr/lib") and "/usr/lib" not in sys.path:
+    sys.path.insert(0, "/usr/lib")
+
+import edgeterm_wsgi
+
+payload = json.loads(__edgeterm_ws_send_json)
+result = await edgeterm_wsgi.websocket_send(
+    payload.get("id") or "",
+    kind=payload.get("kind") or "text",
+    data=payload.get("data") or "",
+    data_base64=payload.get("dataBase64") or "",
+)
+json.dumps(result)
+`);
+        return JSON.parse(String(raw));
+      }
+
+      async function dispatchAppModeWebSocketPoll(request = {}) {
+        const existing = appModeState.webSockets.get(String(request.id || ""));
+        if (existing?.instance?.mode === "php" || existing?.mode === "php") {
+          const events = existing.events.splice(0);
+          if (events.some((event) => event.type === "close")) appModeState.webSockets.delete(String(request.id || ""));
+          return { ok: true, events };
+        }
+        pyodide.globals.set("__edgeterm_ws_poll_json", JSON.stringify(request || {}));
+        const raw = await pyodide.runPythonAsync(`
+import json
+import os
+import sys
+
+rootfs_lib = globals().get("__edgeterm_rootfs_lib", "") or os.environ.get("EDGETERM_ROOTFS_LIB", "")
+if rootfs_lib and os.path.isdir(rootfs_lib) and rootfs_lib not in sys.path:
+    sys.path.insert(0, rootfs_lib)
+if os.path.isdir("/usr/lib") and "/usr/lib" not in sys.path:
+    sys.path.insert(0, "/usr/lib")
+
+import edgeterm_wsgi
+
+payload = json.loads(__edgeterm_ws_poll_json)
+result = await edgeterm_wsgi.websocket_poll(payload.get("id") or "")
+json.dumps(result)
+`);
+        return JSON.parse(String(raw));
+      }
+
+      async function dispatchAppModeWebSocketClose(request = {}) {
+        const id = String(request.id || "");
+        const existing = appModeState.webSockets.get(id);
+        if (existing?.instance?.mode === "php" || existing?.mode === "php") {
+          const result = await dispatchPhpWebSocketEvent(existing, "close", request);
+          appModeState.webSockets.delete(id);
+          return { ok: result.ok, events: normalizeWebSocketEvents(result.events || []) };
+        }
+        pyodide.globals.set("__edgeterm_ws_close_json", JSON.stringify(request || {}));
+        const raw = await pyodide.runPythonAsync(`
+import json
+import os
+import sys
+
+rootfs_lib = globals().get("__edgeterm_rootfs_lib", "") or os.environ.get("EDGETERM_ROOTFS_LIB", "")
+if rootfs_lib and os.path.isdir(rootfs_lib) and rootfs_lib not in sys.path:
+    sys.path.insert(0, rootfs_lib)
+if os.path.isdir("/usr/lib") and "/usr/lib" not in sys.path:
+    sys.path.insert(0, "/usr/lib")
+
+import edgeterm_wsgi
+
+payload = json.loads(__edgeterm_ws_close_json)
+result = await edgeterm_wsgi.close_websocket(
+    payload.get("id") or "",
+    code=payload.get("code") or 1000,
+    reason=payload.get("reason") or "",
+)
+json.dumps(result)
+`);
+        appModeState.webSockets.delete(id);
+        return JSON.parse(String(raw));
       }
 
       function rewriteAppModeAssets(doc, documentFsPath, config) {
@@ -2896,6 +6176,14 @@ json.dumps(result)
       function shouldBridgeAppModeAssetUrl(value) {
         const url = String(value || "").trim();
         if (!url || url.startsWith("#") || /^(data|blob|javascript|mailto):/i.test(url)) return false;
+        if (/^\/\//.test(url)) {
+          try {
+            const parsed = new URL(`https:${url}`);
+            return parsed.hostname === "edgeterm.local";
+          } catch {
+            return false;
+          }
+        }
         if (/^https?:\/\//i.test(url)) {
           try {
             return new URL(url).hostname === "edgeterm.local";
@@ -2924,6 +6212,67 @@ json.dumps(result)
         return registerAppModeBlob(new Blob([payload], { type: contentType }));
       }
 
+      function appModeInternalUrlToPath(value) {
+        const url = String(value || "").trim();
+        if (!url) return "";
+        try {
+          const parsed = /^\/\//.test(url) ? new URL(`https:${url}`) : new URL(url);
+          if (parsed.hostname !== "edgeterm.local") return "";
+          return `${parsed.pathname || "/"}${parsed.search || ""}${parsed.hash || ""}`;
+        } catch {
+          return "";
+        }
+      }
+
+      function isStaticAssetRequestPath(value = "") {
+        const pathname = (() => {
+          try {
+            return new URL(String(value || ""), "https://edgeterm.local/").pathname;
+          } catch {
+            return String(value || "").split(/[?#]/, 1)[0] || "";
+          }
+        })();
+        return /\.(?:avif|bmp|css|gif|ico|jpe?g|js|mjs|png|svg|webp|woff2?|ttf|otf|eot|mp3|mp4|ogg|webm|wasm)$/i.test(pathname);
+      }
+
+      async function rewriteInternalAssetReferences(text, routePath, options = {}) {
+        let rewritten = String(text || "");
+        const matches = new Set();
+        const absolutePattern = /\bhttps?:\/\/edgeterm\.local\/[^\s"'`)\\<>{}]+|\/\/edgeterm\.local\/[^\s"'`)\\<>{}]+/gi;
+        for (const match of rewritten.matchAll(absolutePattern)) {
+          matches.add(match[0]);
+        }
+        const cssUrlPattern = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
+        for (const match of rewritten.matchAll(cssUrlPattern)) {
+          const rawUrl = String(match[2] || "").trim();
+          if (!shouldBridgeAppModeAssetUrl(rawUrl)) continue;
+          matches.add(rawUrl);
+        }
+
+        for (const rawUrl of matches) {
+          const pathUrl = appModeInternalUrlToPath(rawUrl) || rawUrl;
+          if (!options.rewriteAll && !isStaticAssetRequestPath(pathUrl)) continue;
+          let replacement = pathUrl;
+          if (isStaticAssetRequestPath(pathUrl)) {
+            try {
+              const response = await dispatchAppModeRequest(pathUrl, {
+                method: "GET",
+                currentPath: routePath || "/",
+                headers: {},
+                body: null,
+              });
+              if (response?.status >= 200 && response.status < 300) {
+                replacement = responseBlobUrl(response);
+              }
+            } catch (err) {
+              console.warn("[APPMODE] Internal asset rewrite failed:", rawUrl, err);
+            }
+          }
+          rewritten = rewritten.split(rawUrl).join(replacement);
+        }
+        return rewritten;
+      }
+
       function copyElementAttributes(source, target, excluded = new Set()) {
         for (const attr of Array.from(source.attributes || [])) {
           if (excluded.has(attr.name.toLowerCase())) continue;
@@ -2931,7 +6280,7 @@ json.dumps(result)
         }
       }
 
-      async function inlineBridgeLoadedAssets(doc, routePath, config) {
+      async function inlineBridgeStylesheets(doc, routePath, config) {
         const fetchAsset = async (url) => {
           try {
             const response = await dispatchAppModeRequest(url, {
@@ -2955,9 +6304,77 @@ json.dumps(result)
           const style = doc.createElement("style");
           copyElementAttributes(link, style, new Set(["href", "rel", "integrity", "crossorigin"]));
           style.setAttribute("data-edgeterm-inlined-href", href);
-          style.textContent = responseBodyText(response);
+          style.textContent = await rewriteInternalAssetReferences(responseBodyText(response), routePath || "/");
           link.replaceWith(style);
         }
+      }
+
+      async function inlineBridgeScripts(doc, routePath, config) {
+        const fetchAsset = async (url) => {
+          try {
+            const response = await dispatchAppModeRequest(url, {
+              method: "GET",
+              currentPath: routePath || "/",
+              headers: {},
+              body: null,
+            });
+            return response?.status >= 200 && response.status < 300 ? response : null;
+          } catch (err) {
+            console.warn("[APPMODE] Script inline failed:", url, err);
+            return null;
+          }
+        };
+
+        for (const script of Array.from(doc.querySelectorAll("script[src]"))) {
+          const src = script.getAttribute("src");
+          if (!shouldBridgeAppModeAssetUrl(src)) continue;
+          const response = await fetchAsset(src);
+          if (!response) continue;
+          const inline = doc.createElement("script");
+          copyElementAttributes(script, inline, new Set(["src", "integrity", "crossorigin"]));
+          inline.setAttribute("data-edgeterm-inlined-src", src);
+          inline.textContent = (await rewriteInternalAssetReferences(responseBodyText(response), routePath || "/", { rewriteAll: true })).replaceAll("</script", "<\\/script");
+          script.replaceWith(inline);
+        }
+      }
+
+      async function rewriteInlineInternalAssets(doc, routePath) {
+        for (const style of Array.from(doc.querySelectorAll("style"))) {
+          style.textContent = await rewriteInternalAssetReferences(style.textContent || "", routePath || "/");
+        }
+        for (const script of Array.from(doc.querySelectorAll("script:not([src])"))) {
+          const type = String(script.getAttribute("type") || "").toLowerCase();
+          if (type && !/(?:javascript|ecmascript|module|importmap|speculationrules|application\/json|text\/plain)/i.test(type)) continue;
+          script.textContent = (await rewriteInternalAssetReferences(script.textContent || "", routePath || "/", { rewriteAll: true })).replaceAll("</script", "<\\/script");
+        }
+      }
+
+      function rewriteInternalNavigationAttributes(doc) {
+        for (const node of Array.from(doc.querySelectorAll("a[href], area[href], form[action]"))) {
+          const attr = node.hasAttribute("href") ? "href" : "action";
+          const rawUrl = node.getAttribute(attr) || "";
+          const pathUrl = appModeInternalUrlToPath(rawUrl) || (shouldBridgeAppModeAssetUrl(rawUrl) ? rawUrl : "");
+          if (!pathUrl) continue;
+          node.setAttribute("data-edgeterm-nav-url", pathUrl);
+          node.setAttribute(attr, attr === "href" ? "#" : "");
+        }
+      }
+
+      async function inlineBridgeLoadedAssets(doc, routePath, config) {
+        const fetchAsset = async (url) => {
+          try {
+            const response = await dispatchAppModeRequest(url, {
+              method: "GET",
+              currentPath: routePath || "/",
+              headers: {},
+              body: null,
+            });
+            return response?.status >= 200 && response.status < 300 ? response : null;
+          } catch (err) {
+            console.warn("[APPMODE] Asset inline failed:", url, err);
+            return null;
+          }
+        };
 
         for (const script of Array.from(doc.querySelectorAll("script[src]"))) {
           const src = script.getAttribute("src");
@@ -2983,24 +6400,39 @@ json.dumps(result)
         }
       }
 
+      function firstSrcsetUrl(value = "") {
+        const first = String(value || "").split(",")[0]?.trim() || "";
+        return first.split(/\s+/)[0] || "";
+      }
+
       function deferBridgeLoadedAssets(doc) {
-        for (const selector of ["img[src]", "script[src]", "link[rel~='stylesheet'][href]", "source[src]", "audio[src]", "video[src]", "video[poster]"]) {
+        for (const selector of ["img[src]", "img[srcset]", "script[src]", "link[rel~='stylesheet'][href]", "source[src]", "source[srcset]", "audio[src]", "video[src]", "video[poster]"]) {
           doc.querySelectorAll(selector).forEach((node) => {
-            const attr = selector.endsWith("[poster]") ? "poster" : node.hasAttribute("href") ? "href" : "src";
-            const value = node.getAttribute(attr);
+          const attr = selector.endsWith("[poster]")
+            ? "poster"
+            : node.hasAttribute("href")
+            ? "href"
+            : node.tagName === "SOURCE" && node.hasAttribute("srcset") && !node.hasAttribute("src")
+            ? "srcset"
+            : "src";
+            const value = node.getAttribute(attr) || firstSrcsetUrl(node.getAttribute("srcset"));
             if (!shouldBridgeAppModeAssetUrl(value)) return;
             node.setAttribute("data-edgeterm-asset-url", value);
             node.setAttribute("data-edgeterm-asset-attr", attr);
             node.removeAttribute(attr);
+            if (attr !== "srcset" && node.hasAttribute("srcset")) node.removeAttribute("srcset");
           });
         }
       }
 
-      async function buildRenderedDocument(html, routePath, documentFsPath, config) {
+      async function buildRenderedDocument(html, routePath, documentFsPath, config, response = null) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(String(html || ""), "text/html");
         rewriteAppModeAssets(doc, documentFsPath, config);
-        await inlineBridgeLoadedAssets(doc, routePath || "/", config);
+        await inlineBridgeStylesheets(doc, routePath || "/", config);
+        await inlineBridgeScripts(doc, routePath || "/", config);
+        await rewriteInlineInternalAssets(doc, routePath || "/");
+        rewriteInternalNavigationAttributes(doc);
         deferBridgeLoadedAssets(doc);
         const hook = doc.createElement("script");
         hook.textContent = buildAppModeClientScript({
@@ -3013,8 +6445,9 @@ json.dumps(result)
             localStorage: appModeState.siteLocalStorage,
             sessionStorage: appModeState.siteSessionStorage,
           },
+          edgeServeDebug: edgeServeDebugForResponse(response, routePath || "/"),
         });
-        doc.body.appendChild(hook);
+        (doc.head || doc.documentElement).prepend(hook);
         return "<!doctype html>\n" + doc.documentElement.outerHTML;
       }
 
@@ -3043,7 +6476,8 @@ json.dumps(result)
           frame.id = displayBrowserFrameId(tab.id);
           frame.className = "app-browser-frame";
           frame.title = tab.title || "EdgeServe Preview";
-          frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-downloads");
+          frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-forms allow-downloads allow-popups allow-popups-to-escape-sandbox allow-modals allow-presentation");
+          frame.setAttribute("allow", "clipboard-read; clipboard-write; fullscreen; geolocation; camera; microphone; display-capture; autoplay; encrypted-media; picture-in-picture; web-share");
           frames.appendChild(frame);
         }
         for (const node of content.querySelectorAll(".app-browser-frame")) {
@@ -3118,6 +6552,12 @@ json.dumps(result)
 
       function saveDisplayBrowserTabState(tab = activeDisplayBrowserTab()) {
         if (!tab) return;
+        if (tab.externalUrl) {
+          tab.currentPath = tab.externalUrl;
+          tab.browserHistory = appModeState.browserHistory || [];
+          tab.browserHistoryIndex = appModeState.browserHistoryIndex ?? -1;
+          return;
+        }
         tab.currentPath = appModeState.currentPath || "/";
         tab.htmlPath = appModeState.htmlPath || "";
         tab.cookieJar = appModeState.cookieJar || new Map();
@@ -3159,18 +6599,38 @@ json.dumps(result)
             siteScope: site.scope,
             browserHistory: [],
             browserHistoryIndex: -1,
+            externalUrl: "",
           };
         tab.routePrefix = routePrefix;
         tab.title = title;
         tab.siteKey = site.key;
         tab.siteLabel = site.label;
         tab.siteScope = site.scope;
+        tab.externalUrl = "";
         appModeState.browserTabs.set(id, tab);
         appModeState.activeBrowserTabId = id;
         loadDisplayBrowserTabState(tab);
         renderDisplayBrowserTabs();
         syncDisplayBrowserButtons();
         updateDisplayBrowserUrl(tab.currentPath || `${routePrefix}/`);
+        return tab;
+      }
+
+      async function openEdgeBrowserNewTab(url = "") {
+        const active = activeDisplayBrowserTab();
+        const instanceId = String(active?.instanceId || appModeState.config?.python?.instanceId || "default");
+        const instance = window.EdgeTermServe?.instances?.get?.(instanceId) || {
+          id: instanceId,
+          mode: appModeState.config?.python?.serveMode || appModeState.config?.python?.framework || "app",
+          routePrefix: active?.routePrefix || appModeState.config?.python?.routePrefix || "/",
+          workingDirectory: appModeState.config?.workingDirectory || "/",
+          label: active?.siteLabel || "",
+        };
+        const target = normalizeDisplayBrowserUrl(url || instance.routePrefix || "/");
+        const tab = createOrActivateDisplayBrowserTab(instance, target, { newTab: true });
+        appModeState.renderTarget = "display";
+        appModeState.active = true;
+        await navigateAppMode(target, { updateHistory: false, replaceDisplayHistory: true });
         return tab;
       }
 
@@ -3293,6 +6753,10 @@ json.dumps(result)
       function updateDisplayBrowserUrl(path = "/", query = "") {
         const input = $id("displayUrlInput");
         if (!input) return;
+        if (/^https?:\/\//i.test(String(path || ""))) {
+          input.value = String(path || "");
+          return;
+        }
         const matchedInstance = findEdgeServeInstanceForPath(path);
         const activeTab = appModeState.renderTarget === "display" ? activeDisplayBrowserTab() : null;
         const routePrefix = normalizePath(matchedInstance?.routePrefix || activeTab?.routePrefix || appModeState.config?.python?.routePrefix || "/");
@@ -3336,8 +6800,47 @@ json.dumps(result)
         if (appModeState.renderTarget === "display") saveDisplayBrowserTabState();
       }
 
+      function isExternalBrowserUrl(raw = "") {
+        const value = String(raw || "").trim();
+        if (!/^https?:\/\//i.test(value)) return false;
+        try {
+          const parsed = new URL(value);
+          return !["edgeterm.local", window.location.hostname].includes(parsed.hostname);
+        } catch {
+          return false;
+        }
+      }
+
+      function loadExternalDisplayBrowserUrl(raw, options = {}) {
+        const url = String(raw || "").trim();
+        if (!url) return;
+        const frame = ensureDisplayAppModeFrame();
+        const tab = activeDisplayBrowserTab();
+        frame.removeAttribute("srcdoc");
+        frame.src = url;
+        appModeState.currentPath = url;
+        appModeState.htmlPath = "";
+        if (tab) {
+          tab.currentPath = url;
+          tab.externalUrl = url;
+          tab.htmlPath = "";
+        }
+        updateDisplayBrowserUrl(url);
+        rememberDisplayBrowserHistory(url, {
+          skipHistory: options.skipDisplayHistory,
+          replaceCurrent: options.replaceDisplayHistory,
+        });
+        saveDisplayBrowserTabState();
+        renderDisplayBrowserTabs();
+        syncDisplayBrowserButtons();
+      }
+
       function normalizeDisplayBrowserUrl(raw) {
         const source = String(raw || "").trim() || "/";
+        if (isExternalBrowserUrl(source)) return source;
+        if (!/^[a-z][a-z0-9+.-]*:/i.test(source) && /^[\w.-]+\.[A-Za-z]{2,}(?:[/:?#]|$)/.test(source)) {
+          return `https://${source}`;
+        }
         let path = source;
         let query = "";
         try {
@@ -3363,11 +6866,20 @@ json.dumps(result)
         if (tab) {
           tab.currentPath = appModeState.currentPath;
           tab.htmlPath = appModeState.htmlPath;
+          tab.externalUrl = "";
         }
         revokeAppModeBlobs();
 
+        const redirectLocation = response.headers?.location || response.headers?.Location || "";
+        const emptyBody = !response.body && !response.bodyBase64;
+        if (response.status >= 300 && response.status < 400 && !redirectLocation && emptyBody) {
+          const debug = edgeServeDebugForResponse(response, routePath || "/");
+          frame.srcdoc = `<!doctype html><html><body style="margin:0;background:#111827;color:#e5e7eb;font:14px/1.5 system-ui,sans-serif;padding:24px;"><h1 style="margin:0 0 12px;font-size:20px;">EdgeServe redirect has no Location header</h1><p style="margin:0 0 16px;">The app returned HTTP ${Number(response.status) || 300}, but did not provide a redirect target, so the browser cannot continue.</p><pre style="white-space:pre-wrap;background:#020617;border:1px solid #334155;border-radius:8px;padding:14px;overflow:auto;">${encodeHtml(JSON.stringify(debug || response, null, 2))}</pre></body></html>`;
+          return;
+        }
+
         if (/text\/html|application\/xhtml\+xml/i.test(contentType)) {
-          frame.srcdoc = await buildRenderedDocument(response.body || "", routePath, documentFsPath, appModeState.config);
+          frame.srcdoc = await buildRenderedDocument(responseBodyText(response), routePath, documentFsPath, appModeState.config, response);
           return;
         }
         if (options.expectHtml) {
@@ -3403,6 +6915,7 @@ json.dumps(result)
             localStorage: appModeState.siteLocalStorage,
             sessionStorage: appModeState.siteSessionStorage,
           },
+          edgeServeDebug: edgeServeDebugForResponse(response, routePath || "/"),
         });
         frame.srcdoc = `<!doctype html><html><body style="margin:0;background:#0f172a;color:#e2e8f0;font:14px/1.5 ui-monospace,Consolas,monospace;"><pre style="margin:0;padding:20px;white-space:pre-wrap;">${encodeHtml(pretty)}</pre><scr` +
           `ipt>${appModeHook.replaceAll("</scr" + "ipt>", "<\\\\/script>")}</scr` +
@@ -3415,6 +6928,15 @@ json.dumps(result)
       }
 
       async function navigateAppMode(url = "/", options = {}) {
+        if (appModeState.renderTarget === "display" && isExternalBrowserUrl(url)) {
+          loadExternalDisplayBrowserUrl(url, options);
+          return {
+            status: 200,
+            headers: { "content-type": "text/html; charset=utf-8", "x-edgeterm-debug-kind": "external" },
+            body: "",
+            bodyBase64: "",
+          };
+        }
         const showBrowserProgress = appModeState.renderTarget === "display" && options.showProgress !== false;
         const progressToken = showBrowserProgress ? options.browserProgressToken || startBrowserLoading("Loading page...") : 0;
         const ownsProgress = showBrowserProgress && !options.browserProgressToken;
@@ -3444,6 +6966,13 @@ json.dumps(result)
             if (ownsProgress) finishBrowserLoading(progressToken, "EdgeServe preview");
             return redirected;
           }
+          if (response.status >= 300 && response.status < 400 && !redirectLocation) {
+            edgeServePhpLog("redirect-missing-location", {
+              status: response.status,
+              url: String(url || ""),
+              headers: response.headers || {},
+            });
+          }
           const { path, query } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
           let documentFsPath = response.headers?.["x-edgeterm-fs-path"] || response.headers?.["X-EdgeTerm-Fs-Path"] || appModeState.htmlPath;
           if (!documentFsPath && appModeState.config?.runtime === "static") {
@@ -3451,6 +6980,7 @@ json.dumps(result)
           }
           updateBrowserLoading(progressToken, 72, "Rendering page...");
           await renderAppModeResponse(response, path, documentFsPath, options);
+          if (appModeState.renderTarget !== "display") updateAppModeAddressBar(`${path}${query ? `?${query}` : ""}`);
           updateBrowserLoading(progressToken, 90, "Finalizing page...");
           if (appModeState.renderTarget === "display") {
             updateBrowserStatus("EdgeServe preview");
@@ -3478,7 +7008,7 @@ json.dumps(result)
 
       async function startPythonAppMode(config, initialUrl = "") {
         pyodide.globals.set("__edgeterm_user", activeUser());
-        pyodide.globals.set("__edgeterm_rootfs_lib", workspacePath(activeWorkspaceId, "/rootfs/usr/lib"));
+        pyodide.globals.set("__edgeterm_rootfs_lib", `${activeRootfsPath()}/usr/lib`);
         pyodide.globals.set("__edgeterm_appmode_config_json", JSON.stringify(config));
         await pyodide.runPythonAsync(`
 import builtins
@@ -3493,8 +7023,9 @@ working_directory = config.get("workingDirectory") or os.path.dirname(entrypoint
 python_cfg = config.get("python") or {}
 app_object_name = python_cfg.get("appObject") or "app"
 app_spec = python_cfg.get("appSpec") or ""
-framework = python_cfg.get("framework") or "edgeterm"
+framework = python_cfg.get("framework") or "flask"
 instance_id = python_cfg.get("instanceId") or ""
+serve_mode = python_cfg.get("serveMode") or ""
 rootfs_lib = globals().get("__edgeterm_rootfs_lib", "") or os.environ.get("EDGETERM_ROOTFS_LIB", "")
 edge_user = globals().get("__edgeterm_user", "") or os.environ.get("EDGE_USER", "user")
 
@@ -3515,7 +7046,15 @@ import edgeterm
 
 os.environ["EDGETERM_APPMODE"] = "1"
 os.chdir(working_directory)
-if instance_id:
+if instance_id and framework == "edgeserve" and serve_mode == "php":
+    builtins.EDGETERM_APPMODE = {
+        "runtime": "edgeserve",
+        "instanceId": instance_id,
+        "routePrefix": python_cfg.get("routePrefix") or "/",
+        "mode": "php",
+        "cwd": working_directory,
+    }
+elif instance_id:
     import edgeterm_wsgi
 
     instance = edgeterm_wsgi.get_instance(instance_id)
@@ -3526,12 +7065,22 @@ if instance_id:
         "mode": instance.mode,
         "cwd": working_directory,
     }
-elif app_spec or framework == "wsgi":
+elif app_spec or framework in {"flask", "wsgi"}:
     edgeterm.reset_app()
     import edgeterm_wsgi
 
+    if framework == "flask":
+        try:
+            import flask
+        except ModuleNotFoundError:
+            import js
+
+            await js.pyodide.loadPackage("micropip")
+            import micropip
+
+            await micropip.install("Flask")
     edgeterm.set_wsgi_app(edgeterm_wsgi.load_app(app_spec, working_directory))
-    builtins.EDGETERM_APPMODE = {"runtime": "wsgi", "appSpec": app_spec, "cwd": working_directory}
+    builtins.EDGETERM_APPMODE = {"runtime": framework, "appSpec": app_spec, "cwd": working_directory}
 else:
     edgeterm.reset_app()
     entry_dir = os.path.dirname(entrypoint)
@@ -3557,6 +7106,35 @@ else:
         await navigateAppMode(routePath, { expectHtml: true, updateHistory: false });
       }
 
+      async function startPhpAppMode(config, initialUrl = "") {
+        const cwd = normalizePath(config.workingDirectory || `/home/${activeUser()}`);
+        const target = resolvePhpAppTarget(config);
+        const relativeTarget = target.startsWith(`${cwd}/`) ? target.slice(cwd.length + 1) : target;
+        const identity = stableEdgeServeIdentity("php", relativeTarget || target, cwd);
+        const isPhpFile = fsIsFile(target) && /\.php$/i.test(target);
+        const documentRoot = isPhpFile ? normalizePath(target.split("/").slice(0, -1).join("/") || "/") : target;
+        const instance = {
+          id: identity.instanceId,
+          mode: "php",
+          requestedMode: "php",
+          target: documentRoot,
+          entryScript: isPhpFile ? target : "",
+          routePrefix: normalizePath(config.python?.routePrefix || "/"),
+          workingDirectory: cwd,
+          label: relativeTarget || target,
+        };
+        window.EdgeTermServe.instances.set(instance.id, instance);
+        config.python = {
+          ...(config.python || {}),
+          framework: "edgeserve",
+          appSpec: relativeTarget || target,
+          instanceId: instance.id,
+          routePrefix: instance.routePrefix || "/",
+          serveMode: "php",
+        };
+        await navigateAppMode(initialUrl || `${instance.routePrefix || ""}/` || "/", { expectHtml: !initialUrl, updateHistory: false });
+      }
+
       async function enterAppMode(config = null, options = {}) {
         const resolved = normalizeAppModeConfig(config || readAppModeConfig());
         validateAppModeConfig(resolved);
@@ -3572,6 +7150,7 @@ else:
         try {
           if (!resolved.preserveStateOnExit || options.forceReload) clearAppModeFrame();
           if (resolved.runtime === "python") await startPythonAppMode(resolved, options.initialUrl || "");
+          else if (resolved.runtime === "php") await startPhpAppMode(resolved, options.initialUrl || "");
           else await startStaticAppMode(resolved, options.initialUrl || "");
           setAppModeLoading(false);
         } catch (err) {
@@ -3639,6 +7218,12 @@ else:
         $id("appModeHideChrome").checked = !!config.ui?.hideWorkspaceChrome;
         $id("appModeAllowDebugTerminal").checked = !!config.ui?.allowDebugTerminal;
         $id("appModeDebugHotkey").value = config.ui?.debugTerminalHotkey || "Ctrl+`";
+        const addressBarField = $id("appModeShowAddressBar");
+        if (addressBarField) addressBarField.checked = !!config.ui?.showAddressBar;
+        const frameworkField = $id("appModePythonFramework");
+        const appSpecField = $id("appModePythonAppSpec");
+        if (frameworkField) frameworkField.value = config.python?.framework || "flask";
+        if (appSpecField) appSpecField.value = config.python?.appSpec || "app:app";
         $id("appModePythonObject").value = config.python?.appObject || "app";
         $id("appModeRoutePrefix").value = config.python?.routePrefix || "/";
         $id("appModePythonFs").checked = !!config.python?.allowFilesystemAccess;
@@ -3650,7 +7235,14 @@ else:
         return normalizeAppModeConfig({
           enabled: $id("appModeEnabled").checked,
           runtime: $id("appModeRuntime").value,
-          entrypoint: normalizePath($id("appModeEntrypoint").value || (String($id("appModeRuntime").value) === "static" ? "/home/user/index.html" : "/home/user/app.py")),
+          entrypoint: normalizePath(
+            $id("appModeEntrypoint").value ||
+              (String($id("appModeRuntime").value) === "static"
+                ? "/home/user/index.html"
+                : String($id("appModeRuntime").value) === "php"
+                  ? "/home/user/public/index.php"
+                  : "/home/user/app.py")
+          ),
           staticRoot: normalizePath($id("appModeStaticRoot").value || "/home/user/public"),
           workingDirectory: normalizePath($id("appModeWorkingDirectory").value || "/home/user"),
           fullscreen: $id("appModeFullscreen").checked,
@@ -3666,8 +7258,11 @@ else:
             hideWorkspaceChrome: $id("appModeHideChrome").checked,
             allowDebugTerminal: $id("appModeAllowDebugTerminal").checked,
             debugTerminalHotkey: $id("appModeDebugHotkey").value || "Ctrl+`",
+            showAddressBar: !!$id("appModeShowAddressBar")?.checked,
           },
           python: {
+            framework: $id("appModePythonFramework")?.value || "flask",
+            appSpec: $id("appModePythonAppSpec")?.value || "",
             appObject: $id("appModePythonObject").value || "app",
             routePrefix: $id("appModeRoutePrefix").value || "/",
             allowFilesystemAccess: $id("appModePythonFs").checked,
@@ -3680,20 +7275,26 @@ else:
       }
 
       async function seedDefaultRootfs(id, force = false) {
-        const rootfsPath = workspacePath(id, "/rootfs");
+        const workspace = workspaces.find((item) => item.id === id);
+        if (force && workspace?.rootfsVersion === "custom") {
+          clearDirectory(workspacePath(id, "/rootfs"));
+          workspace.rootfsVersion = DEFAULT_ROOTFS_VERSION;
+        }
+        const rootfsPath = SYSTEM_ROOTFS_PATH;
         const shellPath = `${rootfsPath}/bin/shell.py`;
         const shellEnginePath = `${rootfsPath}/usr/lib/edgeterm_shell.py`;
-        const workspace = workspaces.find((item) => item.id === id);
         const hasRootfs = pyodide.FS.analyzePath(`${rootfsPath}/bin/shell.py`).exists;
         const hasCurrentShell =
           pyodide.FS.analyzePath(shellPath).exists &&
           pyodide.FS.readFile(shellPath, { encoding: "utf8" }).includes("EDGETERM_SHELL") &&
           pyodide.FS.analyzePath(shellEnginePath).exists &&
           pyodide.FS.readFile(shellEnginePath, { encoding: "utf8" }).includes("class EdgeTermShell");
-        const isCustomRootfs = workspace?.rootfsVersion === "custom";
-        const hasCurrentRootfs = workspace?.rootfsVersion === DEFAULT_ROOTFS_VERSION && hasCurrentShell;
+        const hasUsableRootfs = hasRootfs && hasCurrentShell;
 
-        if (!force && (isCustomRootfs || (hasRootfs && hasCurrentRootfs))) return;
+        if (!force && hasUsableRootfs) {
+          if (workspace && !workspace.rootfsVersion) workspace.rootfsVersion = DEFAULT_ROOTFS_VERSION;
+          return;
+        }
 
         clearDirectory(rootfsPath);
         const rootfsUrl = `${assetUrl("rootfs.zip")}?v=${encodeURIComponent(DEFAULT_ROOTFS_VERSION)}`;
@@ -3701,26 +7302,58 @@ else:
         const resp = await fetch(rootfsUrl, { cache: "no-store" });
         if (!resp.ok) throw new Error("Failed to fetch rootfs.zip");
         const zip = await JSZip.loadAsync(await readResponseBlobWithProgress(resp, "Downloading rootfs..."));
-        await extractZipTo(zip, rootfsPath);
-        if (workspace) workspace.rootfsVersion = DEFAULT_ROOTFS_VERSION;
+        await extractZipTo(zip, rootfsPath, { phase: "Extracting rootfs..." });
+        if (workspace && workspace.rootfsVersion !== "custom") workspace.rootfsVersion = DEFAULT_ROOTFS_VERSION;
+      }
+
+      function schedulePersistedDefaultRootfsPrune(id) {
+        const workspace = workspaces.find((item) => item.id === id);
+        if (!workspace || workspace.transient || workspace.rootfsVersion === "custom") return;
+        setTimeout(() => {
+          (async () => {
+            const persistedRootfs = workspacePath(id, "/rootfs");
+            if (!pyodide?.FS?.analyzePath(persistedRootfs).exists) return;
+            try {
+              const entries = pyodide.FS.readdir(persistedRootfs).filter((entry) => entry !== "." && entry !== "..");
+              if (!entries.length) return;
+              console.info("[BOOT] Pruning persisted default rootfs from workspace storage for faster future starts.");
+              clearDirectory(persistedRootfs);
+              await syncfs(false);
+            } catch (err) {
+              console.warn("[BOOT] Persisted default rootfs prune skipped:", err);
+            }
+          })();
+        }, 10000);
       }
 
       async function ensureWorkspaceLayout(id) {
+        const workspace = workspaces.find((item) => item.id === id);
         for (const dir of [
           workspacePath(id),
-          workspacePath(id, "/rootfs"),
           workspacePath(id, "/home/user"),
           workspacePath(id, "/overlay/upper"),
           workspacePath(id, "/overlay/work"),
         ]) {
           ensureDir(dir);
         }
-        const workspace = workspaces.find((item) => item.id === id);
+        if (workspace?.rootfsVersion === "custom") ensureDir(workspacePath(id, "/rootfs"));
         for (const user of workspace.users || ["user"]) {
           ensureDir(workspacePath(id, `/home/${user}`));
         }
+        migrateLegacyRootfsHomes(id);
         await seedDefaultRootfs(id);
         ensureAppModeStarterFiles(id);
+      }
+
+      function migrateLegacyRootfsHomes(id) {
+        const legacyHomeRoot = workspacePath(id, "/rootfs/home");
+        if (!pyodide.FS.analyzePath(legacyHomeRoot).exists) return;
+        let copied = false;
+        for (const user of pyodide.FS.readdir(legacyHomeRoot)) {
+          if (user === "." || user === "..") continue;
+          copied = copyTreeMissing(`${legacyHomeRoot}/${user}`, workspacePath(id, `/home/${user}`)) || copied;
+        }
+        if (copied) console.info("[PERSIST] Migrated legacy rootfs home files into workspace home.");
       }
 
       function ensureAppModeStarterFiles(id) {
@@ -3731,7 +7364,9 @@ else:
         if (!pyodide.FS.analyzePath(pythonSamplePath).exists) {
           pyodide.FS.writeFile(
             pythonSamplePath,
-            `from edgeterm import app, request
+            `from flask import Flask, request
+
+app = Flask(__name__)
 
 @app.route("/")
 def index():
@@ -3748,7 +7383,7 @@ def index():
 
 @app.route("/api/data")
 def data():
-    return {"value": 123, "query": request.args}
+    return {"value": 123, "query": request.args.to_dict()}
 `,
             { encoding: "utf8" }
           );
@@ -3788,16 +7423,20 @@ def data():
       function createRootLinks() {
         const fs = pyodide.FS;
         const links = ["boot", "bin", "etc", "packages", "usr", "var"];
+        const rootfsPath = activeRootfsPath();
 
         for (const dir of links) {
           const link = `/${dir}`;
-          const target = workspacePath(activeWorkspaceId, `/rootfs/${dir}`);
+          const target = `${rootfsPath}/${dir}`;
           ensureDir(target);
 
           try {
             const stat = fs.lstat(link);
             if (fs.isLink(stat.mode)) fs.unlink(link);
-            else continue;
+            else {
+              copyTreeMissing(target, link);
+              continue;
+            }
           } catch (err) {
             if (err?.errno !== 44) continue;
           }
@@ -3807,6 +7446,10 @@ def data():
       }
 
       function prepareActiveMounts() {
+        const fs = pyodide.FS;
+        try {
+          fs.chdir("/");
+        } catch {}
         ensureDir("/workspace-store");
         ensureDir("/home");
         ensureDir("/overlay");
@@ -3814,14 +7457,18 @@ def data():
         ensureDir("/overlay/work");
         for (const user of mountedUsers) {
           const path = `/home/${user}`;
-          if (pyodide.FS.analyzePath(path).exists) clearDirectory(path);
+          if (pyodide.FS.analyzePath(path).exists) removeTree(path);
         }
         mountedUsers = new Set(activeWorkspace().users);
-        for (const user of mountedUsers) ensureDir(`/home/${user}`);
+        for (const user of mountedUsers) ensureDir(workspacePath(activeWorkspaceId, `/home/${user}`));
         removeRootOverlayEntries();
         clearDirectory("/overlay/upper");
         for (const user of mountedUsers) {
-          copyTree(workspacePath(activeWorkspaceId, `/home/${user}`), `/home/${user}`);
+          const runtimeHome = `/home/${user}`;
+          const targetHome = workspacePath(activeWorkspaceId, `/home/${user}`);
+          if (fs.analyzePath(runtimeHome).exists) removeTree(runtimeHome);
+          ensureDir(targetHome);
+          fs.symlink(targetHome, runtimeHome);
         }
         copyTree(workspacePath(activeWorkspaceId, "/overlay/upper"), "/overlay/upper");
         createRootLinks();
@@ -3831,8 +7478,22 @@ def data():
       }
 
       function recordDisplayEvent(event) {
+        try {
+          const dispatcher = globalThis.__edgeterm_tk_event || pyodide?.globals?.get?.("__edgeterm_tk_event");
+          if (dispatcher) {
+            dispatcher({ ...(event || {}), ts: Date.now() });
+            return;
+          }
+        } catch (err) {
+          console.error("[DISPLAY] tkinter direct event dispatch failed:", err);
+        }
         displayInputQueue.push({ ...event, ts: Date.now() });
         if (displayInputQueue.length > 200) displayInputQueue = displayInputQueue.slice(-200);
+        try {
+          displayInputPump?.();
+        } catch (err) {
+          console.error("[DISPLAY] input pump failed:", err);
+        }
       }
 
       function updateDisplayStatus(message) {
@@ -4001,6 +7662,63 @@ def data():
         content.innerHTML = `<table class="display-table">${thead}<tbody>${tbody}</tbody></table>`;
       }
 
+      function installDisplayHtmlEventBridge(content) {
+        if (content.dataset.etkBridgeInstalled === "true") return;
+        content.dataset.etkBridgeInstalled = "true";
+        const widgetTarget = (event) => event.target?.closest?.("[data-etk]");
+        const widgetPayload = (event, type) => {
+          const target = widgetTarget(event);
+          if (!target) return null;
+          const rect = target.getBoundingClientRect();
+          return {
+            type,
+            widgetId: target.dataset.etk || "",
+            value: "value" in event.target ? event.target.value : undefined,
+            checked: "checked" in event.target ? event.target.checked : undefined,
+            x: event.clientX !== undefined ? event.clientX - rect.left : 0,
+            y: event.clientY !== undefined ? event.clientY - rect.top : 0,
+            button: event.button,
+            buttons: event.buttons,
+            key: event.key || "",
+            code: event.code || "",
+            deltaX: event.deltaX || 0,
+            deltaY: event.deltaY || 0,
+          };
+        };
+        content.addEventListener("pointerdown", (event) => {
+          const payload = widgetPayload(event, "pointerdown");
+          if (payload) recordDisplayEvent(payload);
+        });
+        content.addEventListener("pointermove", (event) => {
+          const payload = widgetPayload(event, "pointermove");
+          if (payload) recordDisplayEvent(payload);
+        });
+        content.addEventListener("pointerup", (event) => {
+          const payload = widgetPayload(event, "pointerup");
+          if (payload) recordDisplayEvent(payload);
+        });
+        content.addEventListener("wheel", (event) => {
+          const payload = widgetPayload(event, "wheel");
+          if (payload) recordDisplayEvent(payload);
+        });
+        content.addEventListener("input", (event) => {
+          const payload = widgetPayload(event, "input");
+          if (payload) recordDisplayEvent(payload);
+        });
+        content.addEventListener("change", (event) => {
+          const payload = widgetPayload(event, "change");
+          if (payload) recordDisplayEvent(payload);
+        });
+        content.addEventListener("keydown", (event) => {
+          const payload = widgetPayload(event, "keydown");
+          if (payload) recordDisplayEvent(payload);
+        });
+        content.addEventListener("keyup", (event) => {
+          const payload = widgetPayload(event, "keyup");
+          if (payload) recordDisplayEvent(payload);
+        });
+      }
+
       function renderDisplayMessage(message) {
         const canvas = $id("displayCanvas");
         const content = $id("displayContent");
@@ -4063,6 +7781,7 @@ def data():
 
         setDisplayVisibility("content");
         content.className = "display-content";
+        installDisplayHtmlEventBridge(content);
 
         if (normalized.type === "svg") {
           content.innerHTML = normalized.content || normalized.svg || "";
@@ -4096,7 +7815,7 @@ def data():
             y: event.clientY - rect.top,
             button: event.button,
             buttons: event.buttons,
-            key: event.key || null,
+            key: event.key || "",
             deltaX: event.deltaX || 0,
             deltaY: event.deltaY || 0,
           });
@@ -4109,8 +7828,8 @@ def data():
         canvas.addEventListener("pointermove", (event) => recordPointer("pointermove", event));
         canvas.addEventListener("pointerup", (event) => recordPointer("pointerup", event));
         canvas.addEventListener("wheel", (event) => recordPointer("wheel", event));
-        canvas.addEventListener("keydown", (event) => recordDisplayEvent({ type: "keydown", key: event.key, code: event.code }));
-        canvas.addEventListener("keyup", (event) => recordDisplayEvent({ type: "keyup", key: event.key, code: event.code }));
+        canvas.addEventListener("keydown", (event) => recordDisplayEvent({ type: "keydown", key: event.key || "", code: event.code || "" }));
+        canvas.addEventListener("keyup", (event) => recordDisplayEvent({ type: "keyup", key: event.key || "", code: event.code || "" }));
         surface.addEventListener("dblclick", () => canvas.focus());
 
         window.EdgeTermDisplay = {
@@ -4120,6 +7839,10 @@ def data():
           focus: () => canvas.focus(),
           getCanvas: () => canvas,
           bindSDLCanvas,
+          postInputEvent: (event) => recordDisplayEvent(event || {}),
+          setInputPump: (callback) => {
+            displayInputPump = typeof callback === "function" ? callback : null;
+          },
           consumeInputEvents: () => {
             const events = [...displayInputQueue];
             displayInputQueue = [];
@@ -4676,8 +8399,17 @@ def data():
             </div>
           `;
           item.querySelector(".workspace-name").textContent = workspace.name;
-          item.querySelector(".workspace-meta").textContent = new Date(workspace.createdAt).toLocaleString();
-          item.querySelector(".open-workspace").addEventListener("click", () => switchWorkspace(workspace.id));
+          const storageLabel = workspace.storageType === "local-directory"
+            ? `local dir${workspace.localDirectoryName ? `: ${workspace.localDirectoryName}` : ""}`
+            : "browser storage";
+          item.querySelector(".workspace-meta").textContent = `${storageLabel} - ${new Date(workspace.createdAt).toLocaleString()}`;
+          item.querySelector(".open-workspace").addEventListener("click", (event) => {
+            event.stopPropagation();
+            switchWorkspace(workspace.id).catch((err) => {
+              console.error("[WORKSPACE] Switch failed:", err);
+              showNotice(`Switch failed: ${err.message || err}`);
+            });
+          });
           item.querySelector(".rename-workspace").addEventListener("click", async (event) => {
             event.stopPropagation();
             await renameWorkspace(workspace.id);
@@ -4740,6 +8472,17 @@ def data():
         if (!workspace) return;
         if ($id("settingsWorkspaceName")) $id("settingsWorkspaceName").textContent = workspace.name;
         if ($id("settingsRootfs")) $id("settingsRootfs").textContent = workspace.rootfsVersion || DEFAULT_ROOTFS_VERSION;
+        if ($id("settingsStorageType")) $id("settingsStorageType").textContent = workspace.storageType === "local-directory" ? "local directory" : "browser storage";
+        if ($id("settingsStorageLocation")) {
+          $id("settingsStorageLocation").textContent = workspace.storageType === "local-directory"
+            ? workspace.localDirectoryName || "Directory permission required"
+            : "/workspace-store";
+        }
+        if ($id("settingsLocalDirectorySupport")) {
+          $id("settingsLocalDirectorySupport").textContent = supportsLocalDirectoryStorage() ? "available" : "unavailable";
+        }
+        if ($id("syncWorkspaceToLocal")) $id("syncWorkspaceToLocal").disabled = workspace.storageType !== "local-directory";
+        if ($id("syncWorkspaceFromLocal")) $id("syncWorkspaceFromLocal").disabled = workspace.storageType !== "local-directory";
         if ($id("themeModeLabel")) $id("themeModeLabel").textContent = appTheme;
         if (pyodide?.FS) populateAppModeSettings();
       }
@@ -4767,6 +8510,10 @@ def data():
         return selectedPath ? [selectedPath] : [];
       }
 
+      function getVisibleFilePaths() {
+        return Array.from(document.querySelectorAll(".file-row")).map((row) => row.dataset.path).filter(Boolean);
+      }
+
       function syncRowSelectionUI() {
         document.querySelectorAll(".file-row").forEach((row) => {
           const path = row.dataset.path;
@@ -4789,6 +8536,21 @@ def data():
         syncRowSelectionUI();
       }
 
+      function toggleSelectAllFiles() {
+        const paths = getVisibleFilePaths();
+        if (!paths.length) return;
+        const allSelected = paths.every((path) => selectedPaths.has(path));
+        if (allSelected) {
+          clearSelection();
+          showNotice("Selection cleared");
+          return;
+        }
+        selectedPaths = new Set(paths);
+        selectedPath = paths[paths.length - 1] || "";
+        syncRowSelectionUI();
+        showNotice(`Selected ${paths.length} item${paths.length === 1 ? "" : "s"}`);
+      }
+
       function hideContextMenu() {
         $id("contextMenu").classList.add("hidden");
         contextTargetPath = "";
@@ -4798,6 +8560,88 @@ def data():
         const button = $id("contextMenu").querySelector('[data-action="preview"]');
         if (!button) return;
         button.classList.toggle("hidden", !isPreviewablePath(contextTargetPath));
+      }
+
+      function isExtractableArchivePath(path) {
+        const lower = String(path || "").toLowerCase();
+        return lower.endsWith(".zip") || lower.endsWith(".7z") || lower.endsWith(".tar") || lower.endsWith(".tar.gz");
+      }
+
+      function updateContextArchiveVisibility() {
+        const button = $id("contextMenu").querySelector('[data-action="unzip"]');
+        if (!button) return;
+        button.classList.toggle("hidden", !isExtractableArchivePath(contextTargetPath));
+      }
+
+      function showFileDropzone() {
+        if (!filesViewIsActive()) return;
+        $id("fileUploadDropzone")?.classList.remove("hidden");
+      }
+
+      function hideFileDropzone() {
+        fileDragDepth = 0;
+        $id("fileUploadDropzone")?.classList.add("hidden");
+      }
+
+      function resetFileUploadProgress() {
+        const wrap = $id("fileUploadProgress");
+        const fill = $id("fileUploadProgressFill");
+        const text = $id("fileUploadProgressText");
+        const label = $id("fileUploadProgressLabel");
+        const meta = $id("fileUploadProgressMeta");
+        wrap?.classList.add("hidden");
+        if (fill) fill.style.width = "0%";
+        if (text) text.textContent = "0%";
+        if (label) label.textContent = "Uploading files...";
+        if (meta) meta.textContent = "Waiting to start...";
+      }
+
+      function updateFileUploadProgress({ loaded = 0, total = 0, fileName = "", fileIndex = 0, fileCount = 0 } = {}) {
+        const wrap = $id("fileUploadProgress");
+        const fill = $id("fileUploadProgressFill");
+        const text = $id("fileUploadProgressText");
+        const label = $id("fileUploadProgressLabel");
+        const meta = $id("fileUploadProgressMeta");
+        if (!wrap) return;
+        const safeLoaded = Math.max(0, Number(loaded) || 0);
+        const safeTotal = Math.max(safeLoaded, Number(total) || 0);
+        const percent = safeTotal > 0 ? Math.min(100, Math.round((safeLoaded / safeTotal) * 100)) : 0;
+        wrap.classList.remove("hidden");
+        if (fill) fill.style.width = `${percent}%`;
+        if (text) text.textContent = `${percent}%`;
+        if (label) label.textContent = fileCount > 1 ? `Uploading ${fileCount} files...` : `Uploading ${fileName || "file"}...`;
+        if (meta) {
+          const filePart = fileName ? `Current: ${fileName}` : "Preparing upload";
+          const countPart = fileCount > 1 ? ` (${Math.min(fileIndex + 1, fileCount)}/${fileCount})` : "";
+          meta.textContent = `${filePart}${countPart} ${formatBytes(safeLoaded)} / ${formatBytes(safeTotal)}`;
+        }
+      }
+
+      async function readFileWithProgress(file, onProgress = () => {}) {
+        const total = Number(file?.size || 0);
+        if (!file?.stream) {
+          const data = new Uint8Array(await file.arrayBuffer());
+          onProgress(data.byteLength, total || data.byteLength);
+          return data;
+        }
+        const reader = file.stream().getReader();
+        const chunks = [];
+        let loaded = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          chunks.push(value);
+          loaded += value.byteLength;
+          onProgress(loaded, total || loaded);
+        }
+        const out = new Uint8Array(loaded);
+        let offset = 0;
+        for (const chunk of chunks) {
+          out.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return out;
       }
 
       function removeMarqueeBox() {
@@ -4886,6 +8730,7 @@ def data():
         menu.style.left = `${x}px`;
         menu.style.top = `${y}px`;
         updateContextPreviewVisibility();
+        updateContextArchiveVisibility();
         menu.classList.remove("hidden");
         window.lucide?.createIcons();
       }
@@ -4897,7 +8742,9 @@ def data():
         if (window.innerWidth <= 820) setSidebarOpen(false);
         if (id !== "displayView" && id !== "browserView" && displayState.fullscreen) setDisplayFullscreen(false);
         if (id === "displayView") $id("displayCanvas")?.focus();
-        if (id === "filesView") refreshFiles();
+        if (id === "filesView") {
+          void ensureActiveWorkspaceMounted("Loading workspace files...").then(() => refreshFiles());
+        }
         if (id === "editorView") {
           renderEditorChrome();
           editor?.layout();
@@ -5281,12 +9128,335 @@ def data():
         await refreshCloudState();
       }
 
-      async function buildWorkspaceBlob() {
-        await persistActiveWorkspace();
+      async function buildWorkspaceBlob(options = {}) {
+        if (options.persist !== false) {
+          await persistActiveWorkspace();
+        }
         const workspace = activeWorkspace();
         const zip = new JSZip();
-        addPathToZip(zip, workspacePath(activeWorkspaceId), workspace.name.replace(/[^\w.-]+/g, "-"));
-        return zip.generateAsync({ type: "blob" });
+        const sourcePath = workspacePath(activeWorkspaceId);
+        const zipPath = workspace.name.replace(/[^\w.-]+/g, "-");
+        showLoadingIndeterminate("Scanning workspace files...", "Calculating archive size...");
+        const stats = countTreeStats(sourcePath);
+        await addPathToZip(zip, sourcePath, zipPath, {
+          phase: "Adding files to archive...",
+          totalFiles: stats.files,
+          totalBytes: stats.bytes,
+        });
+        return await zip.generateAsync({ type: "blob" }, (metadata) => {
+          updateLoadingProgress({
+            current: Number(metadata.percent || 0),
+            total: 100,
+            phase: "Preparing workspace archive...",
+            detail: metadata.currentFile
+              ? `Preparing workspace archive... ${metadata.currentFile}`
+              : "Preparing workspace archive...",
+          });
+        });
+      }
+
+      async function writeActiveWorkspaceToLocalDirectory(handle, options = {}) {
+        const workspace = activeWorkspace();
+        if (!workspace || !handle) return false;
+        if (options.persist !== false) await persistActiveWorkspace();
+        const sourcePath = workspacePath(workspace.id);
+        const previousMeta = await readLocalWorkspaceMeta(handle);
+        const sourceTopLevelEntries = pyodide.FS.readdir(sourcePath).filter((entry) => entry !== "." && entry !== "..");
+        for (const entry of Array.isArray(previousMeta.managedEntries) ? previousMeta.managedEntries : []) {
+          if (!sourceTopLevelEntries.includes(entry)) await removeLocalDirectoryEntry(handle, entry, { recursive: true });
+        }
+        const stats = countTreeStats(sourcePath);
+        showLoadingIndeterminate("Syncing workspace to local directory...", "Preparing file tree...");
+        const progressState = {
+          phase: "Writing local directory...",
+          totalFiles: stats.files,
+          totalBytes: stats.bytes,
+          completedFiles: 0,
+          completedBytes: 0,
+          lastRenderedFiles: 0,
+        };
+        await writeFsTreeToLocalDirectory(sourcePath, handle, progressState, { prune: false });
+        await removeLocalDirectoryEntry(handle, LOCAL_WORKSPACE_ARCHIVE);
+        const meta = {
+          app: "EdgeTerm",
+          workspaceId: workspace.id,
+          name: workspace.name,
+          storageType: "local-directory",
+          format: "file-tree",
+          rootfsVersion: workspace.rootfsVersion || DEFAULT_ROOTFS_VERSION,
+          users: workspace.users || ["user"],
+          userName: workspace.userName || "user",
+          managedEntries: sourceTopLevelEntries,
+          updatedAt: new Date().toISOString(),
+        };
+        await writeLocalWorkspaceMeta(handle, meta);
+        workspace.localDirectoryName = handle.name || workspace.localDirectoryName || "Local directory";
+        workspace.localDirectorySyncedAt = Date.now();
+        saveWorkspaceRegistry();
+        return true;
+      }
+
+      async function syncActiveWorkspaceToLocalDirectory(options = {}) {
+        const workspace = activeWorkspace();
+        if (!workspace || workspace.storageType !== "local-directory") return false;
+        if (syncingLocalWorkspaceId === workspace.id) return false;
+        const handle = await getLocalWorkspaceHandle(workspace.id, { write: true });
+        if (!handle) {
+          if (!options.silent) showNotice("Choose the local directory again to sync");
+          return false;
+        }
+        syncingLocalWorkspaceId = workspace.id;
+        const ownsOverlay = !options.silent && options.overlay !== false;
+        if (ownsOverlay) setBusy(true, "Syncing workspace to local directory...");
+        try {
+          if (!options.silent) showNotice("Syncing workspace to local directory...");
+          await writeActiveWorkspaceToLocalDirectory(handle, { persist: options.persist !== false });
+          renderWorkspaces();
+          if (!options.silent) showNotice("Synced workspace to local directory");
+          return true;
+        } catch (err) {
+          console.error("[LOCAL-DIR] Sync to local directory failed:", err);
+          if (!options.silent) showNotice(`Local directory sync failed: ${err.message || err}`);
+          return false;
+        } finally {
+          syncingLocalWorkspaceId = "";
+          if (ownsOverlay) setBusy(false);
+        }
+      }
+
+      async function syncActiveWorkspaceFromLocalDirectory(options = {}) {
+        const workspace = activeWorkspace();
+        if (!workspace || workspace.storageType !== "local-directory") return false;
+        try {
+          const handle = await getLocalWorkspaceHandle(workspace.id, { write: false });
+          if (!handle) {
+            if (!options.silent) showNotice("Choose the local directory again to restore");
+            return false;
+          }
+          const meta = await readLocalWorkspaceMeta(handle);
+          const hasArchive = await localDirectoryFileExists(handle, meta.archive || LOCAL_WORKSPACE_ARCHIVE);
+          const sourceLabel = hasArchive && meta.format !== "file-tree"
+            ? (meta.archive || LOCAL_WORKSPACE_ARCHIVE)
+            : "the file tree";
+          const confirmed = options.confirm === false || await askConfirm(
+            "Restore From Local Directory",
+            `Replace "${workspace.name}" with ${sourceLabel} from "${handle.name}"?`,
+            { confirmLabel: "Restore" }
+          );
+          if (!confirmed) return false;
+          await withBusy("Restoring workspace from local directory...", async () => {
+            await exitAppMode({ force: true, resetSurface: true, toDebugTerminal: false });
+            clearDirectory(workspacePath(workspace.id));
+            if (hasArchive && meta.format !== "file-tree") {
+              showLoadingIndeterminate("Reading local archive...", meta.archive || LOCAL_WORKSPACE_ARCHIVE);
+              const file = await readLocalDirectoryFile(handle, meta.archive || LOCAL_WORKSPACE_ARCHIVE);
+              await importZipIntoWorkspace(workspace.id, file);
+            } else {
+              showLoadingIndeterminate("Scanning local directory...", "Counting files before restore...");
+              const stats = await countLocalDirectoryTreeStats(handle);
+              const progressState = {
+                phase: "Reading local directory...",
+                totalFiles: stats.files,
+                totalBytes: stats.bytes,
+                completedFiles: 0,
+                completedBytes: 0,
+                lastRenderedFiles: 0,
+              };
+              await readLocalDirectoryTreeIntoFs(handle, workspacePath(workspace.id), { progressState });
+              workspace.rootfsVersion = meta.rootfsVersion || workspace.rootfsVersion || DEFAULT_ROOTFS_VERSION;
+              workspace.users = Array.isArray(meta.users) && meta.users.length ? meta.users : listWorkspaceUsers(workspace.id);
+              workspace.userName = workspace.users.includes(meta.userName) ? meta.userName : (workspace.users.includes("user") ? "user" : workspace.users[0]);
+            }
+            await ensureWorkspaceLayout(workspace.id);
+            await clearWorkspaceJournal(workspace.id);
+            showLoadingIndeterminate("Saving restored workspace...", "Writing browser workspace index...");
+            await syncfs(false);
+            prepareActiveMounts();
+            saveWorkspaceRegistry();
+            renderWorkspaces();
+            await bootShell();
+            refreshFiles(`/home/${activeUser()}`);
+            await maybeAutoStartAppMode();
+          });
+          showNotice("Restored workspace from local directory");
+          return true;
+        } catch (err) {
+          console.error("[LOCAL-DIR] Restore from local directory failed:", err);
+          if (!options.silent) showNotice(`Local directory restore failed: ${err.message || err}`);
+          return false;
+        }
+      }
+
+      async function refreshActiveWorkspaceFromGrantedLocalDirectory() {
+        const workspace = activeWorkspace();
+        if (!workspace || workspace.storageType !== "local-directory") return false;
+        const record = await localWorkspaceHandleRecord(workspace.id);
+        const handle = record?.handle || null;
+        if (!handle) return false;
+        const permission = await handle.queryPermission?.({ mode: "readwrite" });
+        if (permission !== "granted") return false;
+        try {
+          const meta = await readLocalWorkspaceMeta(handle);
+          clearDirectory(workspacePath(workspace.id));
+          if (await localDirectoryFileExists(handle, meta.archive || LOCAL_WORKSPACE_ARCHIVE) && meta.format !== "file-tree") {
+            const file = await readLocalDirectoryFile(handle, meta.archive || LOCAL_WORKSPACE_ARCHIVE);
+            await importZipIntoWorkspace(workspace.id, file);
+          } else {
+            await readLocalDirectoryTreeIntoFs(handle, workspacePath(workspace.id));
+            workspace.rootfsVersion = meta.rootfsVersion || workspace.rootfsVersion || DEFAULT_ROOTFS_VERSION;
+            workspace.users = Array.isArray(meta.users) && meta.users.length ? meta.users : listWorkspaceUsers(workspace.id);
+            workspace.userName = workspace.users.includes(meta.userName) ? meta.userName : (workspace.users.includes("user") ? "user" : workspace.users[0]);
+          }
+          await ensureWorkspaceLayout(workspace.id);
+          await clearWorkspaceJournal(workspace.id);
+          await syncfs(false);
+          return true;
+        } catch (err) {
+          console.warn("[LOCAL-DIR] Could not refresh workspace from local directory:", err);
+          return false;
+        }
+      }
+
+      async function chooseLocalDirectoryForActiveWorkspace(options = {}) {
+        if (!supportsLocalDirectoryStorage()) {
+          showNotice("Local directory storage needs a browser with File System Access API");
+          return false;
+        }
+        const workspace = activeWorkspace();
+        if (!workspace) return false;
+        const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+        const allowed = await requestDirectoryPermission(handle, true);
+        if (!allowed) {
+          showNotice("Directory permission was not granted");
+          return false;
+        }
+        await saveLocalWorkspaceHandle(workspace.id, handle);
+        workspace.storageType = "local-directory";
+        workspace.localDirectoryName = handle.name || "Local directory";
+        workspace.updatedAt = Date.now();
+        saveWorkspaceRegistry();
+        if (options.sync !== false) await syncActiveWorkspaceToLocalDirectory({ silent: !!options.silent, persist: true });
+        renderWorkspaces();
+        return true;
+      }
+
+      async function restoreWorkspaceFromLocalDirectory() {
+        if (!supportsLocalDirectoryStorage()) {
+          showNotice("Local directory restore needs a browser with File System Access API");
+          return;
+        }
+        try {
+          const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+          if (!(await requestDirectoryPermission(handle, true))) {
+            showNotice("Directory permission was not granted");
+            return;
+          }
+          await withBusy("Restoring local directory workspace...", async () => {
+            const meta = await readLocalWorkspaceMeta(handle);
+            const name = meta.name || handle.name || "Local Directory Workspace";
+            let id = "";
+            if (await localDirectoryFileExists(handle, meta.archive || LOCAL_WORKSPACE_ARCHIVE) && meta.format !== "file-tree") {
+              showLoadingIndeterminate("Reading local archive...", meta.archive || LOCAL_WORKSPACE_ARCHIVE);
+              const file = await readLocalDirectoryFile(handle, meta.archive || LOCAL_WORKSPACE_ARCHIVE);
+              id = await createWorkspaceFromZip(name, file);
+            } else {
+              id = await createWorkspaceFromZip(name, null, { switchOptions: { skipBootShell: true, skipRefreshFiles: true, skipAutoStartAppMode: true } });
+              clearDirectory(workspacePath(id));
+              showLoadingIndeterminate("Scanning local directory...", "Counting files before restore...");
+              const stats = await countLocalDirectoryTreeStats(handle);
+              const progressState = {
+                phase: "Reading local directory...",
+                totalFiles: stats.files,
+                totalBytes: stats.bytes,
+                completedFiles: 0,
+                completedBytes: 0,
+                lastRenderedFiles: 0,
+              };
+              await readLocalDirectoryTreeIntoFs(handle, workspacePath(id), { progressState });
+              const restored = workspaces.find((item) => item.id === id);
+              if (restored) {
+                restored.rootfsVersion = meta.rootfsVersion || restored.rootfsVersion || DEFAULT_ROOTFS_VERSION;
+                restored.users = Array.isArray(meta.users) && meta.users.length ? meta.users : listWorkspaceUsers(id);
+                restored.userName = restored.users.includes(meta.userName) ? meta.userName : (restored.users.includes("user") ? "user" : restored.users[0]);
+              }
+              await ensureWorkspaceLayout(id);
+              await clearWorkspaceJournal(id);
+              showLoadingIndeterminate("Saving restored workspace...", "Writing browser workspace index...");
+              await syncfs(false);
+              prepareActiveMounts();
+              await bootShell();
+              refreshFiles(`/home/${activeUser()}`);
+              await maybeAutoStartAppMode();
+            }
+            const workspace = workspaces.find((item) => item.id === id);
+            if (workspace) {
+              workspace.storageType = "browser-storage";
+              workspace.localDirectoryName = "";
+              await deleteLocalWorkspaceHandle(id);
+              saveWorkspaceRegistry();
+              renderWorkspaces();
+            }
+          });
+          showNotice("Restored workspace from local directory");
+        } catch (err) {
+          console.error("[LOCAL-DIR] Restore local directory workspace failed:", err);
+          showNotice(`Local directory restore failed: ${err.message || err}`);
+        }
+      }
+
+      async function switchWorkspaceStorageWizard() {
+        const workspace = activeWorkspace();
+        if (!workspace) return;
+        const currentType = workspace.storageType === "local-directory" ? "Local directory" : "Browser storage";
+        const result = await askFields("Switch Workspace Storage", [
+          {
+            name: "storageType",
+            label: "Storage type",
+            type: "select",
+            value: workspace.storageType || "browser-storage",
+            options: [
+              { value: "browser-storage", label: "Browser storage" },
+              { value: "local-directory", label: "Local directory" },
+            ],
+          },
+          {
+            name: "direction",
+            label: "Migration action",
+            type: "select",
+            value: "copy-current",
+            options: [
+              { value: "copy-current", label: "Copy current workspace to target" },
+              { value: "restore-target", label: "Restore current workspace from target" },
+            ],
+          },
+        ], {
+          message: `Current storage: ${currentType}. Switching keeps the workspace entry and syncs data in the selected direction.`,
+          confirmLabel: "Continue",
+        });
+        if (!result) return;
+        if (result.storageType === "local-directory") {
+          if (result.direction === "restore-target") {
+            await chooseLocalDirectoryForActiveWorkspace({ silent: true, sync: false });
+            await syncActiveWorkspaceFromLocalDirectory({ confirm: true });
+          } else {
+            await chooseLocalDirectoryForActiveWorkspace();
+          }
+          return;
+        }
+        await withBusy("Switching to browser storage...", async () => {
+          if (workspace.storageType === "local-directory" && result.direction === "restore-target") {
+            await syncActiveWorkspaceFromLocalDirectory({ confirm: true });
+          } else {
+            await persistActiveWorkspace();
+          }
+          workspace.storageType = "browser-storage";
+          workspace.localDirectoryName = "";
+          await deleteLocalWorkspaceHandle(workspace.id);
+          saveWorkspaceRegistry();
+          await syncfs(false);
+          renderWorkspaces();
+        });
+        showNotice("Workspace now uses browser storage");
       }
 
       async function importZipIntoWorkspace(id, file) {
@@ -5304,7 +9474,7 @@ def data():
           }
         } else {
           clearDirectory(workspacePath(id, "/rootfs"));
-          await extractZipTo(zip, workspacePath(id, "/rootfs"));
+          await extractZipTo(zip, workspacePath(id, "/rootfs"), { phase: "Importing rootfs..." });
           if (workspace) workspace.rootfsVersion = "custom";
         }
       }
@@ -5352,8 +9522,16 @@ def data():
           }
           const snapshot = cloudSnapshots.find((item) => item.id === snapshotId);
           const file = new File([await readResponseBlobWithProgress(response, "Downloading rootfs backup...")], `${snapshot?.name || "cloud-restore"}.workspace.zip`, { type: "application/zip" });
-          await createWorkspaceFromZip(`${snapshot?.name || "Cloud Restore"} (Cloud)`, file);
-        }).catch((err) => showNotice(err.message));
+          await createWorkspaceFromZip(`${snapshot?.name || "Cloud Restore"} (Cloud)`, file, {
+            persistCurrentWorkspace: false,
+            deferInitialSync: true,
+            initialSyncDelayMs: 30000,
+          });
+          showNotice("Cloud backup restored");
+        }).catch((err) => {
+          console.error("[CLOUD] Restore failed:", err);
+          showNotice(formatError(err));
+        });
       }
 
       async function downloadCloudSnapshot(snapshotId) {
@@ -5578,6 +9756,8 @@ def data():
 
       function workspaceHasRestoredRootfs(workspaceId) {
         if (!pyodide?.FS || !workspaceId) return false;
+        const workspace = workspaces.find((item) => item.id === workspaceId);
+        if (workspace && workspace.rootfsVersion !== "custom") return true;
         try {
           return !!pyodide.FS.analyzePath(workspacePath(workspaceId, "/rootfs/usr/lib/edgeterm.py")).exists;
         } catch {
@@ -5718,6 +9898,9 @@ def data():
               workspaceId = await createWorkspaceFromZip(`${meta.snapshot.name} (Shared)`, file, {
                 workspaceId: existingWorkspace?.id,
                 persistRegistry: !meta.share.tempMode,
+                persistCurrentWorkspace: false,
+                deferInitialSync: true,
+                initialSyncDelayMs: 30000,
                 shareRef: shareWorkspaceKey(meta),
                 transient: !!meta.share.tempMode,
                 switchOptions,
@@ -6232,7 +10415,11 @@ def data():
             throw new Error(payload.error || "Restore failed");
           }
           const file = new File([await readResponseBlobWithProgress(response, "Downloading rootfs backup...")], `${snapshot?.name || "platform-restore"}.workspace.zip`, { type: "application/zip" });
-          await createWorkspaceFromZip(`${snapshot?.name || "Platform Restore"} (${snapshot?.owner?.email || "admin"})`, file);
+          await createWorkspaceFromZip(`${snapshot?.name || "Platform Restore"} (${snapshot?.owner?.email || "admin"})`, file, {
+            persistCurrentWorkspace: false,
+            deferInitialSync: true,
+            initialSyncDelayMs: 30000,
+          });
         }).catch((err) => showNotice(err.message));
       }
 
@@ -6351,7 +10538,12 @@ def data():
 
         if (fs.isDir(stat.mode)) {
           const zip = new JSZip();
-          addPathToZip(zip, path, filename);
+          const stats = countTreeStats(path);
+          await addPathToZip(zip, path, filename, {
+            phase: "Adding files to archive...",
+            totalFiles: stats.files,
+            totalBytes: stats.bytes,
+          });
           blob = await zip.generateAsync({ type: "blob" });
           filename += ".zip";
         } else {
@@ -6374,9 +10566,20 @@ def data():
         }
 
         const zip = new JSZip();
+        const stats = paths.reduce((total, path) => {
+          const next = countTreeStats(path);
+          total.entries += next.entries;
+          total.files += next.files;
+          total.bytes += next.bytes;
+          return total;
+        }, { entries: 0, files: 0, bytes: 0 });
         for (const path of paths) {
           const name = path.split("/").filter(Boolean).pop() || "root";
-          addPathToZip(zip, path, name);
+          await addPathToZip(zip, path, name, {
+            phase: "Adding files to archive...",
+            totalFiles: stats.files,
+            totalBytes: stats.bytes,
+          });
         }
         const blob = await zip.generateAsync({ type: "blob" });
         const url = URL.createObjectURL(blob);
@@ -6388,17 +10591,40 @@ def data():
         showNotice(`Downloaded ${paths.length} items`);
       }
 
-      function addPathToZip(zip, sourcePath, zipPath) {
+      async function addPathToZip(zip, sourcePath, zipPath, progressState = null) {
         const fs = pyodide.FS;
         const stat = fs.stat(sourcePath);
         if (fs.isDir(stat.mode)) {
           const folder = zip.folder(zipPath);
           for (const entry of fs.readdir(sourcePath)) {
             if (entry === "." || entry === "..") continue;
-            addPathToZip(folder, `${sourcePath}/${entry}`, entry);
+            await addPathToZip(folder, `${sourcePath}/${entry}`, entry, progressState);
           }
         } else {
-          zip.file(zipPath, fs.readFile(sourcePath));
+          const fileBytes = fs.readFile(sourcePath);
+          zip.file(zipPath, fileBytes);
+          if (progressState) {
+            progressState.completedFiles = (progressState.completedFiles || 0) + 1;
+            progressState.completedBytes = (progressState.completedBytes || 0) + fileBytes.byteLength;
+            const totalFiles = Math.max(progressState.completedFiles, Number(progressState.totalFiles) || 0);
+            const totalBytes = Math.max(progressState.completedBytes, Number(progressState.totalBytes) || 0);
+            const shouldRender =
+              progressState.completedFiles === totalFiles ||
+              progressState.completedFiles - (progressState.lastRenderedFiles || 0) >= 20;
+            if (shouldRender) {
+              progressState.lastRenderedFiles = progressState.completedFiles;
+              const byteDetail = totalBytes > 0
+                ? `${formatBytes(progressState.completedBytes)} / ${formatBytes(totalBytes)}`
+                : `${progressState.completedFiles} files`;
+              updateLoadingProgress({
+                current: totalBytes > 0 ? progressState.completedBytes : progressState.completedFiles,
+                total: totalBytes > 0 ? totalBytes : totalFiles,
+                phase: progressState.phase || "Adding files to archive...",
+                detail: `${progressState.phase || "Adding files to archive..."} ${progressState.completedFiles} of ${totalFiles || progressState.completedFiles} files (${byteDetail})`,
+              });
+              await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+            }
+          }
         }
       }
 
@@ -6406,7 +10632,15 @@ def data():
         await persistActiveWorkspace();
         const workspace = activeWorkspace();
         const zip = new JSZip();
-        addPathToZip(zip, workspacePath(activeWorkspaceId), workspace.name.replace(/[^\w.-]+/g, "-"));
+        const sourcePath = workspacePath(activeWorkspaceId);
+        const zipPath = workspace.name.replace(/[^\w.-]+/g, "-");
+        showLoadingIndeterminate("Scanning workspace files...", "Calculating archive size...");
+        const stats = countTreeStats(sourcePath);
+        await addPathToZip(zip, sourcePath, zipPath, {
+          phase: "Adding files to archive...",
+          totalFiles: stats.files,
+          totalBytes: stats.bytes,
+        });
         const blob = await zip.generateAsync({ type: "blob" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
@@ -6511,12 +10745,18 @@ if (Module["__edgetermStdinChar"] && Module["__edgetermStdoutChar"] && Module["_
 `;
         const stdinPatchedSource = String(source)
           .replace(/^#!.*(?:\r?\n|$)/, "")
+          .replace(/^import\s+([A-Za-z_$][\w$]*)\s+from\s+["']([^"']+)["'];\s*/gm, 'const $1 = "$2";\n')
+          .replace(/^export\s+\{[^}]*\};\s*/gm, "")
+          .replace(/^export\s+const\s+/gm, "const ")
+          .replace(/^export\s+function\s+/gm, "function ")
+          .replace(/\bvar wasmBinary;/, 'var wasmBinary=Module["wasmBinary"];')
           .replace(
             /var FS_stdin_getChar=\(\)=>\{[\s\S]*?\};var TTY=/,
             `var FS_stdin_getChar=()=>{if(!FS_stdin_getChar_buffer.length){var result=null;if(globalThis.__edgetermWasmPrompt){try{var tty=typeof TTY!="undefined"&&TTY.ttys&&TTY.ttys[1];if(tty&&tty.output&&tty.output.length){out(UTF8ArrayToString(tty.output));tty.output=[]}}catch{}result=globalThis.__edgetermWasmPrompt()}else if(ENVIRONMENT_IS_NODE){var BUFSIZE=256;var buf=Buffer.alloc(BUFSIZE);var bytesRead=0;var fd=process.stdin.fd;try{bytesRead=fs.readSync(fd,buf,0,BUFSIZE)}catch(e){if(e.toString().includes("EOF"))bytesRead=0;else throw e}if(bytesRead>0){result=buf.slice(0,bytesRead).toString("utf-8")}}else{}if(!result){return null}FS_stdin_getChar_buffer=intArrayFromString(result,true)}return FS_stdin_getChar_buffer.shift()};var TTY=`
           )
           .replace(/var Module\s*=\s*typeof Module\s*!=\s*['"]undefined['"]\s*\?\s*Module\s*:\s*\{\s*\}\s*;/, (m) => `${m}${ttyHook}`)
           .replace(/var Module=typeof Module!=['"]undefined['"]\?Module:\{\};/, (m) => `${m}${ttyHook}`)
+          .replace(/var Module=typeof PHPLoader!=['"]undefined['"]\?PHPLoader:\{\};/, (m) => `${m}${ttyHook}`)
           .replace(
             /else if\(globalThis\.window\?\.prompt\)\{result=window\.prompt\("Input: "\);if\(result!==null\)\{result\+="\\n"\}\}else\{\}/g,
             'else if(globalThis.__edgetermWasmPrompt){result=globalThis.__edgetermWasmPrompt()}else{}'
@@ -6534,6 +10774,67 @@ if (Module["__edgetermStdinChar"] && Module["__edgetermStdoutChar"] && Module["_
             'globalThis.__edgetermWasmPrompt){result=globalThis.__edgetermWasmPrompt()}'
           );
         const normalizedSource = stdinPatchedSource;
+        if (/function init\s*\(\s*RuntimeName\s*,\s*PHPLoader\s*\)/.test(normalizedSource)) {
+          const patchedSource = normalizedSource.replace(
+            /Module\["onRuntimeInitialized"\]\?\.\(\);/,
+            'Module["FS"]=FS;Module["callMain"]=callMain;Module["run"]=run;Module["onRuntimeInitialized"]?.();'
+          );
+          return async (moduleArg = {}) => {
+            const phpRunner = new Function(
+              "moduleArg",
+              "globalThis",
+              `${patchedSource}
+return new Promise((resolve, reject) => {
+  const originalAbort = moduleArg["onAbort"];
+  moduleArg["noExitRuntime"] = true;
+  moduleArg["noInitialRun"] = true;
+  moduleArg["onAbort"] = (what) => {
+    try {
+      if (typeof originalAbort === "function") originalAbort(what);
+    } catch {}
+    reject(new Error(String(what || "aborted")));
+  };
+  moduleArg["onRuntimeInitialized"] = () => resolve(moduleArg);
+  try {
+    const runtimeName = typeof WorkerGlobalScope !== "undefined" && globalThis instanceof WorkerGlobalScope ? "WORKER" : "WEB";
+    init(runtimeName, moduleArg);
+  } catch (err) {
+    reject(err);
+  }
+});`
+            );
+            const phpModule = await phpRunner(moduleArg, globalThis);
+            phpModule.__edgetermRunCli = async (args = []) => {
+              const extensionArgs = [];
+              const extensions = { ...(moduleArg.extensions || {}) };
+              try {
+                if (!extensions.intl && phpModule.FS?.analyzePath?.("/packages/php/intl.so")?.exists) {
+                  extensions.intl = "/packages/php/intl.so";
+                }
+              } catch {}
+              for (const extensionPath of Object.values(extensions)) {
+                if (extensionPath) extensionArgs.push("-d", `extension=${extensionPath}`);
+              }
+              const cliArgs = [phpModule.thisProgram || moduleArg.thisProgram || "php", ...extensionArgs, ...args];
+              for (const arg of cliArgs) phpModule.ccall("wasm_add_cli_arg", "number", ["string"], [String(arg)]);
+              try {
+                const result = phpModule.ccall("run_cli", "number", [], [], { async: true });
+                return Number((result && typeof result.then === "function" ? await result : result) || 0);
+              } catch (err) {
+                if (
+                  err?.name === "ExitStatus" ||
+                  err?.constructor?.name === "ExitStatus" ||
+                  typeof err?.status === "number" ||
+                  typeof err?.code === "number"
+                ) {
+                  return Number(err.status ?? err.code ?? 0);
+                }
+                throw err;
+              }
+            };
+            return phpModule;
+          };
+        }
         if (/var wasmExports;/.test(normalizedSource) && /createWasm\s*\(\s*\)\s*;/.test(normalizedSource) && /run\s*\(\s*\)\s*;/.test(normalizedSource)) {
           const patchedSource = normalizedSource
             .replace(/var Module\s*=\s*typeof Module\s*!=\s*['"]undefined['"]\s*\?\s*Module\s*:\s*\{\s*\}\s*;/, "var Module = moduleArg || {};")
@@ -6612,8 +10913,23 @@ return (async () => {
         return pyodide.FS.analyzePath(`${cwd}/${arg}`).exists;
       }
 
-      function collectWasmSyncRoots(cwd, args) {
-        const roots = new Set(["/home", "/tmp", "/var", "/etc", "/packages"]);
+      function collectWasmSyncRoots(cwd, args, entry = null, env = {}) {
+        let requestedRoots = [];
+        try {
+          const rawRoots = env?.EDGETERM_WASM_SYNC_ROOTS;
+          requestedRoots = rawRoots ? JSON.parse(String(rawRoots)) : [];
+        } catch {
+          requestedRoots = [];
+        }
+        const roots = new Set(
+          Array.isArray(requestedRoots) && requestedRoots.length
+            ? requestedRoots.map((root) => normalizePath(root)).filter(Boolean)
+            : ["/home", "/tmp", "/var", "/etc", "/packages"]
+        );
+        if (entry?.packageName === "php" || entry?.command === "php") roots.add("/packages/php");
+        for (const extensionPath of Object.values(entry?.manifest?.extensions || {})) {
+          if (extensionPath) roots.add(extensionPath);
+        }
         roots.add(cwd || "/");
         for (const arg of args) {
           if (!isPotentialPathArg(arg, cwd || "/")) continue;
@@ -6706,7 +11022,7 @@ return (async () => {
         const workerUrl = new URL(assetUrl("wasm-cli-worker.js"));
         workerUrl.searchParams.set("v", DEFAULT_ROOTFS_VERSION);
         const worker = new Worker(workerUrl);
-        const syncRoots = collectWasmSyncRoots(cwd, args);
+        const syncRoots = collectWasmSyncRoots(cwd, args, entry, env);
         const fsEntries = [];
         for (const root of syncRoots) serializeEdgeFsTree(root, root, fsEntries);
         const useSharedStdin = false;
@@ -6720,14 +11036,20 @@ return (async () => {
           let interactiveSession = false;
           let stdinReadActive = false;
           let settled = false;
+          const configuredTimeout = Number(env?.EDGETERM_WASM_TIMEOUT_MS || 0);
+          const watchdogMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+            ? Math.max(1000, configuredTimeout)
+            : stdinText
+            ? 15000
+            : 5000;
           const watchdog = setTimeout(() => {
             finish({
               found: true,
               code: 1,
               stdout: "",
-              stderr: `${entry.command}: WASM runtime did not request stdin or exit in time. This package may need Asyncify or a different Emscripten build for interactive browser use.\n`,
+              stderr: `${entry.command}: WASM runtime did not request stdin or exit within ${watchdogMs}ms. This package may need Asyncify/JSPI support, a longer timeout, or a different Emscripten build for interactive browser use.\n`,
             });
-          }, stdinText ? 15000 : 5000);
+          }, watchdogMs);
 
           const finish = (result) => {
             if (settled) return;
@@ -6802,20 +11124,25 @@ return (async () => {
               console.log(`[WASM worker] ${data.message}`);
               return;
             }
+            if (data.type === "stream") {
+              const text = String(data.text || "");
+              if (text) term.echo(text, { newline: false });
+              return;
+            }
             if (data.type === "done") {
               applyWorkerFsEntries(data.fsEntries || []);
-              if (data.tailDisplay) term.echo(data.tailDisplay, { newline: false });
+              if (data.streamed && data.tailDisplay) term.echo(data.tailDisplay, { newline: false });
               let stdout = data.stdout || "";
               let stderr = data.stderr || "";
               if (interactiveSession) {
                 stdout = "";
                 stderr = "";
               }
-              finish({ found: true, code: Number(data.code || 0), stdout, stderr });
+              finish({ found: true, code: Number(data.code || 0), stdout, stderr, sapi: !!data.sapi });
               return;
             }
             if (data.type === "error") {
-              if (data.tailDisplay) term.echo(data.tailDisplay, { newline: false });
+              if (data.streamed && data.tailDisplay) term.echo(data.tailDisplay, { newline: false });
               finish({ found: true, code: Number(data.code || 1), stdout: "", stderr: data.stderr || "" });
             }
           };
@@ -6838,8 +11165,16 @@ return (async () => {
             wasmBytes: pyodide.FS.readFile(entry.wasmPath),
             packageRoot: entry.packageRoot,
             thisProgram: entry.thisProgram,
+            extensions: {
+              ...(entry.packageName === "php" || entry.command === "php" ? { intl: "/packages/php/intl.so" } : {}),
+              ...(entry.manifest?.extensions || {}),
+            },
             fsEntries,
             syncRoots,
+            streamOutput: (entry.packageName === "php" || entry.command === "php") && String(env?.EDGETERM_PHP_STREAM || "") !== "0",
+            phpRequest: env?.EDGETERM_PHP_SAPI_REQUEST
+              ? JSON.parse(String(env.EDGETERM_PHP_SAPI_REQUEST || "{}"))
+              : null,
             stdinControl: stdinControlBuffer,
             stdinData: stdinDataBuffer,
             ttyBrokerUrl: useSharedStdin ? "" : ttyBrokerUrl,
@@ -6897,18 +11232,28 @@ return (async () => {
             noInitialRun: true,
             arguments: [...effectiveArgs],
             thisProgram: entry.thisProgram,
+            extensions: {
+              ...(entry.packageName === "php" || entry.command === "php" ? { intl: "/packages/php/intl.so" } : {}),
+              ...(entry.manifest?.extensions || {}),
+            },
             ENV: { ...env, PWD: cwd },
             wasmBinary: wasmBytes,
             locateFile: (path) => `${entry.packageRoot}/${path}`,
             __edgetermStdinChar: stdinInput,
             __edgetermStdoutChar: stdoutOutput,
             __edgetermStderrChar: stderrOutput,
+            onStdout: (chunk) => {
+              for (const code of chunk || []) stdoutOutput(code);
+            },
+            onStderr: (chunk) => {
+              for (const code of chunk || []) stderrOutput(code);
+            },
             print: (text) => stdout.push(String(text)),
             printErr: (text) => stderr.push(String(text)),
           });
           if (!moduleInstance?.FS) throw new Error("package runtime did not expose FS after initialization");
           try {
-            for (const root of collectWasmSyncRoots(cwd, args)) copyEdgePathToModule(moduleInstance.FS, root);
+            for (const root of collectWasmSyncRoots(cwd, args, entry, env)) copyEdgePathToModule(moduleInstance.FS, root);
           } catch (err) {
             throw new Error(`filesystem sync-in failed: ${wasmRuntimeFriendlyError(err, entry)}`);
           }
@@ -6925,7 +11270,8 @@ return (async () => {
 
           let code = 0;
           try {
-            if (typeof moduleInstance.callMain === "function") moduleInstance.callMain([...effectiveArgs]);
+            if (typeof moduleInstance.__edgetermRunCli === "function") code = await moduleInstance.__edgetermRunCli([...effectiveArgs]);
+            else if (typeof moduleInstance.callMain === "function") moduleInstance.callMain([...effectiveArgs]);
             else if (typeof moduleInstance.main === "function") code = Number(moduleInstance.main([...effectiveArgs]) || 0);
             else throw new Error("package did not expose callMain() or main()");
           } catch (err) {
@@ -6944,7 +11290,7 @@ return (async () => {
           }
 
           try {
-            for (const root of collectWasmSyncRoots(cwd, args)) copyModulePathToEdge(moduleInstance.FS, root);
+            for (const root of collectWasmSyncRoots(cwd, args, entry, env)) copyModulePathToEdge(moduleInstance.FS, root);
           } catch (err) {
             throw new Error(`filesystem sync-out failed: ${wasmRuntimeFriendlyError(err, entry)}`);
           }
@@ -7009,13 +11355,25 @@ return (async () => {
           async runCommandJSON(command, argsJson, stdinText, cwd, envJson) {
             try {
               const registry = refreshWasmCommandLinks();
-              const entry = registry.get(command);
+              let entry = registry.get(command);
               if (!entry) return JSON.stringify({ found: false, code: 127, stdout: "", stderr: "" });
               if (!pyodide.FS.analyzePath(entry.launcherPath).exists) {
-                return JSON.stringify({ found: true, code: 1, stdout: "", stderr: `${command}: launcher file is missing from package ${entry.packageName}\n` });
+                const fallbackLauncher = entry.manifest?.js || entry.manifest?.launcher || entry.manifest?.main || "";
+                const fallbackLauncherPath = fallbackLauncher ? `${entry.packageRoot}/${fallbackLauncher}` : "";
+                if (fallbackLauncherPath && pyodide.FS.analyzePath(fallbackLauncherPath).exists) {
+                  entry = { ...entry, launcherPath: fallbackLauncherPath };
+                } else {
+                  return JSON.stringify({ found: true, code: 1, stdout: "", stderr: `${command}: launcher file is missing from package ${entry.packageName}\n` });
+                }
               }
               if (!pyodide.FS.analyzePath(entry.wasmPath).exists) {
-                return JSON.stringify({ found: true, code: 1, stdout: "", stderr: `${command}: wasm binary is missing from package ${entry.packageName}\n` });
+                const fallbackWasm = entry.manifest?.wasm ? String(entry.manifest.wasm).split("/").pop() : "";
+                const fallbackWasmPath = fallbackWasm ? `${entry.packageRoot}/${fallbackWasm}` : "";
+                if (fallbackWasmPath && pyodide.FS.analyzePath(fallbackWasmPath).exists) {
+                  entry = { ...entry, wasmPath: fallbackWasmPath };
+                } else {
+                  return JSON.stringify({ found: true, code: 1, stdout: "", stderr: `${command}: wasm binary is missing from package ${entry.packageName}\n` });
+                }
               }
               const parsedArgs = JSON.parse(argsJson || "[]");
               const parsedEnv = JSON.parse(envJson || "{}");
@@ -7056,10 +11414,34 @@ return (async () => {
       }
 
       async function uploadFiles(files) {
+        if (!Array.isArray(files) || files.length === 0) return;
+        await ensureWorkspaceMountedForRuntimePath(currentPath, "Loading workspace files for upload...");
         const touchedTargets = [];
         const fileBytesByTarget = new Map();
-        for (const file of files) {
-          const data = new Uint8Array(await file.arrayBuffer());
+        const totalBytes = files.reduce((sum, file) => sum + Math.max(0, Number(file?.size) || 0), 0);
+        let completedBytes = 0;
+        try {
+          for (let index = 0; index < files.length; index += 1) {
+            const file = files[index];
+            let fileLoaded = 0;
+            const data = await readFileWithProgress(file, (loaded, fileTotal) => {
+              fileLoaded = loaded;
+              updateFileUploadProgress({
+                loaded: completedBytes + loaded,
+                total: totalBytes || completedBytes + fileTotal,
+                fileName: file.name,
+                fileIndex: index,
+                fileCount: files.length,
+              });
+            });
+            completedBytes += fileLoaded || data.byteLength;
+            updateFileUploadProgress({
+              loaded: completedBytes,
+              total: totalBytes || completedBytes,
+              fileName: file.name,
+              fileIndex: index,
+              fileCount: files.length,
+            });
           const target = `${currentPath === "/" ? "" : currentPath}/${file.name}`;
           pyodide.FS.writeFile(target, data);
           const mirrorTarget = workspaceMirrorPathForRuntimePath(target);
@@ -7073,9 +11455,14 @@ return (async () => {
         else schedulePersistActiveWorkspace(750);
         refreshWasmCommandLinks();
         refreshFiles();
+        showNotice(files.length === 1 ? `Uploaded ${files[0].name}` : `Uploaded ${files.length} files`);
+        } finally {
+          setTimeout(resetFileUploadProgress, 500);
+        }
       }
 
       async function renameSelectedPath(path) {
+        await ensureWorkspaceMountedForRuntimePath(path, "Loading workspace files for rename...");
         const currentName = path.split("/").filter(Boolean).pop();
         const nextName = await askText("Rename Item", "New name", currentName, { confirmLabel: "Rename" });
         if (!nextName) return;
@@ -7089,18 +11476,162 @@ return (async () => {
 
       async function deleteSelectedPaths(paths) {
         if (paths.length === 0) return;
+        await ensureWorkspaceMountedForRuntimePath(paths[0], "Loading workspace files for delete...");
         const label = paths.length === 1 ? paths[0] : `${paths.length} items`;
         if (!(await askConfirm("Delete Files", `Delete ${label}?`, { confirmLabel: "Delete", danger: true }))) return;
-        for (const path of paths) removeTree(path);
+        const progressState = {
+          total: Math.max(1, paths.reduce((sum, path) => sum + countTreeEntries(path), 0)),
+          deleted: 0,
+          lastRendered: 0,
+        };
+        showProgressNotice({
+          label: "Deleting files...",
+          current: 0,
+          total: progressState.total,
+          detail: `0 of ${progressState.total} removed`,
+        });
+        for (const path of paths) await deleteTreeWithProgress(path, progressState);
         await persistActiveWorkspace();
         refreshWasmCommandLinks();
         clearSelection();
         refreshFiles();
+        hideProgressNotice();
         showNotice(paths.length === 1 ? `Deleted ${label}` : `Deleted ${paths.length} items`);
+      }
+
+      async function createFolderInCurrentPath() {
+        const name = await askText("New Folder", "Folder name", "", { confirmLabel: "Create" });
+        if (!name) return;
+        const trimmed = String(name).trim();
+        if (!trimmed || trimmed.includes("/")) return showNotice("Folder name cannot be empty or contain /");
+        const target = normalizePath(`${currentPath === "/" ? "" : currentPath}/${trimmed}`);
+        await ensureWorkspaceMountedForRuntimePath(target, "Loading workspace files for new folder...");
+        if (pyodide.FS.analyzePath(target).exists) return showNotice("A file or folder with that name already exists");
+        ensureDir(target);
+        await persistActiveWorkspace();
+        refreshWasmCommandLinks();
+        refreshFiles(currentPath);
+        showNotice(`Created folder ${trimmed}`);
+      }
+
+      async function createFileInCurrentPath() {
+        const name = await askText("New File", "File name", "", { confirmLabel: "Create" });
+        if (!name) return;
+        const trimmed = String(name).trim();
+        if (!trimmed || trimmed.endsWith("/") || trimmed.includes("/")) return showNotice("File name cannot be empty or contain /");
+        const target = normalizePath(`${currentPath === "/" ? "" : currentPath}/${trimmed}`);
+        await ensureWorkspaceMountedForRuntimePath(target, "Loading workspace files for new file...");
+        if (pyodide.FS.analyzePath(target).exists) return showNotice("A file or folder with that name already exists");
+        ensureDir(target.split("/").slice(0, -1).join("/") || "/");
+        pyodide.FS.writeFile(target, "");
+        await persistActiveWorkspace();
+        refreshWasmCommandLinks();
+        refreshFiles(currentPath);
+        showNotice(`Created file ${trimmed}`);
+      }
+
+      async function openTerminalAtPath(path = currentPath) {
+        const target = normalizePath(path || currentPath || `/home/${activeUser()}`);
+        if (!pyodide.FS.analyzePath(target).exists) return showNotice("Path not found");
+        const stat = pyodide.FS.stat(target);
+        if (!pyodide.FS.isDir(stat.mode)) return showNotice("Open Terminal Here only works for folders");
+        pyodide.globals.set("__edgeterm_terminal_target", target);
+        try {
+          pyodide.FS.chdir(target);
+        } catch {}
+        await pyodide.runPythonAsync(`
+import builtins
+import os
+
+target = globals().get("__edgeterm_terminal_target", "/")
+shell = getattr(builtins, "EDGETERM_SHELL", None)
+os.chdir(target)
+if shell is not None:
+    shell.logical_cwd = target
+    shell._sync_env()
+else:
+    os.environ["PWD"] = target
+`);
+        setView("terminalView");
+        await updatePrompt();
+        term?.focus?.();
+      }
+
+      async function extractArchivePath(path) {
+        const target = normalizePath(path || "");
+        if (!target || !pyodide.FS.analyzePath(target).exists) return showNotice("Archive not found");
+        if (!isExtractableArchivePath(target)) return showNotice("That file type is not supported for extraction");
+        const lower = target.toLowerCase();
+        if (lower.endsWith(".7z")) return showNotice("7z extraction is not available in this runtime yet");
+
+        const destination = target.split("/").slice(0, -1).join("/") || "/";
+        pyodide.globals.set("__edgeterm_extract_archive_path", target);
+        pyodide.globals.set("__edgeterm_extract_archive_destination", destination);
+        await withBusy("Extracting archive...", async () => {
+          await pyodide.runPythonAsync(`
+import os
+import posixpath
+import tarfile
+import zipfile
+
+archive_path = globals().get("__edgeterm_extract_archive_path", "")
+destination = globals().get("__edgeterm_extract_archive_destination", "/")
+lower = archive_path.lower()
+
+def _safe_join(base, member_name):
+    normalized = posixpath.normpath(member_name.replace("\\\\", "/")).lstrip("/")
+    if not normalized or normalized == ".":
+        return None
+    if normalized.startswith("../") or "/../" in normalized:
+        raise ValueError(f"archive contains unsafe path: {member_name}")
+    final_path = posixpath.normpath(posixpath.join(base, normalized))
+    if final_path != base and not final_path.startswith(base.rstrip("/") + "/"):
+        raise ValueError(f"archive escapes destination: {member_name}")
+    return final_path
+
+if lower.endswith(".zip"):
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in archive.infolist():
+            target_path = _safe_join(destination, info.filename)
+            if target_path is None:
+                continue
+            if info.is_dir():
+                os.makedirs(target_path, exist_ok=True)
+                continue
+            os.makedirs(posixpath.dirname(target_path) or destination, exist_ok=True)
+            with archive.open(info) as source, open(target_path, "wb") as output:
+                output.write(source.read())
+elif lower.endswith(".tar") or lower.endswith(".tar.gz"):
+    mode = "r:gz" if lower.endswith(".tar.gz") else "r:"
+    with tarfile.open(archive_path, mode) as archive:
+        for member in archive.getmembers():
+            target_path = _safe_join(destination, member.name)
+            if target_path is None:
+                continue
+            if member.isdir():
+                os.makedirs(target_path, exist_ok=True)
+                continue
+            if member.issym() or member.islnk():
+                raise ValueError(f"archive contains unsupported link: {member.name}")
+            extracted = archive.extractfile(member)
+            if extracted is None:
+                continue
+            os.makedirs(posixpath.dirname(target_path) or destination, exist_ok=True)
+            with extracted as source, open(target_path, "wb") as output:
+                output.write(source.read())
+else:
+    raise ValueError("unsupported archive type")
+`);
+          await persistActiveWorkspace();
+          refreshWasmCommandLinks();
+          refreshFiles(destination);
+          showNotice(`Extracted ${target.split("/").pop()}`);
+        }).catch((err) => showNotice(err.message || String(err)));
       }
 
       async function pasteClipboardItems() {
         if (!clipboard?.paths?.length) return;
+        await ensureWorkspaceMountedForRuntimePath(currentPath, "Loading workspace files for paste...");
         for (const source of clipboard.paths) {
           const name = source.split("/").filter(Boolean).pop();
           const target = `${currentPath === "/" ? "" : currentPath}/${name}`;
@@ -7133,6 +11664,10 @@ return (async () => {
         if (action === "preview") {
           if (paths.length > 1) return showNotice("Preview works on one item at a time");
           return openPreview(paths[0]);
+        }
+        if (action === "unzip") {
+          if (paths.length > 1) return showNotice("Unzip works on one archive at a time");
+          return extractArchivePath(paths[0]);
         }
         if (action === "download") return downloadSelectedPaths(paths);
         if (action === "copy") {
@@ -7200,6 +11735,7 @@ return (async () => {
           } else {
             schedulePersistActiveWorkspace();
           }
+          refreshFilesIfVisible(currentPath);
           showNotice(`Created ${loaded.path}`);
         }
         editorPathFieldForTarget(targetName).value = loaded.path;
@@ -7273,6 +11809,23 @@ return (async () => {
             return instance;
           },
           async createInstance(mode, target, cwd, identity = {}) {
+            if (normalizeEdgeServeRouteMode(mode) === "php") {
+              const targetPath = resolveWorkspaceDirectory(cwd, target);
+              const isPhpFile = fsIsFile(targetPath) && /\.php$/i.test(targetPath);
+              const documentRoot = isPhpFile ? normalizePath(targetPath.split("/").slice(0, -1).join("/") || "/") : targetPath;
+              if (!fsPathExists(targetPath)) throw new Error(`PHP app target not found: ${targetPath}`);
+              if (!isPhpFile && !fsIsDir(targetPath)) throw new Error(`PHP app target is not a directory or PHP file: ${targetPath}`);
+              return JSON.stringify({
+                id: identity.instanceId || stableEdgeServeIdentity(mode, target, cwd).instanceId,
+                mode: "php",
+                requestedMode: "php",
+                target: documentRoot,
+                entryScript: isPhpFile ? targetPath : "",
+                routePrefix: identity.routePrefix || stableEdgeServeIdentity(mode, target, cwd).routePrefix,
+                workingDirectory: cwd,
+                label: target,
+              });
+            }
             pyodide.globals.set("__edgeterm_edgeserve_json", JSON.stringify({ mode, target, cwd, ...identity }));
             return await pyodide.runPythonAsync(`
 import json
@@ -7339,6 +11892,7 @@ json.dumps(info)
           term.echo("Goodbye.");
           return;
         }
+        const mayMutateBeforeRun = commandMayMutateWorkspace(line);
 
         try {
           pyodide.globals.set("__edgeterm_line", line);
@@ -7362,9 +11916,8 @@ except Exception as exc:
         }
 
         try {
-          const mayMutateWorkspace = commandMayMutateWorkspace(line);
-          if (mayMutateWorkspace && options.postRunSync !== false) schedulePersistActiveWorkspace(750);
-          if (commandNeedsImmediateWorkspacePersist(line)) {
+          const mayMutateWorkspace = mayMutateBeforeRun;
+          if (mayMutateWorkspace && options.postRunSync !== false) {
             await persistActiveWorkspace();
           }
           if (mayMutateWorkspace) refreshFilesIfVisible(currentPath);
@@ -7490,9 +12043,11 @@ except Exception as exc:
       async function getShellPromptPath() {
         try {
           return await pyodide.runPythonAsync(`
-import builtins, os
+import builtins, os, re
 shell = getattr(builtins, "EDGETERM_SHELL", None)
-shell.env.get("PWD", getattr(shell, "logical_cwd", os.getcwd())) if shell else os.environ.get("PWD", os.getcwd())
+path = shell.env.get("PWD", getattr(shell, "logical_cwd", os.getcwd())) if shell else os.environ.get("PWD", os.getcwd())
+match = re.search(r"/workspace-store/[^/]+(/home/.*)$", path)
+match.group(1) if match else path
 `);
         } catch {
           return await pyodide.runPythonAsync("os.environ.get('PWD', os.getcwd())");
@@ -7502,6 +12057,69 @@ shell.env.get("PWD", getattr(shell, "logical_cwd", os.getcwd())) if shell else o
       async function updatePrompt() {
         const cwd = await getShellPromptPath();
         term.set_prompt(`${cwd} $ `);
+      }
+
+      function startTerminalBootLoader(label = "Starting EdgeTerm services") {
+        const frames = ["-", "\\", "|", "/"];
+        let frame = 0;
+        let step = 0;
+        let text = label;
+        let line = -1;
+        const width = 18;
+        const canUpdate = !!term?.update && !!term?.last_index;
+        const render = (state = "..") => {
+          const filled = Math.min(width, Math.max(1, step % (width + 1)));
+          const bar = `${"=".repeat(Math.max(0, filled - 1))}>${".".repeat(Math.max(0, width - filled))}`;
+          return `[  ${state}  ] [${bar}] ${text} ${frames[frame % frames.length]}`;
+        };
+        const write = (state = "..") => {
+          frame += 1;
+          step += 1;
+          const value = render(state);
+          if (canUpdate && line >= 0) {
+            try {
+              term.update(line, value);
+              return;
+            } catch {}
+          }
+          if (line < 0) {
+            term.echo(value);
+            try {
+              line = term.last_index();
+            } catch {
+              line = -1;
+            }
+          }
+        };
+        write();
+        const timer = setInterval(() => write(), 120);
+        return {
+          phase(nextText) {
+            text = nextText || text;
+            write();
+          },
+          done(doneText = "EdgeTerm services ready") {
+            clearInterval(timer);
+            if (canUpdate && line >= 0) {
+              try {
+                term.update(line, render("OK"));
+              } catch {}
+            }
+            term.echo(`[  OK  ] ${doneText}`);
+          },
+          fail(failText = "EdgeTerm service startup failed") {
+            clearInterval(timer);
+            text = failText;
+            const value = render("!!");
+            if (canUpdate && line >= 0) {
+              try {
+                term.update(line, value);
+                return;
+              } catch {}
+            }
+            term.error(value);
+          },
+        };
       }
 
       async function bootShell() {
@@ -7517,7 +12135,7 @@ shell.env.get("PWD", getattr(shell, "logical_cwd", os.getcwd())) if shell else o
         window.terminal = { input: readTerminalInput };
         pyodide.globals.set("input", pyodide.toPy(readTerminalInput));
         pyodide.globals.set("__edgeterm_user", activeUser());
-        pyodide.globals.set("__edgeterm_rootfs_lib", workspacePath(activeWorkspaceId, "/rootfs/usr/lib"));
+        pyodide.globals.set("__edgeterm_rootfs_lib", `${activeRootfsPath()}/usr/lib`);
         await pyodide.runPythonAsync(`
 import os
 os.environ["EDGE_USER"] = __edgeterm_user
@@ -7570,12 +12188,17 @@ except Exception:
         term.clear();
         setDisplayFullscreen(false);
         clearDisplaySurface(`Display ready for ${activeWorkspace().name}`);
-        term.echo("Project EdgeTerm Workspace, Powered by EdwardLab (https://github.com/EdwardLab, https://edwarddev.com) GPLv3.0 License");
+        term.echo("Project EdgeTerm Workspace, Powered by EdwardLab (https://github.com/EdwardLab, https://edwarddev.com) MPL 2.0 License");
         term.echo(`[WORKSPACE] ${activeWorkspace().name} (${activeUser()})`);
+        const bootLoader = startTerminalBootLoader("Mounting workspace services");
         try {
+          bootLoader.phase("Resetting shell runtime");
           if (edgeTermShell?.destroy) edgeTermShell.destroy();
           edgeTermShell = null;
-          const code = pyodide.FS.readFile("/bin/shell.py", { encoding: "utf8" });
+          bootLoader.phase("Reading shell bootstrap");
+          const shellBootstrapPath = `${activeRootfsPath()}/bin/shell.py`;
+          const code = pyodide.FS.readFile(shellBootstrapPath, { encoding: "utf8" });
+          bootLoader.phase("Starting shell service");
           edgeTermShell = await pyodide.runPythonAsync(`
 ${code}
 import builtins
@@ -7625,9 +12248,12 @@ if "run_rc_local" not in globals():
 
 shell
 `);
+          bootLoader.phase("Running rc.local services");
           await pyodide.runPythonAsync("await run_rc_local()");
+          bootLoader.done("EdgeTerm services ready");
           term.echo("Welcome to EdgeTerm!");
         } catch (err) {
+          bootLoader.fail("EdgeTerm service startup failed");
           term.error("[INIT] " + formatInitError(err));
         }
         await updatePrompt();
@@ -7671,12 +12297,14 @@ shell
         const existingId = options.workspaceId || "";
         const persistRegistry = options.persistRegistry !== false;
         await withBusy(file ? "Importing workspace..." : "Creating workspace...", async () => {
-          await persistActiveWorkspace();
+          if (options.persistCurrentWorkspace !== false) {
+            await persistActiveWorkspace();
+          }
           const id = existingId || `ws-${Date.now()}`;
           createdId = id;
           let workspace = workspaces.find((item) => item.id === id);
           if (!workspace) {
-            workspace = { id, name, createdAt: Date.now(), rootfsVersion: file ? "custom" : DEFAULT_ROOTFS_VERSION, users: ["user"], userName: "user" };
+            workspace = { id, name, createdAt: Date.now(), rootfsVersion: file ? "custom" : DEFAULT_ROOTFS_VERSION, users: ["user"], userName: "user", storageType: "browser-storage" };
             workspaces.push(workspace);
           } else {
             workspace.name = name;
@@ -7686,13 +12314,20 @@ shell
           workspace.transient = !!options.transient;
           activeWorkspaceId = id;
           if (persistRegistry) saveWorkspaceRegistry();
-          await mountWorkspaceStorage(id, { load: !!existingId });
+          await mountWorkspaceStorage(id, { load: !!existingId, migrate: !!existingId });
           await ensureWorkspaceLayout(id);
           await clearWorkspaceJournal(id);
           if (file) {
             await importZipIntoWorkspace(id, file);
+            await persistWorkspaceStoredHomeJournal(id);
           }
-          if (!options.transient) await syncfs(false);
+          if (!options.transient) {
+            if (options.deferInitialSync) {
+              scheduleWorkspaceFlush(options.initialSyncDelayMs || 5000);
+            } else {
+              await syncfs(false);
+            }
+          }
           prepareActiveMounts();
           renderWorkspaces();
           if (!options.switchOptions?.skipBootShell) await bootShell();
@@ -7857,10 +12492,22 @@ shell
               bodyBase64: response.bodyBase64 || "",
             };
           },
-            syncSiteData: (payload = {}) => {
-              applySyncedSiteData(payload);
-              return true;
-            },
+          openTab: async (url, options = {}) => {
+            await openEdgeBrowserNewTab(url || "/", options);
+            return true;
+          },
+          websocketOpen: async (request) => dispatchAppModeWebSocketOpen(request),
+          websocketSend: async (request) => dispatchAppModeWebSocketSend(request),
+          websocketPoll: async (request) => dispatchAppModeWebSocketPoll(request),
+          websocketClose: async (request) => dispatchAppModeWebSocketClose(request),
+          edgeServeLog: (payload = {}) => {
+            edgeServePhpLog(payload.event || "browser", payload);
+            return true;
+          },
+          syncSiteData: (payload = {}) => {
+            applySyncedSiteData(payload);
+            return true;
+          },
               keydown: (payload) => {
                 const synthetic = {
                   key: payload?.key || "",
@@ -7940,6 +12587,11 @@ shell
         $id("settingsExportWorkspace").addEventListener("click", exportActiveWorkspace);
         $id("settingsUpdateRootfs").addEventListener("click", updateActiveWorkspaceRootfs);
         $id("settingsResetEnvironment").addEventListener("click", resetEnvironment);
+        $id("chooseWorkspaceLocalDirectory")?.addEventListener("click", () => chooseLocalDirectoryForActiveWorkspace());
+        $id("restoreWorkspaceFromLocalDirectory")?.addEventListener("click", restoreWorkspaceFromLocalDirectory);
+        $id("syncWorkspaceToLocal")?.addEventListener("click", () => syncActiveWorkspaceToLocalDirectory());
+        $id("syncWorkspaceFromLocal")?.addEventListener("click", () => syncActiveWorkspaceFromLocalDirectory());
+        $id("switchWorkspaceStorage")?.addEventListener("click", switchWorkspaceStorageWizard);
         $id("browserClearCookies")?.addEventListener("click", () => void clearCurrentBrowserSiteData("cookies"));
         $id("browserClearStorage")?.addEventListener("click", () => void clearCurrentBrowserSiteData("storage"));
         $id("browserClearCache")?.addEventListener("click", () => void clearCurrentBrowserSiteData("cache"));
@@ -8150,6 +12802,22 @@ shell
           await exitAppMode({ force: true });
           await openEditor("/etc/appmode/config.json");
         });
+        $id("appModeAddressBar")?.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const target = $id("appModeUrlInput")?.value || "/";
+          try {
+            await navigateAppMode(target, { updateHistory: false });
+          } catch (err) {
+            showNotice(`Navigation failed: ${err.message || err}`);
+          }
+        });
+        $id("appModeRefreshButton")?.addEventListener("click", async () => {
+          try {
+            await navigateAppMode(appModeState.currentPath || "/", { updateHistory: false, replaceDisplayHistory: true });
+          } catch (err) {
+            showNotice(`Refresh failed: ${err.message || err}`);
+          }
+        });
 
         $id("filePath").addEventListener("keydown", (event) => {
           if (event.key === "Enter") refreshFiles($id("filePath").value);
@@ -8157,10 +12825,47 @@ shell
         $id("fileList").addEventListener("mousedown", startMarqueeSelection);
         $id("goUp").addEventListener("click", () => refreshFiles(currentPath.split("/").slice(0, -1).join("/") || "/"));
         $id("refreshFiles").addEventListener("click", () => refreshFiles($id("filePath").value));
+        $id("selectAllFiles").addEventListener("click", toggleSelectAllFiles);
+        $id("newFolder").addEventListener("click", createFolderInCurrentPath);
+        $id("newFile").addEventListener("click", createFileInCurrentPath);
+        $id("openTerminalHere").addEventListener("click", async () => openTerminalAtPath(currentPath));
         $id("uploadFile").addEventListener("click", () => $id("fileUploader").click());
         $id("fileUploader").addEventListener("change", async (event) => {
           await uploadFiles(Array.from(event.target.files || []));
           event.target.value = "";
+        });
+        const filesView = $id("filesView");
+        filesView.addEventListener("dragenter", (event) => {
+          if (!event.dataTransfer?.types?.includes("Files")) return;
+          event.preventDefault();
+          fileDragDepth += 1;
+          showFileDropzone();
+        });
+        filesView.addEventListener("dragover", (event) => {
+          if (!event.dataTransfer?.types?.includes("Files")) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "copy";
+          showFileDropzone();
+        });
+        filesView.addEventListener("dragleave", (event) => {
+          if (!event.dataTransfer?.types?.includes("Files")) return;
+          event.preventDefault();
+          fileDragDepth = Math.max(0, fileDragDepth - 1);
+          if (fileDragDepth === 0 && !filesView.contains(event.relatedTarget)) hideFileDropzone();
+        });
+        filesView.addEventListener("drop", async (event) => {
+          if (!event.dataTransfer?.files?.length) return;
+          event.preventDefault();
+          hideFileDropzone();
+          await uploadFiles(Array.from(event.dataTransfer.files));
+        });
+        window.addEventListener("dragover", (event) => {
+          if (!event.dataTransfer?.types?.includes("Files")) return;
+          event.preventDefault();
+        });
+        window.addEventListener("drop", (event) => {
+          if (!event.dataTransfer?.files?.length) return;
+          if (!event.target.closest?.("#filesView")) event.preventDefault();
         });
         $id("downloadFile").addEventListener("click", async () => {
           const paths = getSelectedPaths();
@@ -8234,6 +12939,7 @@ shell
         } else {
           schedulePersistActiveWorkspace(750);
         }
+        refreshFilesIfVisible(currentPath);
         await openEditor(target);
         event.target.value = "";
       });
@@ -8505,10 +13211,11 @@ shell
         loadWorkspaceRegistry();
         const active = activeWorkspace();
         if (active) {
-          await mountWorkspaceStorage(active.id);
           showBootStatus(`Preparing ${active.name}...`);
+          await mountWorkspaceStorage(active.id);
           await ensureWorkspaceLayout(active.id);
           await restoreWorkspaceJournal(active.id);
+          if (!active.rootfsVersion) active.rootfsVersion = DEFAULT_ROOTFS_VERSION;
         }
         saveWorkspaceRegistry();
         prepareActiveMounts();
@@ -8527,7 +13234,7 @@ shell
         revealApp();
         if (!bootIntoDirectApp) {
           await bootShell();
-          refreshFiles(`/home/${activeUser()}`);
+          currentPath = `/home/${activeUser()}`;
         }
         if (PAGE_KIND === "admin" && CLOUD_ENABLED) setView("adminView");
         await openShareFromUrl(initialShareLocator);
@@ -8535,7 +13242,7 @@ shell
           await maybeAutoStartAppMode();
         } else if (!appModeState.active && !edgeTermShell) {
           await bootShell();
-          refreshFiles(`/home/${activeUser()}`);
+          currentPath = `/home/${activeUser()}`;
         }
         clearTimeout(bootWatchdog);
 
@@ -8544,6 +13251,7 @@ shell
           term?.error?.("[EDITOR] Monaco failed to load: " + formatError(err));
         });
         scheduleWorkspaceFlush(5000);
+        if (activeWorkspaceId) schedulePersistedDefaultRootfsPrune(activeWorkspaceId);
       }
 
       main().catch((err) => {

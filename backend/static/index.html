@@ -134,11 +134,15 @@
               </div>
             </section>
 
-            <section id="filesView" class="view file-view">
+        <section id="filesView" class="view file-view">
           <div class="toolbar">
             <button id="goUp" class="icon-only" title="Up"><i data-lucide="corner-left-up"></i></button>
             <input id="filePath" class="path" value="/home/user" />
             <button id="refreshFiles" class="icon-only" title="Refresh"><i data-lucide="refresh-cw"></i></button>
+            <button id="selectAllFiles" class="icon-only" title="Select All"><i data-lucide="list-checks"></i></button>
+            <button id="newFolder" class="icon-only" title="New Folder"><i data-lucide="folder-plus"></i></button>
+            <button id="newFile" class="icon-only" title="New File"><i data-lucide="file-plus-2"></i></button>
+            <button id="openTerminalHere" class="icon-only" title="Open Terminal Here"><i data-lucide="square-terminal"></i></button>
             <button id="uploadFile" class="icon-only" title="Upload"><i data-lucide="upload"></i></button>
             <button id="downloadFile" class="icon-only" title="Download"><i data-lucide="download"></i></button>
             <button id="copyFile" class="icon-only" title="Copy"><i data-lucide="copy"></i></button>
@@ -146,6 +150,22 @@
             <button id="pasteFile" class="icon-only" title="Paste"><i data-lucide="clipboard-paste"></i></button>
             <button id="renameFile" class="icon-only" title="Rename"><i data-lucide="pencil"></i></button>
             <button id="deleteFile" class="icon-only" title="Delete"><i data-lucide="trash-2"></i></button>
+          </div>
+          <div id="fileUploadDropzone" class="file-dropzone hidden" aria-hidden="true">
+            <div class="file-dropzone-card">
+              <strong>Drop files to upload</strong>
+              <span>Upload into the current folder</span>
+            </div>
+          </div>
+          <div id="fileUploadProgress" class="file-upload-progress hidden" aria-live="polite">
+            <div class="file-upload-progress-head">
+              <strong id="fileUploadProgressLabel">Uploading files...</strong>
+              <span id="fileUploadProgressText">0%</span>
+            </div>
+            <div class="file-upload-progress-track">
+              <div id="fileUploadProgressFill" class="file-upload-progress-fill"></div>
+            </div>
+            <div id="fileUploadProgressMeta" class="file-upload-progress-meta">Waiting to start...</div>
           </div>
           <div id="fileList" class="file-list"></div>
         </section>
@@ -663,12 +683,27 @@
                   </div>
                   <div>
                     <span>Storage</span>
-                    <code>/workspace-store</code>
+                    <code id="settingsStorageType">browser storage</code>
+                  </div>
+                  <div>
+                    <span>Location</span>
+                    <code id="settingsStorageLocation">/workspace-store</code>
                   </div>
                   <div>
                     <span>Runtime class</span>
                     <code>browser / pyodide</code>
                   </div>
+                  <div>
+                    <span>Local directory API</span>
+                    <code id="settingsLocalDirectorySupport">checking</code>
+                  </div>
+                </div>
+                <div class="storage-action-grid">
+                  <button id="chooseWorkspaceLocalDirectory" class="icon-button button-secondary"><i data-lucide="folder-open"></i>Choose Local Directory</button>
+                  <button id="restoreWorkspaceFromLocalDirectory" class="icon-button button-secondary"><i data-lucide="archive-restore"></i>Restore From Directory</button>
+                  <button id="syncWorkspaceToLocal" class="icon-button button-ghost"><i data-lucide="upload"></i>Sync To Directory</button>
+                  <button id="syncWorkspaceFromLocal" class="icon-button button-ghost"><i data-lucide="download"></i>Sync From Directory</button>
+                  <button id="switchWorkspaceStorage" class="icon-button button-primary"><i data-lucide="repeat-2"></i>Switch / Migrate</button>
                 </div>
               </section>
 
@@ -688,22 +723,40 @@
                   <div class="setting-field">
                     <label for="appModeRuntime">Runtime</label>
                     <select id="appModeRuntime">
-                      <option value="python">Python (Pyodide routes)</option>
+                      <option value="python">Python (Flask)</option>
+                      <option value="php">PHP</option>
                       <option value="static">Static HTML</option>
                     </select>
+                    <div class="hint">Choose Python for WSGI apps, PHP for php-wasm apps, or Static HTML for files served from a document root.</div>
                   </div>
                   <div class="setting-field">
                     <label for="appModeEntrypoint">Entrypoint</label>
                     <input id="appModeEntrypoint" value="/home/user/app.py" />
-                    <div class="hint">Python resolves a script path. Static mode resolves an HTML file.</div>
+                    <div class="hint">Python uses a script or app spec, PHP accepts an index.php file or document root, and Static resolves an HTML file.</div>
                   </div>
                   <div class="setting-field">
                     <label for="appModeWorkingDirectory">Working directory</label>
                     <input id="appModeWorkingDirectory" value="/home/user" />
+                    <div class="hint">Commands and relative paths start here. Keep this inside the active workspace unless the app needs system files.</div>
                   </div>
                   <div class="setting-field">
                     <label for="appModeStaticRoot">Static root</label>
                     <input id="appModeStaticRoot" value="/home/user/public" />
+                    <div class="hint">Static assets and PHP document-root requests are resolved from this directory when no exact entry file is used.</div>
+                  </div>
+                </div>
+                <div class="config-explainer">
+                  <div>
+                    <strong>Runtime selection</strong>
+                    <p>Python starts the configured WSGI-style app, PHP runs requests through the bundled php-wasm runtime, and Static serves files directly from the workspace.</p>
+                  </div>
+                  <div>
+                    <strong>Paths</strong>
+                    <p>Use absolute workspace paths such as <code>/home/user/public/index.php</code>. If PHP points at a directory, App Mode looks for <code>index.php</code> and can still serve static assets beside it.</p>
+                  </div>
+                  <div>
+                    <strong>Saving</strong>
+                    <p>The form writes <code>/etc/appmode/config.json</code>. Edit JSON when you need to review or copy the exact configuration.</p>
                   </div>
                 </div>
               </section>
@@ -736,9 +789,22 @@
                     <label class="setting-checkbox compact"><input id="appModeConfirmExit" type="checkbox" /> Confirm before exiting App Mode</label>
                     <label class="setting-checkbox compact"><input id="appModeHideChrome" type="checkbox" checked /> Hide workspace chrome while app is open</label>
                     <label class="setting-checkbox compact"><input id="appModeAllowDebugTerminal" type="checkbox" /> Debug terminal hotkey exits to terminal</label>
+                    <label class="setting-checkbox compact"><input id="appModeShowAddressBar" type="checkbox" /> Show optional URL address bar</label>
                     <div class="setting-field">
                       <label for="appModeDebugHotkey">Debug terminal hotkey</label>
                       <input id="appModeDebugHotkey" value="Ctrl+`" />
+                    </div>
+                    <div class="setting-field">
+                      <label for="appModePythonFramework">Python framework</label>
+                      <select id="appModePythonFramework">
+                        <option value="flask">Flask (WSGI)</option>
+                        <option value="wsgi">Generic WSGI</option>
+                        <option value="edgeterm">Legacy EdgeTerm routes</option>
+                      </select>
+                    </div>
+                    <div class="setting-field">
+                      <label for="appModePythonAppSpec">WSGI app spec</label>
+                      <input id="appModePythonAppSpec" value="app:app" />
                     </div>
                     <div class="setting-field">
                       <label for="appModePythonObject">Python app object</label>
@@ -836,6 +902,11 @@
     </div>
 
     <div id="appModeShell" class="hidden">
+      <form id="appModeAddressBar" class="app-mode-address-bar hidden">
+        <button id="appModeRefreshButton" type="button" class="icon-only" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
+        <input id="appModeUrlInput" class="path" autocomplete="off" spellcheck="false" value="/" aria-label="App Mode URL" />
+        <button id="appModeUrlGo" type="submit" class="icon-only" title="Go" aria-label="Go"><i data-lucide="arrow-right"></i></button>
+      </form>
       <div class="app-mode-frame-wrap">
         <iframe id="appModeFrame" title="EdgeTerm App Mode" sandbox="allow-scripts allow-same-origin allow-forms allow-downloads"></iframe>
         <div id="appModeLoading" class="app-mode-overlay hidden">
@@ -869,6 +940,7 @@
     <div id="contextMenu" class="hidden">
       <button class="context-item" data-action="open"><i data-lucide="folder-open"></i>Open</button>
       <button class="context-item" data-action="preview"><i data-lucide="image"></i>Preview</button>
+      <button class="context-item hidden" data-action="unzip"><i data-lucide="archive-restore"></i>Unzip</button>
       <button class="context-item" data-action="download"><i data-lucide="download"></i>Download</button>
       <button class="context-item" data-action="copy"><i data-lucide="copy"></i>Copy</button>
       <button class="context-item" data-action="cut"><i data-lucide="scissors"></i>Cut</button>
@@ -903,6 +975,6 @@
       window.EDGETERM_PAGE_KIND = "main";
       window.EDGETERM_ASSET_BASE = "/static/";
     </script>
-    <script type="module" src="./assets/main.js"></script>
+    <script type="module" src="./assets/main.js?v=php-wasm-v140"></script>
   </body>
 </html>

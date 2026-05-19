@@ -7,6 +7,7 @@ HELP = """Usage:
   edgeserve flask module:app
   edgeserve asgi module:app
   edgeserve django project.wsgi:application
+  edgeserve php .
   edgeserve static .
 
 Aliases:
@@ -21,7 +22,7 @@ async def main(args):
         return 0 if args else 1
 
     mode = args[0].lower()
-    if mode in {"flask", "wsgi", "django", "asgi", "fastapi", "starlette", "static"}:
+    if mode in {"flask", "wsgi", "django", "asgi", "fastapi", "starlette", "php", "static"}:
         target_args = args[1:]
     else:
         mode = "flask"

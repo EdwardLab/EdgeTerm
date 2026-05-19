@@ -12,7 +12,8 @@ EdgeTerm App Mode lets a workspace behave like a local browser-native app instea
 
 Current runtimes:
 
-- `python`: Pyodide-powered app routes through a Flask-style API.
+- `python`: Pyodide-powered Flask/WSGI apps.
+- `php`: php-wasm app requests with static-file fallback from the document root.
 - `static`: HTML apps rendered from the workspace filesystem.
 
 Future runtimes can plug into the same loader later, including Lua or generic WASM apps.
@@ -50,6 +51,8 @@ Default example:
   },
   "python": {
     "appObject": "app",
+    "appSpec": "app:app",
+    "framework": "flask",
     "routePrefix": "/",
     "allowFilesystemAccess": true
   },
@@ -104,7 +107,11 @@ Default example:
 ### `python`
 
 - `appObject`
-  - Name of the app object exported by the script, default `app`.
+  - Name of the app object exported by the script, default `app`. Used when deriving an app spec from `entrypoint`.
+- `appSpec`
+  - WSGI app import path, default `app:app`.
+- `framework`
+  - Default is `flask`. Use `wsgi` for another WSGI callable or `edgeterm` for the legacy EdgeTerm route dispatcher.
 - `routePrefix`
   - Prefix used for Python route dispatch.
 - `allowFilesystemAccess`
@@ -139,12 +146,14 @@ The settings panel lets you:
 
 ## Python App Mode
 
-Python App Mode uses a browser-side route dispatcher powered by Pyodide. There is no real HTTP server. Requests are routed internally from the browser UI into Python handlers.
+Python App Mode runs Flask as a real WSGI app inside Pyodide. There is no TCP listener or external HTTP server; EdgeTerm builds WSGI requests in the browser and dispatches them directly to the Flask app.
 
 Example:
 
 ```python
-from edgeterm import app, request
+from flask import Flask, request
+
+app = Flask(__name__)
 
 
 @app.route("/")
@@ -157,31 +166,16 @@ def index():
 
 @app.route("/api/data")
 def data():
-    return {"value": 123, "query": request.args}
+    return {"value": 123, "query": request.args.to_dict()}
 ```
 
-### Supported Python return types
-
-- `str`
-  - returned as HTML by default
-- `dict` or `list`
-  - returned as JSON
-- `(body, status)`
-- `(body, status, headers)`
+For a default `/home/user/app.py`, EdgeTerm uses the WSGI app spec `app:app`, meaning module `app` and object `app`.
 
 ### Python routing notes
 
-- Route handlers are synchronous in the current implementation.
-- `request` exposes:
-  - `method`
-  - `path`
-  - `query_string`
-  - `headers`
-  - `body`
-  - `args`
-  - `form`
-  - `json`
-- If a Python route is not found, EdgeTerm can still serve matching files from `staticRoot`.
+- Flask route handling, `request`, JSON responses, status tuples, redirects, cookies, and Werkzeug response objects are handled through Flask's WSGI interface.
+- EdgeTerm auto-installs Flask into the Pyodide runtime if it is missing and package installation is available.
+- If a Flask route is not found, EdgeTerm can still serve matching files from `staticRoot`.
 
 ## Static HTML App Mode
 
@@ -204,7 +198,10 @@ Example config:
   "enabled": true,
   "runtime": "static",
   "entrypoint": "/home/user/public/index.html",
-  "staticRoot": "/home/user/public"
+  "staticRoot": "/home/user/public",
+  "ui": {
+    "showAddressBar": false
+  }
 }
 ```
 
@@ -222,10 +219,21 @@ Static mode supports:
 - `entrypoint` should be a Python file such as `/home/user/app.py`
 - `workingDirectory` is applied before running the script
 
+### PHP
+
+- set `runtime` to `php`
+- `entrypoint` can point directly to a PHP file such as `/home/user/public/index.php`
+- if `entrypoint` points to a directory, App Mode treats it as the PHP document root and looks for `index.php`
+- static files beside the PHP app can still be served from the same document root
+
 ### Static
 
 - `entrypoint` can point directly to an HTML file
 - if omitted or directory-like, EdgeTerm uses `staticRoot` + `static.indexFile`
+
+### Optional URL address bar
+
+Set `ui.showAddressBar` to `true` to show a small App Mode URL bar above the iframe. It lets users type or refresh internal app paths such as `/`, `/admin`, or `/index.php?page=home` without returning to the workspace.
 
 ## Exiting App Mode
 
@@ -246,7 +254,7 @@ When App Mode exits:
 - Runs locally through Pyodide
 - No backend server
 - No sockets or bound ports
-- Browser-side request dispatch only
+- Browser-side WSGI request dispatch only
 
 ### Static runtime
 
@@ -255,7 +263,7 @@ When App Mode exits:
 
 ## Current limitations
 
-- Python route handlers are synchronous only in this first implementation.
+- Flask apps run in-process through WSGI; raw sockets and real port binding are not available.
 - `allowFilesystemAccess` is descriptive right now; Python apps still use the workspace filesystem normally.
 - Static asset rewriting handles common linked assets, but complex CSS `url(...)` rewriting is not fully implemented.
 - Browser history and URL bar are not treated like a normal hosted website.

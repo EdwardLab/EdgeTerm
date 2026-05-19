@@ -7,6 +7,7 @@ const root = process.cwd();
 const frontendDir = path.join(root, "frontend");
 const buildDir = path.join(root, "build");
 const cloudEnabled = mode === "cloud";
+const assetVersion = "php-wasm-v140";
 
 function assetBaseFor(modeName) {
   return modeName === "cloud" ? "/static/" : "./";
@@ -30,7 +31,7 @@ async function writeOfflineHtml() {
     .replace('./src/ui/styles.css', './assets/styles.css')
     .replace(
       '<script type="module" src="./src/main.js"></script>',
-      `${globals}\n    <script type="module" src="./assets/main.js"></script>`
+      `${globals}\n    <script type="module" src="./assets/main.js?v=${assetVersion}"></script>`
     );
   await writeFile(path.join(buildDir, "index.html"), html, "utf8");
 }
@@ -49,7 +50,7 @@ async function writeCloudAppShell() {
     .replace('./src/ui/styles.css', "{{ url_for('static', filename='assets/styles.css') }}")
     .replace(
       '<script type="module" src="./src/main.js"></script>',
-      `${globals}\n    <script type="module" src="{{ url_for('static', filename='assets/main.js') }}"></script>`
+      `${globals}\n    <script type="module" src="{{ url_for('static', filename='assets/main.js') }}?v=${assetVersion}"></script>`
     );
   await writeFile(path.join(root, "backend", "templates", "app_shell.html"), html, "utf8");
 }

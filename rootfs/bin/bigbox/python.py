@@ -140,6 +140,203 @@ class _AsyncInputTransformer(ast.NodeTransformer):
         return node
 
 
+class _LoopYieldTransformer(ast.NodeTransformer):
+    """Add browser-yield points to loops.
+
+    Pyodide runs Python on the browser UI thread.  Traditional pygame loops
+    need real await points so the browser can paint and process input.
+    """
+
+    def _yield_stmt(self):
+        return ast.Expr(
+            value=ast.Await(
+                value=ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="asyncio", ctx=ast.Load()), attr="sleep", ctx=ast.Load()),
+                    args=[ast.Constant(value=0)],
+                    keywords=[],
+                )
+            )
+        )
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        return self.generic_visit(node)
+
+    def visit_Lambda(self, node):
+        return node
+
+    def visit_ClassDef(self, node):
+        return self.generic_visit(node)
+
+    def visit_For(self, node):
+        node = self.generic_visit(node)
+        return node
+
+    def visit_AsyncFor(self, node):
+        node = self.generic_visit(node)
+        return node
+
+    def visit_While(self, node):
+        node = self.generic_visit(node)
+        node.body.append(self._yield_stmt())
+        return node
+
+
+class _PygameAsyncTargetCollector(ast.NodeVisitor):
+    def __init__(self):
+        self.loop_functions = set()
+        self.current_function = None
+
+    def visit_FunctionDef(self, node):
+        old_function = self.current_function
+        self.current_function = node.name
+        self.generic_visit(node)
+        self.current_function = old_function
+
+    def visit_AsyncFunctionDef(self, node):
+        old_function = self.current_function
+        self.current_function = node.name
+        self.generic_visit(node)
+        self.current_function = old_function
+
+    def visit_For(self, node):
+        self.generic_visit(node)
+
+    def visit_AsyncFor(self, node):
+        self.generic_visit(node)
+
+    def visit_While(self, node):
+        if self.current_function:
+            self.loop_functions.add(self.current_function)
+        self.generic_visit(node)
+
+
+class _PygameCallCollector(ast.NodeVisitor):
+    def __init__(self, targets):
+        self.targets = set(targets)
+        self.called_targets = set()
+        self.current_function = None
+
+    def visit_FunctionDef(self, node):
+        old_function = self.current_function
+        self.current_function = node.name
+        self.generic_visit(node)
+        self.current_function = old_function
+
+    def visit_AsyncFunctionDef(self, node):
+        old_function = self.current_function
+        self.current_function = node.name
+        self.generic_visit(node)
+        self.current_function = old_function
+
+    def visit_Call(self, node):
+        if self.current_function and _pygame_call_name(node) in self.targets:
+            self.called_targets.add(self.current_function)
+        self.generic_visit(node)
+
+
+def _pygame_call_name(node):
+    func = getattr(node, "func", None)
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _pygame_async_targets(nodes):
+    collector = _PygameAsyncTargetCollector()
+    for node in nodes:
+        collector.visit(node)
+    targets = set(collector.loop_functions)
+    changed = True
+    while changed:
+        call_collector = _PygameCallCollector(targets)
+        for node in nodes:
+            call_collector.visit(node)
+        new_targets = targets | call_collector.called_targets
+        changed = new_targets != targets
+        targets = new_targets
+    targets.discard("__init__")
+    return targets
+
+
+class _PygameAsyncTransformer(ast.NodeTransformer):
+    def __init__(self, async_targets):
+        self.async_targets = set(async_targets)
+        self.current_async_function = False
+
+    def _is_async_call(self, node):
+        return _pygame_call_name(node) in self.async_targets
+
+    def _await_if_needed(self, node):
+        if isinstance(node, ast.Await):
+            return node
+        if isinstance(node, ast.Call) and self._is_async_call(node):
+            return ast.Await(value=node)
+        return node
+
+    def visit_Await(self, node):
+        return node
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        if self.current_async_function and self._is_async_call(node):
+            return ast.Await(value=node)
+        return node
+
+    def visit_Expr(self, node):
+        node = self.generic_visit(node)
+        if not self.current_async_function:
+            node.value = self._await_if_needed(node.value)
+        return node
+
+    def visit_Assign(self, node):
+        node = self.generic_visit(node)
+        if not self.current_async_function:
+            node.value = self._await_if_needed(node.value)
+        return node
+
+    def visit_AnnAssign(self, node):
+        node = self.generic_visit(node)
+        if not self.current_async_function and node.value is not None:
+            node.value = self._await_if_needed(node.value)
+        return node
+
+    def visit_Return(self, node):
+        node = self.generic_visit(node)
+        if self.current_async_function and node.value is not None:
+            node.value = self._await_if_needed(node.value)
+        return node
+
+    def visit_FunctionDef(self, node):
+        if node.name not in self.async_targets:
+            return node
+        old_async = self.current_async_function
+        self.current_async_function = True
+        body = [self.visit(stmt) for stmt in node.body]
+        self.current_async_function = old_async
+        async_node = ast.AsyncFunctionDef(
+            name=node.name,
+            args=node.args,
+            body=body,
+            decorator_list=node.decorator_list,
+            returns=node.returns,
+            type_comment=node.type_comment,
+            type_params=getattr(node, "type_params", []),
+        )
+        return async_node
+
+    def visit_AsyncFunctionDef(self, node):
+        old_async = self.current_async_function
+        self.current_async_function = True
+        node = self.generic_visit(node)
+        self.current_async_function = old_async
+        return node
+
+
 def _clone_path():
     return list(sys.path)
 
@@ -202,6 +399,287 @@ def _capture_state():
 def _remember_env(state, *keys):
     for key in keys:
         state["environ"].setdefault(key, os.environ.get(key))
+
+
+def _install_pygame_compat():
+    if getattr(builtins, "_EDGETERM_PYGAME_COMPAT_INSTALLED", False):
+        return
+
+    original_import = builtins.__import__
+    patched_ids = set()
+
+    def _edge_display_send(payload):
+        try:
+            import json as _json
+
+            bridge = js.window.EdgeTermDisplay
+            bridge.send(_json.dumps(payload))
+            return True
+        except Exception as exc:
+            if os.environ.get("EDGETERM_DEBUG_PYGAME") == "1":
+                print(f"[pygame-compat] display bridge failed: {exc!r}", file=sys.stderr)
+            return False
+
+    def _patch_pygame(pygame):
+        if id(pygame) in patched_ids:
+            return pygame
+        patched_ids.add(id(pygame))
+
+        pygame._edgeterm_compat = True
+
+        def _safe_display_canvas(size=None):
+            width, height = 960, 640
+            if size is not None:
+                try:
+                    width, height = int(size[0]), int(size[1])
+                except Exception:
+                    pass
+            width = max(1, width)
+            height = max(1, height)
+            return _edge_display_send(
+                {
+                    "type": "canvas",
+                    "width": width,
+                    "height": height,
+                    "background": "#000000",
+                    "bindSDL": True,
+                    "focus": True,
+                }
+            )
+
+        try:
+            display = pygame.display
+            original_set_mode = display.set_mode
+            original_flip = display.flip
+            original_update = display.update
+            caption = ["", ""]
+
+            def set_mode(size=(0, 0), flags=0, depth=0, display=0, vsync=0):
+                _safe_display_canvas(size)
+                try:
+                    return original_set_mode(size, flags, depth, display, vsync)
+                except Exception as exc:
+                    if "Invalid window" not in str(exc):
+                        raise
+                    _safe_display_canvas(size)
+                    surface = None
+                    try:
+                        surface = pygame.Surface(size)
+                    except Exception:
+                        pass
+                    if surface is not None:
+                        return surface
+                    raise
+
+            def _yield_to_browser():
+                try:
+                    import time as _time
+
+                    _time.sleep(0)
+                except Exception:
+                    pass
+
+            def flip():
+                try:
+                    result = original_flip()
+                except Exception as exc:
+                    if "Invalid window" not in str(exc):
+                        raise
+                    result = None
+                _yield_to_browser()
+                return result
+
+            def update(*args, **kwargs):
+                try:
+                    result = original_update(*args, **kwargs)
+                except Exception as exc:
+                    if "Invalid window" not in str(exc):
+                        raise
+                    result = None
+                _yield_to_browser()
+                return result
+
+            def set_caption(title, icontitle=None):
+                caption[0] = str(title or "")
+                caption[1] = str(icontitle if icontitle is not None else title or "")
+
+            def get_caption():
+                return tuple(caption)
+
+            display.set_mode = set_mode
+            display.flip = flip
+            display.update = update
+            display.set_caption = set_caption
+            display.get_caption = get_caption
+            display.set_icon = lambda *args, **kwargs: None
+            display.quit = lambda *args, **kwargs: None
+        except Exception as exc:
+            if os.environ.get("EDGETERM_DEBUG_PYGAME") == "1":
+                print(f"[pygame-compat] display patch failed: {exc!r}", file=sys.stderr)
+
+        try:
+            original_pygame_init = pygame.init
+
+            def init():
+                initialized = 0
+                failed = 0
+                for module_name in ("display", "font", "joystick"):
+                    module = getattr(pygame, module_name, None)
+                    init_func = getattr(module, "init", None)
+                    if not init_func:
+                        continue
+                    try:
+                        init_func()
+                        initialized += 1
+                    except Exception:
+                        failed += 1
+                if initialized or failed:
+                    return initialized, failed
+                try:
+                    return original_pygame_init()
+                except Exception:
+                    return 0, 1
+
+            pygame.init = init
+            pygame.quit = lambda *args, **kwargs: None
+        except Exception:
+            pass
+
+        try:
+            mixer = pygame.mixer
+
+            class _NullSound:
+                def __init__(self, *args, **kwargs):
+                    self._volume = 1.0
+
+                def play(self, *args, **kwargs):
+                    return None
+
+                def stop(self):
+                    return None
+
+                def fadeout(self, *args, **kwargs):
+                    return None
+
+                def set_volume(self, volume):
+                    self._volume = volume
+
+                def get_volume(self):
+                    return self._volume
+
+            class _NullMusic:
+                def load(self, *args, **kwargs):
+                    return None
+
+                def play(self, *args, **kwargs):
+                    return None
+
+                def stop(self):
+                    return None
+
+                def pause(self):
+                    return None
+
+                def unpause(self):
+                    return None
+
+                def fadeout(self, *args, **kwargs):
+                    return None
+
+                def set_volume(self, *args, **kwargs):
+                    return None
+
+                def get_busy(self):
+                    return False
+
+            class _NullChannel:
+                def __init__(self, *args, **kwargs):
+                    self._volume = 1.0
+
+                def play(self, *args, **kwargs):
+                    return None
+
+                def stop(self):
+                    return None
+
+                def pause(self):
+                    return None
+
+                def unpause(self):
+                    return None
+
+                def fadeout(self, *args, **kwargs):
+                    return None
+
+                def set_volume(self, volume, *args):
+                    self._volume = volume
+
+                def get_volume(self):
+                    return self._volume
+
+                def get_busy(self):
+                    return False
+
+            mixer.pre_init = lambda *args, **kwargs: None
+            mixer.init = lambda *args, **kwargs: None
+            mixer.quit = lambda *args, **kwargs: None
+            mixer.get_init = lambda *args, **kwargs: None
+            mixer.set_num_channels = lambda *args, **kwargs: None
+            mixer.get_num_channels = lambda *args, **kwargs: 0
+            mixer.get_busy = lambda *args, **kwargs: False
+            mixer.Sound = _NullSound
+            mixer.Channel = _NullChannel
+            mixer.find_channel = lambda *args, **kwargs: _NullChannel()
+            mixer.music = _NullMusic()
+        except Exception:
+            pass
+
+        try:
+            import time as _time
+
+            class _BrowserClock:
+                def __init__(self):
+                    self._last = _time.perf_counter()
+                    self._fps = 0.0
+                    self._last_ms = 0
+
+                def tick(self, framerate=0):
+                    now = _time.perf_counter()
+                    dt = max(0.0, now - self._last)
+                    self._last = now
+                    self._last_ms = int(dt * 1000)
+                    if dt > 0:
+                        self._fps = 1.0 / dt
+                    return self._last_ms
+
+                def tick_busy_loop(self, framerate=0):
+                    return self.tick(framerate)
+
+                def get_time(self):
+                    return self._last_ms
+
+                def get_rawtime(self):
+                    return self._last_ms
+
+                def get_fps(self):
+                    return self._fps
+
+            pygame.time.Clock = _BrowserClock
+        except Exception:
+            pass
+
+        return pygame
+
+    def _import(name, globals=None, locals=None, fromlist=(), level=0):
+        module = original_import(name, globals, locals, fromlist, level)
+        if name == "pygame" or name.startswith("pygame."):
+            pygame = sys.modules.get("pygame")
+            if pygame is not None:
+                _patch_pygame(pygame)
+        return module
+
+    builtins.__import__ = _import
+    builtins._EDGETERM_PYGAME_COMPAT_INSTALLED = True
 
 
 def _is_django_management_script(script_path):
@@ -479,7 +957,13 @@ async def _run_module_source(source, filename, namespace):
     # Transform time.sleep → await asyncio.sleep and input() → await input()
     sleep_transformer = _TopLevelSleepTransformer()
     input_transformer = _AsyncInputTransformer()
-    body = [input_transformer.visit(sleep_transformer.visit(node)) for node in body]
+    if "pygame" in source:
+        body = [input_transformer.visit(sleep_transformer.visit(node)) for node in body]
+        async_targets = _pygame_async_targets(body)
+        body = [_PygameAsyncTransformer(async_targets).visit(node) for node in body]
+        body = [_LoopYieldTransformer().visit(node) for node in body]
+    else:
+        body = [input_transformer.visit(sleep_transformer.visit(node)) for node in body]
     wrapped = ast.Module(
         body=[
             *future_imports,
@@ -571,6 +1055,7 @@ async def _run_code(code, argv0="<string>", argv_tail=None):
     old_stdin = sys.stdin
     sys.stdin = _make_tty_stdin(old_stdin)
     sys.argv = [argv0, *(argv_tail or [])]
+    _install_pygame_compat()
     try:
         await _run_module_source(code, "<string>", namespace)
         return namespace
@@ -625,6 +1110,7 @@ async def _run_script(path, args):
     #   Then stdlib and site-packages, excluding /bin/bigbox and /bin
     sys.path[:] = _pythonpath_for_script(script_dir, old_path)
     _install_pbkdf2_hmac_compat()
+    _install_pygame_compat()
     # Work around a Pyodide edge case: if manage.py sits next to a `mysite/`
     # package (standard Django layout), pre-import the package so that
     # submodules (mysite.settings) can be found reliably.  find_spec for
@@ -793,6 +1279,7 @@ async def _run_module(module_name, args):
             continue
         clean_path.append(entry)
     sys.path[:] = clean_path
+    _install_pygame_compat()
     try:
         runpy.run_module(module_name, run_name="__main__", alter_sys=True)
         return {"__name__": "__main__"}

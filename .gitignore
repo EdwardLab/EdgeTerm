@@ -1,6 +1,35 @@
+# EdgeTerm local/runtime artifacts
+/.edgeterm-cloud/
+/backend/.edgeterm-cloud/
+/rootfs.zip
+/rootfs/packages/
+/rootfs/usr/
+/backend/static/rootfs.zip
+/backend/static/index.html
+/backend/static/wasm-cli-worker.js
+/backend/static/assets/
+!/backend/static/.gitkeep
+/build/
+/dist-*/
+/dist/
+/node_modules/
+
+# Local scratch and backup files
+*.bak
+*.bak.*
+*.tmp
+*.temp
+*.orig
+*.rej
+*.noedit
+*.bak.noedit
+
+# Local launcher scripts generated for a developer machine
+/buildrootfs.bat
+/serve-edgeterm.bat
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
-/.edgeterm-cloud/
 *.py[cod]
 *$py.class
 
@@ -78,7 +107,6 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
-node_modules/
 
 # IPython
 profile_default/
@@ -175,9 +203,3 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
-rootfs.zip
-buildrootfs.bat
-serve-edgeterm.bat
-dist-*
-rootfs/packages
-backend/.edgeterm-cloud

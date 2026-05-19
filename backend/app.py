@@ -116,7 +116,7 @@ def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | N
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-        response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+        response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
         response.headers["Origin-Agent-Cluster"] = "?1"
         response.headers["Permissions-Policy"] = "cross-origin-isolated=(self)"
         response.headers["X-Content-Type-Options"] = "nosniff"

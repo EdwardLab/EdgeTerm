@@ -3,11 +3,13 @@
 /backend/.edgeterm-cloud/
 /rootfs.zip
 /rootfs/packages/
+/runtime-packages/
 /rootfs/usr/
 /backend/static/rootfs.zip
 /backend/static/index.html
 /backend/static/wasm-cli-worker.js
 /backend/static/assets/
+/backend/static/packages/
 !/backend/static/.gitkeep
 /build/
 /dist-*/
@@ -203,3 +205,4 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 
+AGENTS.md

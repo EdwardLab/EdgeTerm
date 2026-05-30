@@ -1,8 +1,12 @@
 import JSZip from "jszip";
 import { ASSET_BASE, CLOUD_ENABLED, PAGE_KIND, assetUrl } from "../cloud/config.js";
+import { BOOTFS_CRITICAL_FILES, clearBootfsCriticalFiles } from "../generated/bootfs-critical.js";
 
 export function bootstrapEdgeTerm() {
 
+      const EDGETERM_BOOT_BUNDLE_VERSION = "refresh-worker-unload-v119";
+      const WORKER_SHELL_ENABLED = !new URLSearchParams(location.search).has("mainPyodide");
+      const PYODIDE_BOOT_LOCK_NAME = "edgeterm-pyodide-boot";
       const WORKSPACE_KEY = "edgeterm.workspaces.v1";
       const ACTIVE_KEY = "edgeterm.activeWorkspace.v1";
       const CLOUD_TOKEN_KEY = "edgeterm.cloud.token.v1";
@@ -20,7 +24,8 @@ export function bootstrapEdgeTerm() {
       const APPMODE_COOKIE_STORE_KEY = "edgeterm.appmode.cookies.v1";
       const APPMODE_SITE_DATA_STORE_KEY = "edgeterm.appmode.siteData.v1";
       const ROOTFS_IDB_PRUNE_KEY = "edgeterm.rootfsIdbPruned.v1";
-const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
+      const PACKAGE_METADATA_STORE_KEY = "edgeterm.packageMetadata.v1";
+      const DEFAULT_ROOTFS_VERSION = "EdgeTerm refresh-worker-unload-v119";
       const SYSTEM_ROOTFS_PATH = "/edgeterm-system-rootfs";
       const DEFAULT_APP_MODE_CONFIG = {
         enabled: false,
@@ -54,6 +59,13 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
           indexFile: "index.html",
           allowInlineScripts: true,
         },
+        wine: {
+          prefix: "/home/user/.wine",
+          runtimePackage: "boxedwine",
+          winePackage: "wine-runtime",
+          display: true,
+          sharedApp: true,
+        },
       };
       const ROOT_RESERVED_ENTRIES = new Set([
         ".",
@@ -86,6 +98,13 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
         let term;
         let editor;
         let splitEditor = null;
+        let monacoSetupPromise = null;
+        let runtimeDiagnosticPhase = "startup";
+        let runtimeHeartbeatTimer = null;
+        let workerShell = null;
+        let workerShellReady = false;
+        let workerShellSequence = 0;
+        let workerShellRequests = new Map();
         let workspaces = [];
         let activeWorkspaceId = "";
         let currentPath = "/home/user";
@@ -126,6 +145,14 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
       let pendingWorkspaceJournalFlushAfterInFlight = false;
       let queuedWorkspaceJournalEntries = new Map();
       let mountedWorkspaceId = "";
+      let mountedWorkspaceStorageReal = false;
+      let mountedWorkspaceStorageLoaded = false;
+      let workspaceStorageLoadPromise = null;
+      let pageIsUnloading = false;
+      let unloadPersistStarted = false;
+      let fullRootfsHydrationTimer = null;
+      let defaultStoragePruneTimer = null;
+      let persistedDefaultRootfsPruneTimer = null;
       let edgeTermShell = null;
         let busyCount = 0;
         let previewObjectUrl = null;
@@ -140,6 +167,7 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
       let cloudShares = [];
       let cloudTiers = {};
       let cloudBackend = "offline";
+      let cloudAuthEventsBound = false;
       let adminUsers = [];
       let adminPlatformShares = [];
       let adminPlatformSnapshots = [];
@@ -150,6 +178,7 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
       let selectedPaths = new Set();
       let clipboard = null;
       let terminalCopyHandlerInstalled = false;
+      let terminalKeyFallbackInstalled = false;
       let mountedUsers = new Set(["user"]);
       let contextTargetPath = "";
       let marqueeState = null;
@@ -157,11 +186,15 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
       let fileDragDepth = 0;
       let displayInputQueue = [];
       let displayInputPump = null;
+      const displayInputSessionId = `display-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       let displayMessageHistory = [];
-      let displayState = {
+        let displayState = {
         mode: "empty",
         width: 960,
         height: 640,
+        preferredWidth: 960,
+        preferredHeight: 640,
+        preferredResolution: "960x640",
         fullscreen: false,
         lastType: "clear",
       };
@@ -202,6 +235,14 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
       const $id = (id) => document.getElementById(id);
 
       function formatError(err) {
+        if (!err) return "Unknown error";
+        if (typeof err === "string") return err;
+        if (typeof err.toString === "function") {
+          try {
+            const value = err.toString();
+            if (value && value !== "[object Object]") return value;
+          } catch {}
+        }
         const text = [
           err?.name,
           err?.message,
@@ -212,7 +253,6 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
           .filter(Boolean)
           .join("\n");
         if (text) return text;
-        if (typeof err === "string") return err;
         try {
           const json = JSON.stringify(err);
           if (json && json !== "{}") return json;
@@ -822,11 +862,40 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
         );
       }
 
+      function installTerminalKeyFallback() {
+        if (terminalKeyFallbackInstalled) return;
+        terminalKeyFallbackInstalled = true;
+        document.addEventListener(
+          "keydown",
+          (event) => {
+            if (!event.key && !event.code && !event.which) {
+              event.preventDefault();
+              event.stopImmediatePropagation();
+              return;
+            }
+            if (typeof event.key === "string") return;
+            const fallbackKey = event.code || (event.which ? String.fromCharCode(event.which) : "");
+            try {
+              Object.defineProperty(event, "key", { configurable: true, value: fallbackKey });
+            } catch {}
+          },
+          true
+        );
+      }
+
       function initializeTerminal() {
         if (term) return;
+        installTerminalKeyFallback();
         $id("terminal").textContent = "";
         term = $("#terminal").terminal(
           async (command) => {
+            if (workerShell) {
+              if (!workerShellReady) {
+                term.error("EdgeTerm worker shell is still loading. Please try again in a moment.");
+                return;
+              }
+              return await runWorkerCommand(command);
+            }
             if (!pyodide || !edgeTermShell) {
               term.error("EdgeTerm runtime is still loading. Please try again in a moment.");
               return;
@@ -838,6 +907,15 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
             history: true,
             greetings: false,
             prompt: "loading... ",
+            keydown: (event) => {
+              if (typeof event.key !== "string" && !event.code && !event.which) return false;
+              if (typeof event.key !== "string") {
+                try {
+                  Object.defineProperty(event, "key", { configurable: true, value: event.code || "" });
+                } catch {}
+              }
+              return undefined;
+            },
           }
         );
         installTerminalCopySanitizer();
@@ -864,6 +942,155 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
         } finally {
           setBusy(false);
         }
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      async function withPyodideBootLock(work, bootStartedAt) {
+        if (!navigator.locks?.request) return await work();
+        const waitStartedAt = performance.now();
+        while (!pageIsUnloading) {
+          const result = await navigator.locks.request(
+            PYODIDE_BOOT_LOCK_NAME,
+            { ifAvailable: true, mode: "exclusive" },
+            async (lock) => {
+              if (!lock) return { acquired: false };
+              console.info(`[BOOT] acquired Pyodide startup lock +${Math.round(performance.now() - bootStartedAt)}ms`);
+              return { acquired: true, value: await work() };
+            }
+          );
+          if (result?.acquired) return result.value;
+          const waitedSeconds = Math.max(1, Math.round((performance.now() - waitStartedAt) / 1000));
+          showBootStatus(
+            `Waiting for another EdgeTerm tab to finish starting Python runtime... ${waitedSeconds}s`,
+            true
+          );
+          await sleep(500);
+        }
+        throw new Error("Startup cancelled while waiting for Pyodide boot lock.");
+      }
+
+      function nextFrame(maxDelay = 48) {
+        return new Promise((resolve) => {
+          let settled = false;
+          let timeoutId = null;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            if (timeoutId !== null) clearTimeout(timeoutId);
+            resolve();
+          };
+          timeoutId = setTimeout(finish, maxDelay);
+          if (typeof requestAnimationFrame === "function" && document.visibilityState !== "hidden") {
+            requestAnimationFrame(finish);
+          } else {
+            setTimeout(finish, 0);
+          }
+        });
+      }
+
+      function markRuntimePhase(phase) {
+        runtimeDiagnosticPhase = phase;
+      }
+
+      function installTimerPhaseDiagnostics() {
+        if (window.__edgetermTimerPhaseDiagnostics) return;
+        window.__edgetermTimerPhaseDiagnostics = true;
+        let timerId = 0;
+        const shortStack = () => {
+          const stack = String(new Error().stack || "")
+            .split("\n")
+            .slice(2, 5)
+            .map((line) => line.trim().replace(location.origin, ""))
+            .join(" <- ");
+          return stack || "unknown";
+        };
+        const wrapCallback = (kind, callback, label) => {
+          if (typeof callback !== "function") return callback;
+          return function edgeTermTimedCallback(...args) {
+            const previous = runtimeDiagnosticPhase;
+            markRuntimePhase(`${kind}:${label}`);
+            try {
+              return callback.apply(this, args);
+            } finally {
+              markRuntimePhase(previous === "startup" ? "root-idle" : previous);
+            }
+          };
+        };
+        const nativeSetTimeout = window.setTimeout.bind(window);
+        const nativeSetInterval = window.setInterval.bind(window);
+        window.setTimeout = (callback, delay, ...args) => {
+          timerId += 1;
+          return nativeSetTimeout(wrapCallback("timeout", callback, `${Math.round(Number(delay) || 0)}ms#${timerId}:${shortStack()}`), delay, ...args);
+        };
+        window.setInterval = (callback, delay, ...args) => {
+          timerId += 1;
+          return nativeSetInterval(wrapCallback("interval", callback, `${Math.round(Number(delay) || 0)}ms#${timerId}:${shortStack()}`), delay, ...args);
+        };
+        if (typeof window.requestAnimationFrame === "function") {
+          const nativeRequestAnimationFrame = window.requestAnimationFrame.bind(window);
+          window.requestAnimationFrame = (callback) => {
+            timerId += 1;
+            return nativeRequestAnimationFrame(wrapCallback("raf", callback, `#${timerId}:${shortStack()}`));
+          };
+        }
+        if (typeof window.requestIdleCallback === "function") {
+          const nativeRequestIdleCallback = window.requestIdleCallback.bind(window);
+          window.requestIdleCallback = (callback, options) => {
+            timerId += 1;
+            return nativeRequestIdleCallback(wrapCallback("idle", callback, `#${timerId}:${shortStack()}`), options);
+          };
+        }
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[ch]);
+      }
+
+      function installRuntimeHangDiagnostics() {
+        if (runtimeHeartbeatTimer) return;
+        installTimerPhaseDiagnostics();
+        let lastBeat = performance.now();
+        runtimeHeartbeatTimer = setInterval(() => {
+          const now = performance.now();
+          const gap = now - lastBeat;
+          lastBeat = now;
+          if (gap > 10000) {
+            console.warn(`[HANG] main thread blocked ${Math.round(gap)}ms during ${runtimeDiagnosticPhase}`);
+          }
+        }, 250);
+        try {
+          const observer = new PerformanceObserver((list) => {
+            for (const entry of list.getEntries()) {
+              if (entry.duration > 10000) {
+                const attribution = Array.from(entry.attribution || []).map((item) => ({
+                  name: item.name || "",
+                  entryType: item.entryType || "",
+                  containerType: item.containerType || "",
+                  containerName: item.containerName || "",
+                  containerId: item.containerId || "",
+                  containerSrc: item.containerSrc || "",
+                }));
+                console.warn(
+                  `[LONGTASK] ${Math.round(entry.duration)}ms during ${runtimeDiagnosticPhase} ${JSON.stringify({
+                    name: entry.name || "",
+                    startTime: Math.round(entry.startTime || 0),
+                    attribution,
+                  })}`
+                );
+              }
+            }
+          });
+          observer.observe({ entryTypes: ["longtask"] });
+        } catch {}
       }
 
       function syncfs(load = false) {
@@ -947,7 +1174,25 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
       }
 
       function isWorkspaceStorageMounted(id) {
-        return !!id && mountedWorkspaceId === id;
+        return !!id && mountedWorkspaceId === id && mountedWorkspaceStorageReal;
+      }
+
+      function isWorkspaceStorageLoaded(id) {
+        return isWorkspaceStorageMounted(id) && mountedWorkspaceStorageLoaded;
+      }
+
+      function prepareWorkspaceBootStub(id) {
+        const workspace = workspaces.find((item) => item.id === id);
+        ensureDir("/workspace-store");
+        ensureDir(workspacePath(id));
+        ensureDir(workspacePath(id, "/home"));
+        for (const user of workspace?.users || ["user"]) ensureDir(workspacePath(id, `/home/${user}`));
+        ensureDir(workspacePath(id, "/overlay/upper"));
+        ensureDir(workspacePath(id, "/overlay/work"));
+        mountedWorkspaceId = id;
+        mountedWorkspaceStorageReal = false;
+        mountedWorkspaceStorageLoaded = false;
+        workspaceStorageLoadPromise = null;
       }
 
       function loadIsolatedWorkspaceMap() {
@@ -1018,6 +1263,64 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
         };
       }
 
+      function staleRuntimeAssetKeyMatcher(id) {
+        const escapedId = String(id || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const packageRoots = [
+          /^\/?packages\/wine(?:\/|$)/,
+          new RegExp(`^/?${escapedId}/packages/wine(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/packages/wine(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/?packages/wine(?:/|$)`),
+        ];
+        const preservePatterns = [
+          /^\/?packages\/wine\/package\.json$/,
+          new RegExp(`^/?${escapedId}/packages/wine/package\\.json$`),
+          new RegExp(`^/?workspace-store/${escapedId}/packages/wine/package\\.json$`),
+          new RegExp(`^/?workspace-store/${escapedId}/?packages/wine/package\\.json$`),
+        ];
+        return (key) => {
+          if (typeof key !== "string") return false;
+          const normalized = key.replaceAll("\\", "/").replace(/^\/+/, "");
+          if (preservePatterns.some((pattern) => pattern.test(normalized) || pattern.test(`/${normalized}`))) return false;
+          return packageRoots.some((pattern) => pattern.test(normalized) || pattern.test(`/${normalized}`));
+        };
+      }
+
+      function staleDefaultStorageKeyMatcher(id) {
+        const rootfsMatcher = legacyRootfsKeyMatcher(id);
+        const runtimeAssetMatcher = staleRuntimeAssetKeyMatcher(id);
+        return (key) => rootfsMatcher(key) || runtimeAssetMatcher(key);
+      }
+
+      function workerBootHeavyStorageKeyMatcher(id) {
+        const escapedId = String(id || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const roots = [
+          /^\/?packages(?:\/|$)/,
+          /^\/?var\/cache\/pkg(?:\/|$)/,
+          /^\/?var\/lib\/pkg\/cache(?:\/|$)/,
+          new RegExp(`^/?${escapedId}/packages(?:/|$)`),
+          new RegExp(`^/?${escapedId}/var/cache/pkg(?:/|$)`),
+          new RegExp(`^/?${escapedId}/var/lib/pkg/cache(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/packages(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/var/cache/pkg(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/var/lib/pkg/cache(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/?packages(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/?var/cache/pkg(?:/|$)`),
+          new RegExp(`^/?workspace-store/${escapedId}/?var/lib/pkg/cache(?:/|$)`),
+        ];
+        const preservePatterns = [
+          /^\/?packages\/[^/]+\/package\.json$/,
+          new RegExp(`^/?${escapedId}/packages/[^/]+/package\\.json$`),
+          new RegExp(`^/?workspace-store/${escapedId}/packages/[^/]+/package\\.json$`),
+          new RegExp(`^/?workspace-store/${escapedId}/?packages/[^/]+/package\\.json$`),
+        ];
+        return (key) => {
+          if (typeof key !== "string") return false;
+          const normalized = key.replaceAll("\\", "/").replace(/^\/+/, "");
+          if (preservePatterns.some((pattern) => pattern.test(normalized) || pattern.test(`/${normalized}`))) return false;
+          return roots.some((pattern) => pattern.test(normalized) || pattern.test(`/${normalized}`));
+        };
+      }
+
       function idbEntryPath(value) {
         if (!value || typeof value !== "object") return "";
         return String(value.path || value.name || value.filename || value.key || "");
@@ -1028,6 +1331,14 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
           request.onsuccess = () => resolve(request.result);
           request.onerror = () => reject(request.error);
         });
+      }
+
+      function parseJsonResponseText(text) {
+        try {
+          return JSON.parse(text || "{}");
+        } catch {
+          return {};
+        }
       }
 
       async function idbDatabaseNamesForWorkspace(id) {
@@ -1095,17 +1406,35 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
           return;
         }
         if (rootfsPruneAlreadyDone(id)) return;
-        const shouldDeleteKey = legacyRootfsKeyMatcher(id);
+        const shouldDeleteKey = staleDefaultStorageKeyMatcher(id);
         let deleted = 0;
         for (const dbName of await idbDatabaseNamesForWorkspace(id)) {
           try {
             deleted += await pruneRootfsEntriesFromIdbDatabase(dbName, shouldDeleteKey);
           } catch (err) {
-            console.warn(`[BOOT] IndexedDB rootfs prune skipped for ${dbName}:`, err);
+            console.warn(`[BOOT] IndexedDB default storage prune skipped for ${dbName}:`, err);
           }
         }
-        if (deleted) console.info(`[BOOT] Pruned ${deleted} persisted default rootfs entries before workspace mount.`);
+        if (deleted) console.info(`[BOOT] Pruned ${deleted} stale default rootfs/runtime entries before workspace mount.`);
         markRootfsPruned(id);
+      }
+
+      async function pruneWorkerBootHeavyStorageBeforeMount(id) {
+        const workspace = workspaces.find((item) => item.id === id);
+        if (!id || workspace?.transient || typeof indexedDB === "undefined") return;
+        const key = `edgeterm.workerBootPrune.${DEFAULT_ROOTFS_VERSION}.${id}`;
+        if (localStorage.getItem(key) === "1") return;
+        const shouldDeleteKey = workerBootHeavyStorageKeyMatcher(id);
+        let deleted = 0;
+        for (const dbName of await idbDatabaseNamesForWorkspace(id)) {
+          try {
+            deleted += await pruneRootfsEntriesFromIdbDatabase(dbName, shouldDeleteKey);
+          } catch (err) {
+            console.warn(`[BOOT] IndexedDB worker boot prune skipped for ${dbName}:`, err);
+          }
+        }
+        if (deleted) console.info(`[BOOT] Pruned ${deleted} package/cache entries from workspace storage before worker boot.`);
+        localStorage.setItem(key, "1");
       }
 
       async function migrateLegacyWorkspaceStorage(id) {
@@ -1211,42 +1540,78 @@ const DEFAULT_ROOTFS_VERSION = "EdgeTerm php-wasm-v109";
       async function mountWorkspaceStorage(id, options = {}) {
         const workspace = workspaces.find((item) => item.id === id);
         if (mountedWorkspaceId && mountedWorkspaceId !== id) {
-          try {
-            pyodide.FS.unmount(workspacePath(mountedWorkspaceId));
-          } catch (err) {
-            console.warn("[PERSIST] Workspace unmount skipped:", err);
+          if (mountedWorkspaceStorageReal) {
+            try {
+              pyodide.FS.unmount(workspacePath(mountedWorkspaceId));
+            } catch (err) {
+              console.warn("[PERSIST] Workspace unmount skipped:", err);
+            }
           }
           mountedWorkspaceId = "";
+          mountedWorkspaceStorageReal = false;
+          mountedWorkspaceStorageLoaded = false;
+          workspaceStorageLoadPromise = null;
         }
         if (!workspace || workspace.transient) {
           mountedWorkspaceId = "";
+          mountedWorkspaceStorageReal = false;
+          mountedWorkspaceStorageLoaded = false;
+          workspaceStorageLoadPromise = null;
           ensureDir(workspacePath(id));
           return;
         }
-        if (isWorkspaceStorageMounted(id)) return;
-        await prunePersistedDefaultRootfsBeforeMount(id);
+        if (isWorkspaceStorageMounted(id)) {
+          if (options.load !== false && !mountedWorkspaceStorageLoaded) await loadMountedWorkspaceStorage(id);
+          return;
+        }
+        schedulePersistedDefaultStoragePrune(id);
         const recoveredHomesPath = options.recoverLegacy === true ? await recoverLegacyHomesFromSharedStore(id) : "";
         if (options.migrate === true) await migrateLegacyWorkspaceStorage(id);
         ensureDir("/workspace-store");
         ensureDir(workspacePath(id));
         pyodide.FS.mount(pyodide.FS.filesystems.IDBFS, {}, workspacePath(id));
         mountedWorkspaceId = id;
-        if (options.load !== false) await syncfs(true);
+        mountedWorkspaceStorageReal = true;
+        mountedWorkspaceStorageLoaded = false;
+        workspaceStorageLoadPromise = null;
+        if (options.load !== false) await loadMountedWorkspaceStorage(id);
         if (restoreRecoveredHomes(id, recoveredHomesPath)) await syncfs(false);
       }
 
+      function schedulePersistedDefaultStoragePrune(id) {
+        // Disabled during normal boot. IndexedDB pruning can hold storage locks
+        // and make reload/new-tab startup randomly stall on large workspaces.
+      }
+
+      async function loadMountedWorkspaceStorage(id, reason = "Loading workspace files...") {
+        if (!id || !isWorkspaceStorageMounted(id) || mountedWorkspaceStorageLoaded) return true;
+        if (workspaceStorageLoadPromise) return await workspaceStorageLoadPromise;
+        workspaceStorageLoadPromise = (async () => {
+          showNotice(reason);
+          await parkShellCwdForMount();
+          await syncfs(true);
+          mountedWorkspaceStorageLoaded = true;
+          await restoreWorkspaceJournal(id);
+          await ensureWorkspaceLayout(id);
+          prepareActiveMounts();
+          await syncShellCwdAfterWorkspaceMount();
+          renderWorkspaces();
+          refreshFilesIfVisible(currentPath);
+          showNotice("Workspace files loaded");
+          return true;
+        })().finally(() => {
+          workspaceStorageLoadPromise = null;
+        });
+        return await workspaceStorageLoadPromise;
+      }
+
       async function ensureActiveWorkspaceMounted(reason = "Loading workspace files...") {
-        if (!activeWorkspaceId || isWorkspaceStorageMounted(activeWorkspaceId)) return true;
-        showNotice(reason);
-        await mountWorkspaceStorage(activeWorkspaceId);
-        await ensureWorkspaceLayout(activeWorkspaceId);
-        await restoreWorkspaceJournal(activeWorkspaceId);
+        if (!activeWorkspaceId) return true;
+        if (!isWorkspaceStorageMounted(activeWorkspaceId)) await mountWorkspaceStorage(activeWorkspaceId, { load: false });
+        if (!isWorkspaceStorageLoaded(activeWorkspaceId)) await loadMountedWorkspaceStorage(activeWorkspaceId, reason);
         await parkShellCwdForMount();
-        prepareActiveMounts();
         await syncShellCwdAfterWorkspaceMount();
-        renderWorkspaces();
         scheduleWorkspaceFlush(5000);
-        showNotice("Workspace files loaded");
         return true;
       }
 
@@ -1798,6 +2163,122 @@ else:
         return `/packages/${packageName}`;
       }
 
+      function installedPackageManifest(packageName) {
+        const path = packageManifestPath(packageName);
+        if (!pyodide?.FS?.analyzePath(path).exists) return null;
+        try {
+          return readJsonFile(path);
+        } catch (err) {
+          console.warn("[PKG] Invalid package manifest:", path, err);
+          return null;
+        }
+      }
+
+      function packageMetadataPaths() {
+        const paths = [];
+        if (pyodide?.FS?.analyzePath("/packages").exists) {
+          for (const packageName of pyodide.FS.readdir("/packages")) {
+            if (packageName === "." || packageName === "..") continue;
+            const manifestPath = `/packages/${packageName}/package.json`;
+            if (pyodide.FS.analyzePath(manifestPath).exists) paths.push(manifestPath);
+          }
+        }
+        for (const path of ["/var/lib/pkg/status.json"]) {
+          if (pyodide?.FS?.analyzePath(path).exists) paths.push(path);
+        }
+        if (pyodide?.FS?.analyzePath("/var/lib/pkg/installed").exists) {
+          for (const file of pyodide.FS.readdir("/var/lib/pkg/installed")) {
+            if (file === "." || file === ".." || !file.endsWith(".json")) continue;
+            const path = `/var/lib/pkg/installed/${file}`;
+            if (pyodide.FS.analyzePath(path).exists) paths.push(path);
+          }
+        }
+        return paths;
+      }
+
+      function persistPackageMetadataCache() {
+        if (!pyodide?.FS) return;
+        const files = [];
+        for (const path of packageMetadataPaths()) {
+          try {
+            files.push({
+              path,
+              text: pyodide.FS.readFile(path, { encoding: "utf8" }),
+            });
+          } catch (err) {
+            console.warn("[PKG] Failed to cache package metadata:", path, err);
+          }
+        }
+        try {
+          if (files.length) localStorage.setItem(PACKAGE_METADATA_STORE_KEY, JSON.stringify({ version: 1, files }));
+          else localStorage.removeItem(PACKAGE_METADATA_STORE_KEY);
+        } catch (err) {
+          console.warn("[PKG] Failed to persist package metadata cache:", err);
+        }
+      }
+
+      function restorePackageMetadataCache() {
+        if (!pyodide?.FS) return;
+        let cached = null;
+        try {
+          cached = JSON.parse(localStorage.getItem(PACKAGE_METADATA_STORE_KEY) || "null");
+        } catch {
+          cached = null;
+        }
+        const files = Array.isArray(cached?.files) ? cached.files : [];
+        if (!files.length) return;
+        for (const file of files) {
+          const path = normalizePath(file?.path || "");
+          if (!path || path.includes("..")) continue;
+          try {
+            writeTextFile(path, String(file.text || ""));
+          } catch (err) {
+            console.warn("[PKG] Failed to restore package metadata:", path, err);
+          }
+        }
+      }
+
+      function cachedPackageManifest(packageName) {
+        const target = `/packages/${normalizePackageName(packageName)}/package.json`;
+        try {
+          const cached = JSON.parse(localStorage.getItem(PACKAGE_METADATA_STORE_KEY) || "null");
+          const files = Array.isArray(cached?.files) ? cached.files : [];
+          const found = files.find((file) => normalizePath(file?.path || "") === target);
+          return found ? JSON.parse(String(found.text || "{}")) : null;
+        } catch {
+          return null;
+        }
+      }
+
+      async function installExternalWinePackage() {
+        const assetRoot = new URL("/edgeterm-packages/packages/wine", location.href).toString().replace(/\/+$/, "");
+        const probeUrl = `${assetRoot}/Wine11/boxedwine.zip`;
+        const response = await fetch(probeUrl, { method: "HEAD", cache: "no-store" });
+        if (!response.ok) throw new Error(`Wine package source not found: ${probeUrl}`);
+        ensureDir("/packages/wine");
+        const manifest = {
+          name: "wine",
+          version: "26R1-wine11",
+          description: "External BoxedWine + Wine11 browser runtime package",
+          license: "GPL-2.0",
+          runtime: "boxedwine",
+          type: "external-runtime",
+          arch: "wasm32-emscripten",
+          external: true,
+          assetRoot,
+          wineRoot: "Wine11/boxedwine.zip",
+          builds: {
+            singleThreaded: "SingleThreaded",
+            multiThreaded: "MultiThreaded",
+          },
+          provides: ["wine", "wine11", "winecfg", "wineconsole", "winetricks"],
+        };
+        writeJsonFile("/packages/wine/package.json", manifest);
+        await persistActiveWorkspace();
+        refreshWasmCommandLinks();
+        return manifest;
+      }
+
       function activeWorkspace() {
         return workspaces.find((workspace) => workspace.id === activeWorkspaceId);
       }
@@ -1842,8 +2323,13 @@ else:
       }
 
       function saveWorkspaceRegistry() {
-        localStorage.setItem(WORKSPACE_KEY, JSON.stringify(workspaces.filter((workspace) => !workspace.transient)));
-        localStorage.setItem(ACTIVE_KEY, activeWorkspaceId);
+        const nextWorkspaces = JSON.stringify(workspaces.filter((workspace) => !workspace.transient));
+        if (localStorage.getItem(WORKSPACE_KEY) !== nextWorkspaces) {
+          localStorage.setItem(WORKSPACE_KEY, nextWorkspaces);
+        }
+        if (localStorage.getItem(ACTIVE_KEY) !== activeWorkspaceId) {
+          localStorage.setItem(ACTIVE_KEY, activeWorkspaceId);
+        }
       }
 
       function readJsonFile(path) {
@@ -1857,6 +2343,111 @@ else:
 
       function writeJsonFile(path, value) {
         writeTextFile(path, `${JSON.stringify(value, null, 2)}\n`);
+      }
+
+      function isCriticalBootFile(path) {
+        const criticalCommands = new Set([
+          "bin/bigbox/bigbox.py",
+          "bin/bigbox/bigbox_utils.py",
+          "bin/bigbox/cat.py",
+          "bin/bigbox/cd.py",
+          "bin/bigbox/clear.py",
+          "bin/bigbox/cp.py",
+          "bin/bigbox/curl.py",
+          "bin/bigbox/edgepkg.py",
+          "bin/bigbox/edgeserve.py",
+          "bin/bigbox/echo.py",
+          "bin/bigbox/help.py",
+          "bin/bigbox/ls.py",
+          "bin/bigbox/mkdir.py",
+          "bin/bigbox/mv.py",
+          "bin/bigbox/pip.py",
+          "bin/bigbox/pip3.py",
+          "bin/bigbox/pkg.py",
+          "bin/bigbox/pwd.py",
+          "bin/bigbox/python.py",
+          "bin/bigbox/python3.py",
+          "bin/bigbox/rm.py",
+          "bin/bigbox/touch.py",
+          "bin/bigbox/wget.py",
+          "bin/bigbox/which.py",
+          "bin/bigbox/wine.py",
+          "bin/bigbox/wine11.py",
+          "bin/bigbox/winecfg.py",
+          "bin/bigbox/wineconsole.py",
+          "bin/bigbox/winetricks.py",
+        ]);
+        return (
+          path === "bin/shell.py" ||
+          criticalCommands.has(path) ||
+          path === "etc/motd" ||
+          path === "etc/profile" ||
+          path === "etc/appmode/config.json" ||
+          path.startsWith("usr/lib/")
+        );
+      }
+
+      function decodeBase64Bytes(data) {
+        const binary = atob(String(data || ""));
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes;
+      }
+
+      async function seedBootRootfs(rootfsPath, options = {}) {
+        setLoadingMessage("Loading boot files...");
+        const criticalOnly = options.criticalOnly !== false;
+        const manifestName = criticalOnly ? "bootfs-critical.js" : "bootfs.json";
+        const seedStartedAt = performance.now();
+        const traceSeed = (tag, extra = "") => {
+          const message = `[BOOTFS] ${tag} +${Math.round(performance.now() - seedStartedAt)}ms${extra ? ` ${extra}` : ""}`;
+          console.info(message);
+        };
+        let manifest = criticalOnly
+          ? { version: EDGETERM_BOOT_BUNDLE_VERSION, files: BOOTFS_CRITICAL_FILES }
+          : null;
+        if (!criticalOnly) {
+          traceSeed("fetch-start", manifestName);
+          const response = await fetch(assetUrl(manifestName), { cache: "force-cache" });
+          if (!response.ok) throw new Error(`Failed to load ${manifestName} (${response.status})`);
+          traceSeed("fetch-done", `status=${response.status}`);
+          manifest = await response.json();
+          traceSeed("json-done");
+        } else {
+          traceSeed("inline-critical-ready", `files=${BOOTFS_CRITICAL_FILES.length}`);
+        }
+        const files = Array.isArray(manifest?.files) ? manifest.files : [];
+        traceSeed("seed-start", `files=${files.length} criticalOnly=${criticalOnly}`);
+        let completed = 0;
+        for (const file of files) {
+          const relative = String(file?.path || "").replaceAll("\\", "/").replace(/^\/+/, "");
+          if (!relative || relative.includes("..")) continue;
+          if (criticalOnly && !isCriticalBootFile(relative)) continue;
+          const fileStartedAt = performance.now();
+          const data = String(file.data || "");
+          const bytes = file.encoding === "base64" ? decodeBase64Bytes(data) : new TextEncoder().encode(data);
+          const decodedAt = performance.now();
+          const fullPath = `${rootfsPath}/${relative}`;
+          ensureDir(fullPath.split("/").slice(0, -1).join("/") || rootfsPath);
+          pyodide.FS.writeFile(fullPath, bytes);
+          const fileDuration = Math.round(performance.now() - fileStartedAt);
+          const decodeDuration = Math.round(decodedAt - fileStartedAt);
+          if (fileDuration > 100) {
+            traceSeed("file-done", `${relative} total=${fileDuration}ms decode=${decodeDuration}ms bytes=${bytes.byteLength}`);
+          }
+          completed += 1;
+        }
+        if (criticalOnly) clearBootfsCriticalFiles();
+        traceSeed("seed-done", `completed=${completed}`);
+      }
+
+      function scheduleLazyBootfsSeed(rootfsPath = SYSTEM_ROOTFS_PATH) {
+        // Full bootfs hydration is intentionally disabled on startup. Large
+        // rootfs/workspace trees made this background write overlap refreshes.
+        // Commands outside the critical set can be restored by rootfs update.
+        return;
       }
 
       function cloneValue(value) {
@@ -1886,7 +2477,7 @@ else:
 
       function normalizeAppModeConfig(raw = {}) {
         const merged = deepMerge(DEFAULT_APP_MODE_CONFIG, raw || {});
-        merged.runtime = ["python", "php", "static"].includes(merged.runtime) ? merged.runtime : "python";
+        merged.runtime = ["python", "php", "static", "wine"].includes(merged.runtime) ? merged.runtime : "python";
         merged.entrypoint = String(
           merged.entrypoint || (merged.runtime === "static" ? "/home/user/index.html" : merged.runtime === "php" ? "/home/user/public/index.php" : "/home/user/app.py")
         );
@@ -1901,6 +2492,7 @@ else:
         merged.ui.showAddressBar = !!merged.ui.showAddressBar;
         merged.python = deepMerge(DEFAULT_APP_MODE_CONFIG.python, merged.python || {});
         merged.static = deepMerge(DEFAULT_APP_MODE_CONFIG.static, merged.static || {});
+        merged.wine = deepMerge(DEFAULT_APP_MODE_CONFIG.wine, merged.wine || {});
         merged.exit.hotkey = String(merged.exit.hotkey || "Escape");
         merged.ui.debugTerminalHotkey = String(merged.ui.debugTerminalHotkey || "Ctrl+`");
         merged.python.appObject = String(merged.python.appObject || "app");
@@ -1912,6 +2504,10 @@ else:
         }
         merged.python.routePrefix = String(merged.python.routePrefix || "/");
         merged.static.indexFile = String(merged.static.indexFile || "index.html");
+        merged.wine.prefix = String(merged.wine.prefix || `/home/${activeUser()}/.wine`);
+        merged.wine.runtimePackage = String(merged.wine.runtimePackage || "boxedwine");
+        merged.wine.winePackage = String(merged.wine.winePackage || "wine-runtime");
+        merged.wine.display = merged.wine.display !== false;
         return merged;
       }
 
@@ -3075,12 +3671,13 @@ else:
 
       async function ensureWorkspaceMountedForRuntimePath(path, reason = "Loading workspace files...") {
         const workspace = activeWorkspace();
-        if (!workspace || isWorkspaceStorageMounted(activeWorkspaceId)) return true;
+        if (!workspace || isWorkspaceStorageLoaded(activeWorkspaceId)) return true;
         return await ensureActiveWorkspaceMounted(reason);
       }
 
       function scheduleWorkspaceFlush(delay = 250) {
         if (activeWorkspace()?.transient) return;
+        if (activeWorkspaceId && isWorkspaceStorageMounted(activeWorkspaceId) && !isWorkspaceStorageLoaded(activeWorkspaceId)) return;
         if (workspaceFlushTimeout) clearTimeout(workspaceFlushTimeout);
         workspaceFlushTimeout = setTimeout(() => {
           workspaceFlushTimeout = null;
@@ -3104,6 +3701,10 @@ else:
 
       async function persistActiveWorkspace() {
         if (activeWorkspace()?.transient) return;
+        if (activeWorkspaceId && isWorkspaceStorageMounted(activeWorkspaceId) && !isWorkspaceStorageLoaded(activeWorkspaceId)) {
+          await flushQueuedWorkspaceJournalEntries();
+          return;
+        }
         if (persistTimeout) {
           clearTimeout(persistTimeout);
           persistTimeout = null;
@@ -3236,7 +3837,7 @@ else:
             pyodide.FS.writeFile(fullPath, await entry.async("uint8array"));
           }
           completed += 1;
-          if (completed === total || completed - lastRendered >= 20) {
+          if (completed === total || completed - lastRendered >= 5) {
             lastRendered = completed;
             updateLoadingProgress({
               current: completed,
@@ -3424,7 +4025,8 @@ else:
 
       function validateAppModeConfig(config) {
         if (!config.enabled) return;
-        if (!["python", "php", "static"].includes(config.runtime)) throw new Error(`Unsupported App Mode runtime: ${config.runtime}`);
+        if (!["python", "php", "static", "wine"].includes(config.runtime)) throw new Error(`Unsupported App Mode runtime: ${config.runtime}`);
+        if (WORKER_SHELL_ENABLED) return;
         if (!pyodide.FS.analyzePath(config.workingDirectory).exists) throw new Error(`Working directory does not exist: ${config.workingDirectory}`);
         if (config.runtime === "python" && !config.python?.appSpec && !pyodide.FS.analyzePath(config.entrypoint).exists) {
           throw new Error(`Python entrypoint does not exist: ${config.entrypoint}`);
@@ -3439,6 +4041,7 @@ else:
           const staticCandidate = resolveStaticEntrypoint(config, config.entrypoint);
           if (!pyodide.FS.analyzePath(staticCandidate).exists) throw new Error(`Static entrypoint does not exist: ${staticCandidate}`);
         }
+        if (config.runtime === "wine" && !config.entrypoint) throw new Error("Wine App Mode requires an entrypoint such as notepad.exe");
       }
 
       function resolveStaticEntrypoint(config, requestedPath = "") {
@@ -4488,6 +5091,18 @@ else:
           bodyBase64: serialized.bodyBase64,
           instanceId: activeInstanceId,
         };
+        if (WORKER_SHELL_ENABLED) {
+          const result = await workerFs("pythonAppDispatch", payload);
+          if (result.status === 404 && dispatchPath.length > 1 && dispatchPath.endsWith("/")) {
+            const retried = await dispatchPythonAppRequest(dispatchPath.slice(0, -1) + (query ? `?${query}` : ""), options, config);
+            if (retried.status !== 404) return retried;
+          }
+          if (result.status === 404 && config.staticRoot) {
+            const fallback = await dispatchStaticRequest(url, options, config, { allowHtml: false, silentNotFound: true });
+            if (fallback.status !== 404) return fallback;
+          }
+          return result;
+        }
         pyodide.globals.set("__edgeterm_app_request_json", JSON.stringify(payload));
         const raw = await pyodide.runPythonAsync(`
 import json
@@ -5347,7 +5962,9 @@ try {
           if (!dispatchPath.startsWith("/")) dispatchPath = `/${dispatchPath}`;
         }
 
-          const target = resolvePhpRequestTarget(activeInstance, dispatchPath);
+          const target = WORKER_SHELL_ENABLED
+            ? await resolvePhpRequestTargetWorker(activeInstance, dispatchPath)
+            : resolvePhpRequestTarget(activeInstance, dispatchPath);
         if (!target) {
           edgeServePhpLog("not-found", {
             method: requestMethod,
@@ -5366,7 +5983,7 @@ try {
             bodyBase64: "",
           };
         }
-        if (target.kind === "static") return responseFromFsFile(target.fsPath);
+        if (target.kind === "static") return WORKER_SHELL_ENABLED ? await responseFromWorkerFsFile(target.fsPath) : responseFromFsFile(target.fsPath);
 
         const serialized = await serializeAppModeRequestBody(
           requestMethod,
@@ -5410,8 +6027,13 @@ try {
         });
         if (bridgedResponse) return bridgedResponse;
 
-        pyodide.FS.writeFile(requestFile, JSON.stringify(payload));
-        pyodide.FS.writeFile(wrapperFile, phpRequestWrapperSource());
+        if (WORKER_SHELL_ENABLED) {
+          await workerFs("writeFile", { path: requestFile, data: JSON.stringify(payload) });
+          await workerFs("writeFile", { path: wrapperFile, data: phpRequestWrapperSource() });
+        } else {
+          pyodide.FS.writeFile(requestFile, JSON.stringify(payload));
+          pyodide.FS.writeFile(wrapperFile, phpRequestWrapperSource());
+        }
         try {
           edgeServePhpLog("request", {
             requestId,
@@ -5449,7 +6071,7 @@ try {
           );
           const durationMs = Math.round(performance.now() - startedAt);
           const result = JSON.parse(String(raw || "{}"));
-          schedulePersistActiveWorkspace(750);
+          if (!WORKER_SHELL_ENABLED) schedulePersistActiveWorkspace(750);
           if (!result?.found) {
             edgeServePhpLog("runtime-missing", { requestId, durationMs, command: "php" });
             return {
@@ -5601,10 +6223,12 @@ try {
           return response;
         } finally {
           try {
-            if (fsPathExists(requestFile)) pyodide.FS.unlink(requestFile);
+            if (WORKER_SHELL_ENABLED) await workerFs("unlink", { path: requestFile });
+            else if (fsPathExists(requestFile)) pyodide.FS.unlink(requestFile);
           } catch {}
           try {
-            if (fsPathExists(wrapperFile)) pyodide.FS.unlink(wrapperFile);
+            if (WORKER_SHELL_ENABLED) await workerFs("unlink", { path: wrapperFile });
+            else if (fsPathExists(wrapperFile)) pyodide.FS.unlink(wrapperFile);
           } catch {}
         }
       }
@@ -5851,6 +6475,7 @@ try {
       }
 
       async function dispatchStaticRequest(url, options, config, extra = {}) {
+        if (WORKER_SHELL_ENABLED) return await dispatchWorkerStaticRequest(url, options, config, extra);
         const { path } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
         const root = normalizePath(config.staticRoot || "/home/user/public");
         let fsPath = path === "/" ? resolveStaticEntrypoint(config) : resolveWorkspaceDirectory(root, `.${path}`);
@@ -5882,7 +6507,7 @@ try {
       }
 
       async function dispatchAppModeRequest(url, options = {}) {
-        const config = appModeState.config || readAppModeConfig();
+        const config = appModeState.config || (WORKER_SHELL_ENABLED ? defaultAppModeConfig() : readAppModeConfig());
         const { path } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
         const matchedInstance = findEdgeServeInstanceForPath(path);
         const serveMode = matchedInstance?.mode || config.python?.serveMode || "";
@@ -6428,7 +7053,7 @@ json.dumps(result)
       async function buildRenderedDocument(html, routePath, documentFsPath, config, response = null) {
         const parser = new DOMParser();
         const doc = parser.parseFromString(String(html || ""), "text/html");
-        rewriteAppModeAssets(doc, documentFsPath, config);
+        if (!WORKER_SHELL_ENABLED) rewriteAppModeAssets(doc, documentFsPath, config);
         await inlineBridgeStylesheets(doc, routePath || "/", config);
         await inlineBridgeScripts(doc, routePath || "/", config);
         await rewriteInlineInternalAssets(doc, routePath || "/");
@@ -7007,6 +7632,45 @@ json.dumps(result)
       }
 
       async function startPythonAppMode(config, initialUrl = "") {
+        if (WORKER_SHELL_ENABLED) {
+          const pythonCfg = config.python || {};
+          const cwd = normalizePath(config.workingDirectory || `/home/${activeUser()}`);
+          let routePrefix = normalizePath(pythonCfg.routePrefix || "/");
+          if (pythonCfg.instanceId && pythonCfg.framework === "edgeserve") {
+            await navigateAppMode(initialUrl || routePrefix || "/", { expectHtml: !initialUrl, updateHistory: false });
+            return;
+          }
+          const appSpec = String(pythonCfg.appSpec || "").trim();
+          if (appSpec || ["flask", "wsgi", "django", "asgi", "fastapi", "starlette"].includes(String(pythonCfg.framework || "").toLowerCase())) {
+            const mode = String(pythonCfg.framework || "flask").toLowerCase();
+            const identity = stableEdgeServeIdentity(mode, appSpec, cwd);
+            const instance = await workerFs("pythonAppCreate", {
+              mode,
+              target: appSpec,
+              cwd,
+              instanceId: pythonCfg.instanceId || identity.instanceId,
+              routePrefix: routePrefix === "/" ? (pythonCfg.routePrefix || identity.routePrefix) : routePrefix,
+            });
+            instance.id ||= pythonCfg.instanceId || identity.instanceId;
+            instance.routePrefix ||= routePrefix === "/" ? identity.routePrefix : routePrefix;
+            instance.workingDirectory ||= cwd;
+            window.EdgeTermServe ||= { instances: new Map() };
+            window.EdgeTermServe.instances ||= new Map();
+            window.EdgeTermServe.instances.set(instance.id, instance);
+            config.python = {
+              ...pythonCfg,
+              framework: "edgeserve",
+              appSpec,
+              instanceId: instance.id,
+              routePrefix: instance.routePrefix,
+              serveMode: instance.mode || normalizeEdgeServeRouteMode(mode),
+            };
+            routePrefix = normalizePath(instance.routePrefix || "/");
+            await navigateAppMode(initialUrl || routePrefix || "/", { expectHtml: !initialUrl, updateHistory: false });
+            return;
+          }
+          throw new Error("Worker Python App Mode requires an EdgeServe app spec such as app:app.");
+        }
         pyodide.globals.set("__edgeterm_user", activeUser());
         pyodide.globals.set("__edgeterm_rootfs_lib", `${activeRootfsPath()}/usr/lib`);
         pyodide.globals.set("__edgeterm_appmode_config_json", JSON.stringify(config));
@@ -7111,7 +7775,9 @@ else:
         const target = resolvePhpAppTarget(config);
         const relativeTarget = target.startsWith(`${cwd}/`) ? target.slice(cwd.length + 1) : target;
         const identity = stableEdgeServeIdentity("php", relativeTarget || target, cwd);
-        const isPhpFile = fsIsFile(target) && /\.php$/i.test(target);
+        const isPhpFile = WORKER_SHELL_ENABLED
+          ? (await workerFsIsFile(target)) && /\.php$/i.test(target)
+          : fsIsFile(target) && /\.php$/i.test(target);
         const documentRoot = isPhpFile ? normalizePath(target.split("/").slice(0, -1).join("/") || "/") : target;
         const instance = {
           id: identity.instanceId,
@@ -7135,8 +7801,26 @@ else:
         await navigateAppMode(initialUrl || `${instance.routePrefix || ""}/` || "/", { expectHtml: !initialUrl, updateHistory: false });
       }
 
+      async function startWineAppMode(config) {
+        const cwd = normalizePath(config.workingDirectory || `/home/${activeUser()}`);
+        const entrypoint = String(config.entrypoint || "").trim();
+        if (!entrypoint) throw new Error("Wine App Mode requires an entrypoint");
+        const result = await window.EdgeTermWine.runCommand("wine", [entrypoint], cwd, {
+          USER: activeUser(),
+          HOME: `/home/${activeUser()}`,
+          PWD: cwd,
+          EDGETERM_APPMODE: "1",
+        }, {
+          appMode: true,
+          fullscreen: !!config.fullscreen,
+          title: entrypoint,
+          prefix: config.wine?.prefix,
+        });
+        if (Number(result?.code || 0) !== 0) throw new Error(result?.stderr || result?.stdout || "Wine runtime failed to start");
+      }
+
       async function enterAppMode(config = null, options = {}) {
-        const resolved = normalizeAppModeConfig(config || readAppModeConfig());
+        const resolved = normalizeAppModeConfig(config || (WORKER_SHELL_ENABLED ? defaultAppModeConfig() : readAppModeConfig()));
         validateAppModeConfig(resolved);
         hideAppModeError();
         appModeState.config = resolved;
@@ -7151,6 +7835,7 @@ else:
           if (!resolved.preserveStateOnExit || options.forceReload) clearAppModeFrame();
           if (resolved.runtime === "python") await startPythonAppMode(resolved, options.initialUrl || "");
           else if (resolved.runtime === "php") await startPhpAppMode(resolved, options.initialUrl || "");
+          else if (resolved.runtime === "wine") await startWineAppMode(resolved);
           else await startStaticAppMode(resolved, options.initialUrl || "");
           setAppModeLoading(false);
         } catch (err) {
@@ -7164,7 +7849,7 @@ else:
 
       async function exitAppMode(options = {}) {
         if (!appModeState.active && !appModeState.booting) return;
-        const config = appModeState.config || readAppModeConfig();
+        const config = appModeState.config || (WORKER_SHELL_ENABLED ? defaultAppModeConfig() : readAppModeConfig());
         if (
           !options.force &&
           config.exit?.confirmBeforeExit &&
@@ -7198,9 +7883,19 @@ else:
       }
 
       async function maybeAutoStartAppMode() {
+        const route = currentShareLocator();
+        const params = new URLSearchParams(location.search);
+        const explicitAutoStart = params.get("autostart") === "1" || params.get("appMode") === "1";
+        if (!explicitAutoStart && !route) {
+          console.info("[APPMODE] Auto-start config read skipped on workspace root. Use /app/ or the Launch button to start App Mode.");
+          markRuntimePhase("root-idle");
+          return false;
+        }
         const config = readAppModeConfig();
         appModeState.config = config;
+        if (!config.enabled || !config.autoStart) return false;
         if (config.enabled && config.autoStart) await enterAppMode(config);
+        return true;
       }
 
       function populateAppModeSettings(config = readAppModeConfig()) {
@@ -7281,49 +7976,20 @@ else:
           workspace.rootfsVersion = DEFAULT_ROOTFS_VERSION;
         }
         const rootfsPath = SYSTEM_ROOTFS_PATH;
-        const shellPath = `${rootfsPath}/bin/shell.py`;
-        const shellEnginePath = `${rootfsPath}/usr/lib/edgeterm_shell.py`;
-        const hasRootfs = pyodide.FS.analyzePath(`${rootfsPath}/bin/shell.py`).exists;
-        const hasCurrentShell =
-          pyodide.FS.analyzePath(shellPath).exists &&
-          pyodide.FS.readFile(shellPath, { encoding: "utf8" }).includes("EDGETERM_SHELL") &&
-          pyodide.FS.analyzePath(shellEnginePath).exists &&
-          pyodide.FS.readFile(shellEnginePath, { encoding: "utf8" }).includes("class EdgeTermShell");
-        const hasUsableRootfs = hasRootfs && hasCurrentShell;
-
-        if (!force && hasUsableRootfs) {
-          if (workspace && !workspace.rootfsVersion) workspace.rootfsVersion = DEFAULT_ROOTFS_VERSION;
-          return;
-        }
-
-        clearDirectory(rootfsPath);
-        const rootfsUrl = `${assetUrl("rootfs.zip")}?v=${encodeURIComponent(DEFAULT_ROOTFS_VERSION)}`;
-        setLoadingMessage("Downloading rootfs...");
-        const resp = await fetch(rootfsUrl, { cache: "no-store" });
-        if (!resp.ok) throw new Error("Failed to fetch rootfs.zip");
-        const zip = await JSZip.loadAsync(await readResponseBlobWithProgress(resp, "Downloading rootfs..."));
-        await extractZipTo(zip, rootfsPath, { phase: "Extracting rootfs..." });
+        await seedBootRootfs(rootfsPath, { criticalOnly: true });
+        scheduleLazyBootfsSeed(rootfsPath);
         if (workspace && workspace.rootfsVersion !== "custom") workspace.rootfsVersion = DEFAULT_ROOTFS_VERSION;
       }
 
+      function scheduleFullRootfsHydration(delay = 2500) {
+        // Boot now uses bootfs.json only. Full rootfs hydration was expensive
+        // enough to freeze refreshes when large Wine/workspace data existed.
+        return Promise.resolve(false);
+      }
+
       function schedulePersistedDefaultRootfsPrune(id) {
-        const workspace = workspaces.find((item) => item.id === id);
-        if (!workspace || workspace.transient || workspace.rootfsVersion === "custom") return;
-        setTimeout(() => {
-          (async () => {
-            const persistedRootfs = workspacePath(id, "/rootfs");
-            if (!pyodide?.FS?.analyzePath(persistedRootfs).exists) return;
-            try {
-              const entries = pyodide.FS.readdir(persistedRootfs).filter((entry) => entry !== "." && entry !== "..");
-              if (!entries.length) return;
-              console.info("[BOOT] Pruning persisted default rootfs from workspace storage for faster future starts.");
-              clearDirectory(persistedRootfs);
-              await syncfs(false);
-            } catch (err) {
-              console.warn("[BOOT] Persisted default rootfs prune skipped:", err);
-            }
-          })();
-        }, 10000);
+        // Do not auto-prune after boot. On large Wine-enabled workspaces this
+        // delayed maintenance can overlap refresh/new-tab boot and stall Chrome.
       }
 
       async function ensureWorkspaceLayout(id) {
@@ -7473,7 +8139,7 @@ def data():
         copyTree(workspacePath(activeWorkspaceId, "/overlay/upper"), "/overlay/upper");
         createRootLinks();
         restoreRootOverlayFromWorkspace();
-        refreshWasmCommandLinks();
+        wasmCommandRegistry();
         pyodide.FS.chdir(`/home/${activeUser()}`);
       }
 
@@ -7487,8 +8153,22 @@ def data():
         } catch (err) {
           console.error("[DISPLAY] tkinter direct event dispatch failed:", err);
         }
-        displayInputQueue.push({ ...event, ts: Date.now() });
+        const payload = { ...event, ts: Date.now() };
+        displayInputQueue.push(payload);
         if (displayInputQueue.length > 200) displayInputQueue = displayInputQueue.slice(-200);
+        try {
+          workerShell?.postMessage({ type: "displayInputEvents", events: [payload] });
+        } catch {}
+        try {
+          if ((payload.type === "keydown" || payload.type === "keyup") && (location.protocol === "http:" || location.protocol === "https:")) {
+            fetch(`/__edgeterm_display_input?id=${encodeURIComponent(displayInputSessionId)}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ events: [payload] }),
+              keepalive: true,
+            }).catch(() => {});
+          }
+        } catch {}
         try {
           displayInputPump?.();
         } catch (err) {
@@ -7586,6 +8266,35 @@ def data():
           browserButton.setAttribute("aria-label", browserButton.title);
         }
         window.lucide?.createIcons();
+      }
+
+      function selectedDisplayResolution() {
+        const raw = String($id("displayResolution")?.value || "960x640");
+        const match = raw.match(/^(\d+)x(\d+)$/);
+        if (!match) return { width: 960, height: 640, label: "960x640" };
+        const width = Math.max(320, Math.min(3840, Number(match[1]) || 960));
+        const height = Math.max(240, Math.min(2160, Number(match[2]) || 640));
+        return { width, height, label: `${width}x${height}` };
+      }
+
+      function applyDisplayResolutionSelection() {
+        const resolution = selectedDisplayResolution();
+        displayState.preferredWidth = resolution.width;
+        displayState.preferredHeight = resolution.height;
+        displayState.preferredResolution = resolution.label;
+        if (displayState.mode === "canvas" || displayState.mode === "empty") {
+          renderDisplayMessage({
+            type: "resize",
+            width: resolution.width,
+            height: resolution.height,
+            background: displayState.mode === "canvas" ? $id("displayCanvas")?.style?.background || "#ffffff" : "#ffffff",
+          });
+        } else if (displayState.mode === "wine") {
+          showNotice("Resolution will apply to the next Wine launch");
+          updateDisplayStatus(`Wine resolution set for next launch: ${resolution.label}`);
+        } else {
+          updateDisplayStatus(`Display resolution set to ${resolution.label}`);
+        }
       }
 
       async function toggleDisplayViewportFullscreen() {
@@ -7750,6 +8459,25 @@ def data():
           return;
         }
 
+        if (normalized.type === "pixels") {
+          setDisplayVisibility("canvas");
+          const width = Number(normalized.width) || canvas.width || displayState.width;
+          const height = Number(normalized.height) || canvas.height || displayState.height;
+          if (canvas.width !== width || canvas.height !== height) setCanvasSize(width, height, normalized.background);
+          const data = String(normalized.data || "");
+          if (data) {
+            const binary = atob(data);
+            const bytes = new Uint8ClampedArray(binary.length);
+            for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+            canvas.getContext("2d").putImageData(new ImageData(bytes, width, height), 0, 0);
+          }
+          if (normalized.focus === true) (canvas.__edgetermFocusInput || (() => canvas.focus()))();
+          displayState.mode = "canvas";
+          displayState.lastType = "pixels";
+          updateDisplayStatus(`Canvas ${canvas.width}x${canvas.height}`);
+          return;
+        }
+
         setView("displayView");
 
         if (normalized.type === "canvas") {
@@ -7772,7 +8500,7 @@ def data():
             ctx.lineWidth = 5;
             ctx.strokeRect(canvas.width * 0.12, canvas.height * 0.58, canvas.width * 0.72, canvas.height * 0.18);
           }
-          if (normalized.focus !== false) canvas.focus();
+          if (normalized.focus !== false) (canvas.__edgetermFocusInput || (() => canvas.focus()))();
           displayState.mode = "canvas";
           displayState.lastType = "canvas";
           updateDisplayStatus(`Canvas ${canvas.width}x${canvas.height}`);
@@ -7806,6 +8534,54 @@ def data():
       function configureDisplayBridge() {
         const surface = $id("displaySurface");
         const canvas = $id("displayCanvas");
+        const keyboardSink = document.createElement("input");
+        keyboardSink.type = "text";
+        keyboardSink.autocomplete = "off";
+        keyboardSink.autocapitalize = "off";
+        keyboardSink.spellcheck = false;
+        keyboardSink.setAttribute("aria-hidden", "true");
+        keyboardSink.tabIndex = -1;
+        keyboardSink.style.cssText = [
+          "position:absolute",
+          "inset:0",
+          "width:100%",
+          "height:100%",
+          "opacity:0",
+          "border:0",
+          "outline:0",
+          "padding:0",
+          "margin:0",
+          "background:transparent",
+          "color:transparent",
+          "caret-color:transparent",
+          "pointer-events:auto",
+        ].join(";");
+        surface.appendChild(keyboardSink);
+        const gameKeyCodeForChar = (value) => {
+          const ch = String(value || "").slice(-1).toLowerCase();
+          if (!"wasd".includes(ch)) return "";
+          return `Key${ch.toUpperCase()}`;
+        };
+        const focusDisplayInput = () => {
+          try {
+            keyboardSink.focus({ preventScroll: true });
+          } catch {
+            try { keyboardSink.focus(); } catch {}
+          }
+        };
+        canvas.__edgetermFocusInput = focusDisplayInput;
+        keyboardSink.addEventListener("input", () => {
+          const chars = String(keyboardSink.value || "");
+          keyboardSink.value = "";
+          for (const ch of chars) {
+            const code = gameKeyCodeForChar(ch);
+            if (!code) continue;
+            recordDisplayEvent({ type: "keydown", key: ch.toLowerCase(), code });
+            recordDisplayEvent({ type: "keyup", key: ch.toLowerCase(), code });
+          }
+        });
+        keyboardSink.addEventListener("keydown", (event) => handleDisplayKeyEvent(event, "keydown"), true);
+        keyboardSink.addEventListener("keyup", (event) => handleDisplayKeyEvent(event, "keyup"), true);
 
         const recordPointer = (eventName, event) => {
           const rect = canvas.getBoundingClientRect();
@@ -7822,21 +8598,61 @@ def data():
         };
 
         canvas.addEventListener("pointerdown", (event) => {
-          canvas.focus();
+          focusDisplayInput();
           recordPointer("pointerdown", event);
         });
         canvas.addEventListener("pointermove", (event) => recordPointer("pointermove", event));
         canvas.addEventListener("pointerup", (event) => recordPointer("pointerup", event));
         canvas.addEventListener("wheel", (event) => recordPointer("wheel", event));
+        keyboardSink.addEventListener("pointerdown", (event) => {
+          focusDisplayInput();
+          recordPointer("pointerdown", event);
+        });
+        keyboardSink.addEventListener("pointermove", (event) => recordPointer("pointermove", event));
+        keyboardSink.addEventListener("pointerup", (event) => recordPointer("pointerup", event));
+        keyboardSink.addEventListener("wheel", (event) => recordPointer("wheel", event));
         canvas.addEventListener("keydown", (event) => recordDisplayEvent({ type: "keydown", key: event.key || "", code: event.code || "" }));
         canvas.addEventListener("keyup", (event) => recordDisplayEvent({ type: "keyup", key: event.key || "", code: event.code || "" }));
-        surface.addEventListener("dblclick", () => canvas.focus());
+        const handleDisplayKeyEvent = (event, type) => {
+          if (displayState.mode !== "canvas") return;
+          const isGameKey = /^(Key[WASD]|Arrow(?:Up|Down|Left|Right)|Space)$/i.test(event.code || "");
+          const displayView = $id("displayView");
+          const displayActive = !!displayView && !displayView.classList.contains("hidden") && getComputedStyle(displayView).display !== "none";
+          if (!isGameKey && event.target?.closest?.("input, textarea, select, [contenteditable='true']")) return;
+          if (!displayActive && event.target?.closest?.("input, textarea, select, [contenteditable='true']")) return;
+          if (isGameKey) event.preventDefault();
+          recordDisplayEvent({ type, key: event.key || "", code: event.code || "" });
+        };
+        window.addEventListener("keydown", (event) => handleDisplayKeyEvent(event, "keydown"), true);
+        window.addEventListener("keyup", (event) => handleDisplayKeyEvent(event, "keyup"), true);
+        surface.addEventListener("dblclick", () => focusDisplayInput());
 
         window.EdgeTermDisplay = {
           send: renderDisplayMessage,
+          sendPixels: (pixelData, width, height) => {
+            // Zero-copy pixel transfer: receives a Uint8ClampedArray from Pyodide
+            // (via JsProxy) and puts it directly on the canvas, skipping base64/JSON.
+            try {
+              const canvas = $id("displayCanvas");
+              if (!canvas) return;
+              if (canvas.width !== width || canvas.height !== height) {
+                setCanvasSize(width, height, "#000000");
+              }
+              setDisplayVisibility("canvas");
+              // pixelData is a JsProxy wrapping a Uint8ClampedArray
+              const clamped = pixelData.toJs ? pixelData.toJs() : pixelData;
+              const imageData = new ImageData(clamped, width, height);
+              canvas.getContext("2d").putImageData(imageData, 0, 0);
+              displayState.mode = "canvas";
+              displayState.lastType = "pixels";
+              updateDisplayStatus(`Canvas ${canvas.width}x${canvas.height}`);
+            } catch (err) {
+              console.warn("[DISPLAY] sendPixels failed:", err);
+            }
+          },
           clear: clearDisplaySurface,
           switchTab: (focus = true) => renderDisplayMessage({ type: "switch", focus }),
-          focus: () => canvas.focus(),
+          focus: () => focusDisplayInput(),
           getCanvas: () => canvas,
           bindSDLCanvas,
           postInputEvent: (event) => recordDisplayEvent(event || {}),
@@ -8067,6 +8883,11 @@ def data():
       async function executeInTerminal(command, options = {}) {
         if (!command?.trim()) return;
         if (options.switchView !== false) setView("terminalView");
+        if (WORKER_SHELL_ENABLED) {
+          term.echo(`${currentPath || `/home/${activeUser()}`} $ ${command}`);
+          await runWorkerCommand(command);
+          return;
+        }
         term.echo(`${await getShellPromptPath()} $ ${command}`);
         await runCommand(command, options);
       }
@@ -8088,6 +8909,20 @@ def data():
 
       async function renameEditorFile() {
         const path = normalizePath($id("editorPath").value);
+        if (WORKER_SHELL_ENABLED) {
+          if (!(await workerFsStat(path)).exists) return showNotice("File does not exist yet");
+          const currentName = path.split("/").filter(Boolean).pop();
+          const nextName = await askText("Rename File", "New file name", currentName, { confirmLabel: "Rename" });
+          if (!nextName) return;
+          const target = normalizePath(`${path.split("/").slice(0, -1).join("/")}/${nextName}`);
+          await workerFs("writeFile", { path: target, data: await workerReadBase64(path), encoding: "base64" });
+          await workerFs("unlink", { path });
+          $id("editorPath").value = target;
+          if (filesViewIsActive()) await refreshWorkerFiles(currentPath);
+          setEditorStatus(`Renamed to ${nextName}`);
+          showNotice(`Renamed to ${nextName}`);
+          return;
+        }
         if (!pyodide.FS.analyzePath(path).exists) {
           showNotice("File does not exist yet");
           return;
@@ -8107,6 +8942,11 @@ def data():
       async function downloadCurrentEditorFile() {
         const path = normalizePath($id("editorPath").value);
         await saveEditor();
+        if (WORKER_SHELL_ENABLED) {
+          await downloadWorkerSelectedPaths([path]);
+          showNotice(`Downloaded ${path}`);
+          return;
+        }
         await downloadPath(path);
         showNotice(`Downloaded ${path}`);
       }
@@ -8170,6 +9010,10 @@ def data():
       }
 
       async function restartRuntime() {
+        if (WORKER_SHELL_ENABLED) {
+          location.reload();
+          return;
+        }
         await persistActiveWorkspace();
         await bootShell();
         setView("terminalView");
@@ -8194,6 +9038,11 @@ def data():
           return;
         }
         const tempPath = `/tmp/edgeterm-selection-${Date.now()}.py`;
+        if (WORKER_SHELL_ENABLED) {
+          await workerFs("writeFile", { path: tempPath, data: code });
+          await executeInTerminal(`python ${tempPath}`, { postRunSync: false });
+          return;
+        }
         ensureDir("/tmp");
         pyodide.FS.writeFile(tempPath, code);
         await executeInTerminal(`python ${tempPath}`, { postRunSync: false });
@@ -8501,6 +9350,7 @@ def data():
         workspace.name = trimmed;
         workspace.updatedAt = Date.now();
         saveWorkspaceRegistry();
+        prepareActiveMounts();
         renderWorkspaces();
         showNotice("Workspace renamed");
       }
@@ -8743,12 +9593,19 @@ def data():
         if (id !== "displayView" && id !== "browserView" && displayState.fullscreen) setDisplayFullscreen(false);
         if (id === "displayView") $id("displayCanvas")?.focus();
         if (id === "filesView") {
+          if (WORKER_SHELL_ENABLED) {
+            void refreshWorkerFiles(currentPath || `/home/${activeUser()}`);
+            window.lucide?.createIcons();
+            return;
+          }
           void ensureActiveWorkspaceMounted("Loading workspace files...").then(() => refreshFiles());
         }
         if (id === "editorView") {
-          renderEditorChrome();
-          editor?.layout();
-          splitEditor?.layout();
+          if (editor && splitEditor) {
+            renderEditorChrome();
+            editor?.layout();
+            splitEditor?.layout();
+          }
         }
         if (id === "usersView") renderUsers();
         if (id === "cloudView") {
@@ -9102,6 +9959,14 @@ def data():
         await loginWithCredentials(mode, email, password, acceptedTos);
       }
 
+      function bindCloudAuthEvents() {
+        if (cloudAuthEventsBound || !CLOUD_ENABLED) return;
+        cloudAuthEventsBound = true;
+        $id("cloudLogin")?.addEventListener("click", () => loginOrRegister("login"));
+        $id("cloudRegister")?.addEventListener("click", () => loginOrRegister("register"));
+        $id("cloudLogout")?.addEventListener("click", logoutCloud);
+      }
+
       async function loginWithCredentials(mode, email, password, acceptedTos = false) {
         try {
           const payload = await cloudJson(`/api/${mode}`, {
@@ -9129,6 +9994,7 @@ def data():
       }
 
       async function buildWorkspaceBlob(options = {}) {
+        await ensureActiveWorkspaceMounted("Loading full workspace before backup...");
         if (options.persist !== false) {
           await persistActiveWorkspace();
         }
@@ -9502,7 +10368,7 @@ def data():
             body: blob,
             phase: "Uploading rootfs backup...",
           });
-          const payload = JSON.parse(response.responseText || "{}");
+          const payload = parseJsonResponseText(response.responseText);
           if (!response.ok) throw new Error(payload.error || "Cloud sync failed");
           cloudUser.storageUsed = payload.storageUsed;
           showNotice(payload.prunedSnapshots?.length ? `Workspace synced. Removed ${payload.prunedSnapshots.length} old backups.` : "Workspace synced to cloud");
@@ -9522,11 +10388,16 @@ def data():
           }
           const snapshot = cloudSnapshots.find((item) => item.id === snapshotId);
           const file = new File([await readResponseBlobWithProgress(response, "Downloading rootfs backup...")], `${snapshot?.name || "cloud-restore"}.workspace.zip`, { type: "application/zip" });
-          await createWorkspaceFromZip(`${snapshot?.name || "Cloud Restore"} (Cloud)`, file, {
-            persistCurrentWorkspace: false,
-            deferInitialSync: true,
-            initialSyncDelayMs: 30000,
-          });
+          const restoredName = `${snapshot?.name || "Cloud Restore"} (Cloud)`;
+          if (WORKER_SHELL_ENABLED && workerShell) {
+            await createWorkerWorkspaceFromZip(restoredName, file);
+          } else {
+            await createWorkspaceFromZip(restoredName, file, {
+              persistCurrentWorkspace: false,
+              deferInitialSync: true,
+              initialSyncDelayMs: 30000,
+            });
+          }
           showNotice("Cloud backup restored");
         }).catch((err) => {
           console.error("[CLOUD] Restore failed:", err);
@@ -10415,11 +11286,16 @@ def data():
             throw new Error(payload.error || "Restore failed");
           }
           const file = new File([await readResponseBlobWithProgress(response, "Downloading rootfs backup...")], `${snapshot?.name || "platform-restore"}.workspace.zip`, { type: "application/zip" });
-          await createWorkspaceFromZip(`${snapshot?.name || "Platform Restore"} (${snapshot?.owner?.email || "admin"})`, file, {
-            persistCurrentWorkspace: false,
-            deferInitialSync: true,
-            initialSyncDelayMs: 30000,
-          });
+          const restoredName = `${snapshot?.name || "Platform Restore"} (${snapshot?.owner?.email || "admin"})`;
+          if (WORKER_SHELL_ENABLED && workerShell) {
+            await createWorkerWorkspaceFromZip(restoredName, file);
+          } else {
+            await createWorkspaceFromZip(restoredName, file, {
+              persistCurrentWorkspace: false,
+              deferInitialSync: true,
+              initialSyncDelayMs: 30000,
+            });
+          }
         }).catch((err) => showNotice(err.message));
       }
 
@@ -10470,6 +11346,12 @@ def data():
         const list = $id("fileList");
         list.textContent = "";
         hideContextMenu();
+
+        if (activeWorkspaceId && !isWorkspaceStorageLoaded(activeWorkspaceId) && currentPath.startsWith("/home")) {
+          list.innerHTML = `<div class="file-muted">Workspace files are loading on demand...</div>`;
+          void ensureActiveWorkspaceMounted("Loading workspace files...").then(() => refreshFiles(currentPath));
+          return;
+        }
 
         if (!fs.analyzePath(currentPath).exists) {
           list.textContent = "Path not found.";
@@ -10700,6 +11582,77 @@ def data():
         return registry;
       }
 
+      const packageAssetRestorePromises = new Map();
+
+      async function restoreBundledWasmPackageAssets(packageName) {
+        const name = String(packageName || "").replace(/^\/+|\/+$/g, "");
+        if (!/^[A-Za-z0-9._-]+$/.test(name)) return false;
+        if (packageAssetRestorePromises.has(name)) return await packageAssetRestorePromises.get(name);
+        const promise = (async () => {
+          const prefix = `packages/${name}/`;
+          const packageRoot = packageRootPath(name);
+          const rootfsUrl = `${assetUrl("rootfs.zip")}?v=${encodeURIComponent(DEFAULT_ROOTFS_VERSION)}`;
+          const resp = await fetch(rootfsUrl, { cache: "force-cache" });
+          if (!resp.ok) return false;
+          const zip = await JSZip.loadAsync(await resp.blob());
+          let restored = 0;
+          for (const [zipPath, entry] of Object.entries(zip.files)) {
+            const normalized = String(zipPath || "").replaceAll("\\", "/").replace(/^\/+/, "");
+            if (!normalized.startsWith(prefix) || entry.dir) continue;
+            const relative = normalized.slice(prefix.length);
+            if (!relative || relative.includes("..")) continue;
+            const target = `${packageRoot}/${relative}`;
+            ensureDir(target.split("/").slice(0, -1).join("/") || packageRoot);
+            pyodide.FS.writeFile(target, await entry.async("uint8array"));
+            restored += 1;
+          }
+          if (restored) {
+            console.info(`[WASM] Restored ${restored} bundled files for package ${name}.`);
+            return true;
+          }
+          return false;
+        })().catch((err) => {
+          console.warn(`[WASM] Could not restore bundled package ${name}:`, err);
+          return false;
+        }).finally(() => {
+          packageAssetRestorePromises.delete(name);
+        });
+        packageAssetRestorePromises.set(name, promise);
+        return await promise;
+      }
+
+      async function ensureWasmEntryFiles(entry) {
+        let nextEntry = entry;
+        if (!pyodide.FS.analyzePath(nextEntry.launcherPath).exists || !pyodide.FS.analyzePath(nextEntry.wasmPath).exists) {
+          await restoreBundledWasmPackageAssets(nextEntry.packageName);
+        }
+        if (!pyodide.FS.analyzePath(nextEntry.launcherPath).exists) {
+          const fallbackLauncher = nextEntry.manifest?.js || nextEntry.manifest?.launcher || nextEntry.manifest?.main || "";
+          const fallbackLauncherPath = fallbackLauncher ? `${nextEntry.packageRoot}/${fallbackLauncher}` : "";
+          if (fallbackLauncherPath && pyodide.FS.analyzePath(fallbackLauncherPath).exists) {
+            nextEntry = { ...nextEntry, launcherPath: fallbackLauncherPath };
+          } else {
+            return {
+              entry: nextEntry,
+              error: `${nextEntry.command}: launcher file is missing from package ${nextEntry.packageName}\n`,
+            };
+          }
+        }
+        if (!pyodide.FS.analyzePath(nextEntry.wasmPath).exists) {
+          const fallbackWasm = nextEntry.manifest?.wasm ? String(nextEntry.manifest.wasm).split("/").pop() : "";
+          const fallbackWasmPath = fallbackWasm ? `${nextEntry.packageRoot}/${fallbackWasm}` : "";
+          if (fallbackWasmPath && pyodide.FS.analyzePath(fallbackWasmPath).exists) {
+            nextEntry = { ...nextEntry, wasmPath: fallbackWasmPath };
+          } else {
+            return {
+              entry: nextEntry,
+              error: `${nextEntry.command}: wasm binary is missing from package ${nextEntry.packageName}\n`,
+            };
+          }
+        }
+        return { entry: nextEntry, error: "" };
+      }
+
       function clearWasmCommandLinks() {
         for (const link of wasmCommandLinks) {
           try {
@@ -10723,6 +11676,10 @@ def data():
           }
         }
         return registry;
+      }
+
+      function wasmCommandRegistry() {
+        return discoverWasmPackages();
       }
 
       function createWasmRuntimeModuleFactory(source, entry) {
@@ -11315,6 +12272,387 @@ return (async () => {
         }
       }
 
+      function configureWineRuntime() {
+        const activeWineProcesses = new Map();
+        const activeWineBlobUrls = new Set();
+        if (!window.__edgeTermWineMessageBridgeInstalled) {
+          window.__edgeTermWineMessageBridgeInstalled = true;
+          window.addEventListener("message", (event) => {
+            const data = event.data || {};
+            if (data.type === "edgeterm-wine-log") {
+              const text = String(data.text || "");
+              if (text) term?.echo?.(`[BOXEDWINE] ${text}`);
+              return;
+            }
+            if (data.type === "edgeterm-wine-status") {
+              const text = String(data.text || "").trim();
+              if (text) updateDisplayStatus(`Wine: ${text}`);
+            }
+          });
+        }
+        const resolveWinePrefix = (env = {}, options = {}) => normalizePath(
+          options.prefix || env.WINEPREFIX || `/home/${activeUser()}/.wine`
+        );
+        const releaseRoot = "/packages/wine";
+        const defaultWineAssetRoot = new URL("/edgeterm-packages/packages/wine", location.href).toString().replace(/\/+$/, "");
+        let externalWineReleaseAvailable = null;
+        const packageInstalled = (name) => pyodide.FS.analyzePath(packageManifestPath(name)).exists;
+        const wineManifest = () => installedPackageManifest("wine") || cachedPackageManifest("wine");
+        const wineAssetRoot = () => String(wineManifest()?.assetRoot || defaultWineAssetRoot).replace(/\/+$/, "");
+        const fsExists = (path) => pyodide.FS.analyzePath(path).exists;
+        const ensureExternalWineRegistered = async () => {
+          if (installedPackageManifest("wine")) return true;
+          const cached = cachedPackageManifest("wine");
+          if (cached) {
+            restorePackageMetadataCache();
+            return !!installedPackageManifest("wine");
+          }
+          try {
+            const probe = await fetch(`${defaultWineAssetRoot}/Wine11/boxedwine.zip`, { method: "HEAD", cache: "no-store" });
+            if (!probe.ok) return false;
+            const manifest = {
+              name: "wine",
+              version: "26R1-wine11",
+              description: "External BoxedWine + Wine11 browser runtime package",
+              license: "GPL-2.0",
+              runtime: "boxedwine",
+              type: "external-runtime",
+              arch: "wasm32-emscripten",
+              external: true,
+              assetRoot: defaultWineAssetRoot,
+              wineRoot: "Wine11/boxedwine.zip",
+              builds: {
+                singleThreaded: "SingleThreaded",
+                multiThreaded: "MultiThreaded",
+              },
+              provides: ["wine", "wine11", "winecfg", "wineconsole", "winetricks"],
+            };
+            writeJsonFile("/packages/wine/package.json", manifest);
+            persistPackageMetadataCache();
+            return true;
+          } catch {
+            return false;
+          }
+        };
+        const hasWineReleaseInFs = () => fsExists(`${releaseRoot}/SingleThreaded/boxedwine.js`) && fsExists(`${releaseRoot}/SingleThreaded/boxedwine.wasm`);
+        const hasExternalWineRelease = async () => {
+          if (!wineManifest() && !(await ensureExternalWineRegistered())) return false;
+          if (externalWineReleaseAvailable !== null) return externalWineReleaseAvailable;
+          try {
+            const response = await fetch(`${wineAssetRoot()}/SingleThreaded/boxedwine.js`, { method: "HEAD", cache: "no-store" });
+            externalWineReleaseAvailable = response.ok;
+          } catch {
+            externalWineReleaseAvailable = false;
+          }
+          return externalWineReleaseAvailable;
+        };
+        const hasWineRelease = async () => hasWineReleaseInFs() || await hasExternalWineRelease();
+        const canUseThreadedWine = () => !!window.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
+        const normalizeWineThreading = (value = "") => {
+          const text = String(value || "").trim().toLowerCase();
+          if (["single", "singlethread", "single-thread"].includes(text)) return "single";
+          if (["multi", "multithread", "multi-thread", "threaded"].includes(text)) return "multi";
+          return "auto";
+        };
+        const selectWineBuild = (options = {}) => {
+          const threading = normalizeWineThreading(options.threading);
+          if (threading === "single") return "SingleThreaded";
+          if (threading === "multi" && canUseThreadedWine()) return "MultiThreaded";
+          return canUseThreadedWine() ? "MultiThreaded" : "SingleThreaded";
+        };
+        const wineAssetUrl = async (relativePath, type = "application/octet-stream") => {
+          const fsPath = `${releaseRoot}/${relativePath}`;
+          if (fsExists(fsPath)) return makeWineBlobUrl(fsPath, type);
+          return `${wineAssetRoot()}/${relativePath}`;
+        };
+        const makeWineBlobUrl = (path, type = "application/octet-stream") => {
+          const url = URL.createObjectURL(new Blob([pyodide.FS.readFile(path)], { type }));
+          activeWineBlobUrls.add(url);
+          appModeState.blobUrls.push(url);
+          return url;
+        };
+        const quoteParam = (value) => `%22${String(value || "").replace(/ /g, "%20")}%22`;
+        const ensureWinePrefix = (prefix) => {
+          ensureDir(prefix);
+          ensureDir(`${prefix}/drive_c`);
+          ensureDir(`${prefix}/drive_c/users/${activeUser()}`);
+          ensureDir(`${prefix}/dosdevices`);
+          const metaPath = `${prefix}/edgeterm-wine.json`;
+          if (!pyodide.FS.analyzePath(metaPath).exists) {
+            writeJsonFile(metaPath, {
+              runtime: "wine",
+              engine: "boxedwine",
+              storage: "workspace",
+              experimental: true,
+            });
+          }
+        };
+        const attachWineDisplay = (process) => {
+          const width = process.fullscreen ? Math.max(960, window.innerWidth || 960) : 960;
+          const height = process.fullscreen ? Math.max(640, window.innerHeight || 640) : 640;
+          renderDisplayMessage({
+            type: "canvas",
+            width,
+            height,
+            background: "#050505",
+            bindSDL: true,
+            focus: true,
+          });
+          displayState.mode = "wine";
+          displayState.lastType = "wine";
+          displayState.wine = {
+            id: process.id,
+            command: process.command,
+            title: process.title,
+            prefix: process.prefix,
+          };
+          updateDisplayStatus(`Wine: ${process.title}`);
+          if (process.fullscreen) setDisplayFullscreen(true);
+        };
+        const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        })[ch]);
+        const showWineRuntimeStatus = (process, message) => {
+          renderDisplayMessage({
+            type: "html",
+            content: `
+              <section class="wine-status">
+                <div class="wine-status-header">
+                  <span class="wine-status-badge">Experimental</span>
+                  <h2>${escapeHtml(process.title)}</h2>
+                  <p>Wine launched through EdgeTerm, but no BoxedWine renderer is available yet.</p>
+                </div>
+                <dl class="wine-status-meta">
+                  <div><dt>Command</dt><dd>${escapeHtml(process.command)}</dd></div>
+                  <div><dt>Prefix</dt><dd>${escapeHtml(process.prefix)}</dd></div>
+                  <div><dt>Process</dt><dd>${escapeHtml(process.id)}</dd></div>
+                </dl>
+                <pre>${escapeHtml(message)}</pre>
+              </section>
+            `,
+          });
+          displayState.mode = "wine-status";
+          displayState.lastType = "wine-status";
+          displayState.wine = {
+            id: process.id,
+            command: process.command,
+            title: process.title,
+            prefix: process.prefix,
+            status: "missing-renderer",
+          };
+          updateDisplayStatus(`Wine runtime pending: ${process.title}`);
+        };
+        const missingRuntimeResult = (command, prefix) => ({
+          found: true,
+          code: 1,
+          stdout: `[BOXEDWINE] Launching ${command}...\n[DISPLAY] Wine runtime status opened for ${command}\n`,
+          stderr:
+            "wine: BoxedWine/Wine runtime assets are not installed yet.\n" +
+            "wine: run `pkg install wine` to register the external BoxedWine/Wine package.\n" +
+            `wine: prefix prepared at ${prefix}; execution remains browser-local and is never sent to the backend.\n`,
+        });
+        const commandPathForWine = (command, cwd) => {
+          if (!command || ["winecfg", "explorer", "winetricks"].includes(command.split(/\s+/, 1)[0])) return "";
+          const head = command.split(/\s+/, 1)[0];
+          const candidate = head.startsWith("/") ? normalizePath(head) : normalizePath(`${cwd}/${head}`);
+          return fsExists(candidate) ? candidate : "";
+        };
+        const createWineAppZipUrl = async (process) => {
+          const sourcePath = commandPathForWine(process.command, process.cwd);
+          if (!sourcePath) return { url: "", program: process.command === "explorer" ? "" : process.command };
+          const filename = sourcePath.split("/").filter(Boolean).pop() || "app.exe";
+          const zip = new JSZip();
+          zip.file(filename, pyodide.FS.readFile(sourcePath));
+          const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+          const url = URL.createObjectURL(blob);
+          activeWineBlobUrls.add(url);
+          appModeState.blobUrls.push(url);
+          return { url, program: filename };
+        };
+        const launchBoxedWineFrame = async (process, options = {}) => {
+          const build = selectWineBuild(options);
+          const preferredResolution = selectedDisplayResolution();
+          const canvasWidth = process.fullscreen ? Math.max(preferredResolution.width, window.innerWidth || preferredResolution.width) : preferredResolution.width;
+          const canvasHeight = process.fullscreen ? Math.max(preferredResolution.height, window.innerHeight || preferredResolution.height) : preferredResolution.height;
+          const shellUrl = await wineAssetUrl(`${build}/boxedwine-shell.js`, "text/javascript");
+          const loaderUrl = await wineAssetUrl(`${build}/boxedwine.js`, "text/javascript");
+          const cssUrl = await wineAssetUrl(`${build}/boxedwine.css`, "text/css");
+          const wasmUrl = await wineAssetUrl(`${build}/boxedwine.wasm`, "application/wasm");
+          const rootZipRelativePath = "Wine11/boxedwine.zip";
+          const rootZipUrl = await wineAssetUrl(rootZipRelativePath, "application/zip");
+          const appZip = await createWineAppZipUrl(process);
+          const urlParams = [
+            "auto=true",
+            process.command === "explorer" ? "desktop=true" : "desktop=false",
+            "sound=false",
+            "disableHideCursor=true",
+            `resolution=${canvasWidth}x${canvasHeight}`,
+            appZip.program ? `p=${quoteParam(appZip.program)}` : "",
+            appZip.url ? "app=app.zip" : "",
+          ].filter(Boolean).join("&");
+          const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>EdgeTerm Wine - ${escapeHtml(process.title)}</title>
+  <link rel="stylesheet" href="${cssUrl}">
+  <style>
+    html, body, #dropzone, .emscripten_border { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050505; }
+    #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #dbeafe; background: #020617; z-index: 5; font: 14px system-ui, sans-serif; }
+    #canvas { width: 100%; height: 100%; display: block; outline: none; }
+    .emscripten, .emscripten_border { padding: 0; border: 0; }
+    #output, #startbtn, #uploadbtn, #downloadbtn, #sound-checkbox, #pointerLock, #showConsole, #resize, input[type=button], hr { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="loading"><div><div id="status">Preparing BoxedWine...</div><progress value="0" max="100" id="progress"></progress><figure id="spinner"></figure></div></div>
+  <button id="startbtn" style="display:none" onclick="start()">Start</button>
+  <button id="uploadbtn" style="display:none"></button>
+  <button id="downloadbtn" style="display:none"></button>
+  <span id="sound-checkbox" style="display:none"><input type="checkbox" id="soundToggle"></span>
+  <input type="checkbox" id="pointerLock">
+  <input type="checkbox" id="showConsole">
+  <input type="checkbox" id="resize">
+  <input type="button" value="Fullscreen">
+  <a style="display:none" id="modalLink" href="#openModal">Open</a>
+  <a style="display:none" id="modalLinkExe" href="#openModalExe">Open</a>
+  <input style="display:none" id="upload" type="file" multiple>
+  <div id="dropzone"><div class="emscripten_border"><canvas class="emscripten" id="canvas" width="${canvasWidth}" height="${canvasHeight}" oncontextmenu="event.preventDefault()"></canvas></div></div>
+  <textarea id="output"></textarea>
+  <div id="openModal" class="modalDialog"><div><a href="#close" class="close">X</a><input id="selectedItem"><div id="tree"></div><h3 id="loadStatus"></h3></div></div>
+  <div id="openModalExe" class="modalDialog"><div><a id="openModalExeClick" href="#close" class="close">X</a><div id="message"></div><div id="items"></div></div></div>
+  <script src="${shellUrl}"></script>
+  <script>
+    window.addEventListener("error", function(event) {
+      parent.postMessage({ type: "edgeterm-wine-log", stream: "stderr", text: String(event.message || "BoxedWine script error") }, "*");
+    });
+    window.addEventListener("unhandledrejection", function(event) {
+      parent.postMessage({ type: "edgeterm-wine-log", stream: "stderr", text: String((event.reason && event.reason.message) || event.reason || "BoxedWine promise rejection") }, "*");
+    });
+    var filename = "";
+    Config.urlParams = ${JSON.stringify(urlParams)};
+    Config.storageMode = STORAGE_MEMORY;
+    Config.showUploadDownload = false;
+    Config.locateRootBaseUrl = "";
+    const __edgeTermWineAssets = {
+      "boxedwine.wasm": ${JSON.stringify(wasmUrl)},
+      "boxedwine.zip": ${JSON.stringify(rootZipUrl)},
+      "app.zip": ${JSON.stringify(appZip.url || "")}
+    };
+    const __edgeTermFetch = window.fetch.bind(window);
+    window.fetch = function(resource, init) {
+      const key = String(resource || "").split("/").pop();
+      if (__edgeTermWineAssets[key]) return __edgeTermFetch(__edgeTermWineAssets[key], init);
+      return __edgeTermFetch(resource, init);
+    };
+    Module.locateFile = function(path) {
+      const key = String(path || "").split("/").pop();
+      return __edgeTermWineAssets[key] || path;
+    };
+    Module.print = function(text) {
+      parent.postMessage({ type: "edgeterm-wine-log", stream: "stdout", text: String(text || "") }, "*");
+      console.log(text);
+    };
+    Module.printErr = function(text) {
+      parent.postMessage({ type: "edgeterm-wine-log", stream: "stderr", text: String(text || "") }, "*");
+      console.error(text);
+    };
+    const __edgeTermSetStatus = Module.setStatus;
+    Module.setStatus = function(text) {
+      __edgeTermSetStatus.call(Module, text);
+      parent.postMessage({ type: "edgeterm-wine-status", text: String(text || "") }, "*");
+      if (!text) document.getElementById("loading").style.display = "none";
+    };
+  </script>
+  <script async src="${loaderUrl}" onerror="parent.postMessage({ type: 'edgeterm-wine-log', stream: 'stderr', text: 'failed to load boxedwine.js' }, '*')"></script>
+</body>
+</html>`;
+          renderDisplayMessage({ type: "html", content: `<iframe class="wine-runtime-frame" sandbox="allow-scripts allow-same-origin allow-pointer-lock allow-downloads allow-forms" srcdoc="${escapeHtml(html)}"></iframe>` });
+          displayState.mode = "wine";
+          displayState.lastType = "wine";
+          displayState.wine = {
+            id: process.id,
+            command: process.command,
+            title: process.title,
+            prefix: process.prefix,
+            build,
+            threaded: build === "MultiThreaded",
+          };
+          updateDisplayStatus(`Wine: ${process.title} (${build})`);
+          if (process.fullscreen) setDisplayFullscreen(true);
+          return build;
+        };
+        window.EdgeTermWine = {
+          processes: activeWineProcesses,
+          isAvailable() {
+            return hasWineReleaseInFs() || packageInstalled("wine");
+          },
+          async runCommand(alias, args = [], cwd = `/home/${activeUser()}`, env = {}, options = {}) {
+            const argv = Array.from(args || []).map((arg) => String(arg));
+            const invoked = String(alias || "wine");
+            let command = argv.join(" ").trim();
+            if (invoked === "winecfg" || argv[0] === "winecfg") command = "winecfg";
+            else if (invoked === "winetricks" || argv[0] === "winetricks") command = `winetricks ${argv.slice(argv[0] === "winetricks" ? 1 : 0).join(" ")}`.trim();
+            else if (invoked === "wineconsole") command = `wineconsole ${argv.join(" ")}`.trim();
+            else if (!command) command = "explorer";
+            const prefix = resolveWinePrefix(env, options);
+            ensureWinePrefix(prefix);
+            const title = options.title || command.split(/[\\/]/).pop() || "Wine";
+            const process = {
+              id: `wine-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              command,
+              cwd: normalizePath(cwd || `/home/${activeUser()}`),
+              prefix,
+              title,
+              startedAt: Date.now(),
+              fullscreen: !!options.fullscreen,
+            };
+            activeWineProcesses.set(process.id, process);
+            await persistActiveWorkspace();
+
+            await ensureExternalWineRegistered();
+            if (!(await hasWineRelease())) {
+              const result = missingRuntimeResult(command, prefix);
+              showWineRuntimeStatus(process, result.stderr);
+              return result;
+            }
+
+            const wineVersion = "wine11";
+            const requestedThreading = normalizeWineThreading(options.threading || env.EDGETERM_WINE_THREADING || env.WINE_THREADING || "");
+            const build = await launchBoxedWineFrame(process, { ...options, wineVersion, threading: requestedThreading });
+            const forcedMultiUnavailable = requestedThreading === "multi" && build !== "MultiThreaded";
+            return {
+              found: true,
+              code: forcedMultiUnavailable ? 1 : 0,
+              stdout: `[BOXEDWINE] Launching ${command} with ${build} + Wine11 build...\n[DISPLAY] Attached Wine window: ${title}\n`,
+              stderr: forcedMultiUnavailable
+                ? "wine: multi-threaded BoxedWine requires cross-origin isolation with SharedArrayBuffer. Use serve-edgeterm.py or Cloud headers that set COOP/COEP, or run with --single-thread.\n"
+                : "",
+            };
+          },
+          listProcesses() {
+            return Array.from(activeWineProcesses.values()).map((process) => ({ ...process }));
+          },
+        };
+      }
+
+      function configurePackageRuntime() {
+        window.EdgeTermPkg = {
+          async install(name) {
+            const packageName = String(name || "").trim().toLowerCase();
+            if (packageName !== "wine") throw new Error(`unknown external package: ${name}`);
+            return installExternalWinePackage();
+          },
+          isInstalled(name) {
+            return !!installedPackageManifest(String(name || "").trim().toLowerCase());
+          },
+        };
+      }
+
       function configureWasmRuntime() {
         const describeBridgeError = (err) => {
           if (!err) return "unknown error";
@@ -11333,12 +12671,12 @@ return (async () => {
 
         window.EdgeTermWasmCLI = {
           which(command) {
-            const registry = refreshWasmCommandLinks();
+            const registry = wasmCommandRegistry();
             return registry.has(command) ? `/bin/${command}` : null;
           },
           commandForPath(path) {
             const normalized = normalizePath(path);
-            const registry = refreshWasmCommandLinks();
+            const registry = wasmCommandRegistry();
             if (normalized.startsWith("/bin/")) {
               const name = normalized.split("/").filter(Boolean).pop();
               return registry.has(name) ? name : null;
@@ -11354,27 +12692,12 @@ return (async () => {
           },
           async runCommandJSON(command, argsJson, stdinText, cwd, envJson) {
             try {
-              const registry = refreshWasmCommandLinks();
+              const registry = wasmCommandRegistry();
               let entry = registry.get(command);
               if (!entry) return JSON.stringify({ found: false, code: 127, stdout: "", stderr: "" });
-              if (!pyodide.FS.analyzePath(entry.launcherPath).exists) {
-                const fallbackLauncher = entry.manifest?.js || entry.manifest?.launcher || entry.manifest?.main || "";
-                const fallbackLauncherPath = fallbackLauncher ? `${entry.packageRoot}/${fallbackLauncher}` : "";
-                if (fallbackLauncherPath && pyodide.FS.analyzePath(fallbackLauncherPath).exists) {
-                  entry = { ...entry, launcherPath: fallbackLauncherPath };
-                } else {
-                  return JSON.stringify({ found: true, code: 1, stdout: "", stderr: `${command}: launcher file is missing from package ${entry.packageName}\n` });
-                }
-              }
-              if (!pyodide.FS.analyzePath(entry.wasmPath).exists) {
-                const fallbackWasm = entry.manifest?.wasm ? String(entry.manifest.wasm).split("/").pop() : "";
-                const fallbackWasmPath = fallbackWasm ? `${entry.packageRoot}/${fallbackWasm}` : "";
-                if (fallbackWasmPath && pyodide.FS.analyzePath(fallbackWasmPath).exists) {
-                  entry = { ...entry, wasmPath: fallbackWasmPath };
-                } else {
-                  return JSON.stringify({ found: true, code: 1, stdout: "", stderr: `${command}: wasm binary is missing from package ${entry.packageName}\n` });
-                }
-              }
+              const fileCheck = await ensureWasmEntryFiles(entry);
+              if (fileCheck.error) return JSON.stringify({ found: true, code: 1, stdout: "", stderr: fileCheck.error });
+              entry = fileCheck.entry;
               const parsedArgs = JSON.parse(argsJson || "[]");
               const parsedEnv = JSON.parse(envJson || "{}");
               const result = await runWasmCommandEntry(
@@ -11690,6 +13013,8 @@ else:
       }
 
       async function saveEditor() {
+        if (WORKER_SHELL_ENABLED) return await saveWorkerEditor();
+        await setupMonaco();
         const path = normalizePath($id("editorPath").value);
         const content = editor.getValue();
         await writeRuntimeFileAndMirror(path, content);
@@ -11724,7 +13049,9 @@ else:
       }
 
       async function openEditorInTarget(path, options = {}) {
+        if (WORKER_SHELL_ENABLED) return await openWorkerEditor(path, options);
         const targetName = options.target === "split" ? "split" : "main";
+        await setupMonaco();
         const instance = editorInstanceForTarget(targetName);
         if (!instance) return;
         const loaded = loadEditorFile(path);
@@ -11859,6 +13186,17 @@ json.dumps(info)
         };
 
       async function saveSplitEditor() {
+        if (WORKER_SHELL_ENABLED) {
+          await setupMonaco();
+          const path = normalizePath(currentEditorPath("split"));
+          const content = splitEditor?.getValue?.() || "";
+          await workerFs("writeFile", { path, data: content });
+          setSplitEditorStatus(`Saved ${path}`);
+          showNotice(`Saved ${path}`);
+          if (filesViewIsActive()) await refreshWorkerFiles(currentPath);
+          return;
+        }
+        await setupMonaco();
         const path = currentEditorPath("split");
         const content = splitEditor.getValue();
         await writeRuntimeFileAndMirror(path, content);
@@ -11887,14 +13225,18 @@ json.dumps(info)
 
       async function runCommand(command, options = {}) {
         const line = command ?? "";
-        if (!line.trim()) return;
-        if (line.trim() === "exit") {
-          term.echo("Goodbye.");
-          return;
-        }
-        const mayMutateBeforeRun = commandMayMutateWorkspace(line);
-
+        let mayMutateBeforeRun = false;
         try {
+          if (!line.trim()) return;
+          if (line.trim() === "exit") {
+            term.echo("Goodbye.");
+            return;
+          }
+          if (commandNeedsWorkspaceLoad(line)) {
+            await ensureActiveWorkspaceMounted("Loading workspace files for command...");
+          }
+          mayMutateBeforeRun = commandMayMutateWorkspace(line);
+
           pyodide.globals.set("__edgeterm_line", line);
           await pyodide.runPythonAsync(`
 import builtins
@@ -11912,11 +13254,14 @@ except Exception as exc:
         raise
 `);
         } catch (err) {
-          term.error("[ERROR] " + (err.message || err));
+          term.error("[ERROR] " + formatError(err));
+          await updatePrompt();
+          return;
         }
 
         try {
           const mayMutateWorkspace = mayMutateBeforeRun;
+          if (commandMayChangePackages(line)) persistPackageMetadataCache();
           if (mayMutateWorkspace && options.postRunSync !== false) {
             await persistActiveWorkspace();
           }
@@ -11926,6 +13271,20 @@ except Exception as exc:
         }
 
         await updatePrompt();
+      }
+
+      function commandNeedsWorkspaceLoad(line) {
+        if (!activeWorkspaceId || isWorkspaceStorageLoaded(activeWorkspaceId)) return false;
+        const source = String(line || "").trim();
+        if (!source) return false;
+        if (/^(clear|help|history|pwd|whoami|uname|date|true|false|exit)\b/i.test(source)) return false;
+        if (/^(pkg|edgepkg)\s+(update|search|list|info)\b/i.test(source)) return false;
+        return true;
+      }
+
+      function commandMayChangePackages(line) {
+        const source = String(line || "").trim();
+        return /^(pkg|edgepkg)\s+(install|remove|purge|upgrade|autoremove|clean)\b/i.test(source);
       }
 
       function commandNeedsImmediateWorkspacePersist(line) {
@@ -12042,7 +13401,7 @@ except Exception as exc:
 
       async function getShellPromptPath() {
         try {
-          return await pyodide.runPythonAsync(`
+          return pyodide.runPython(`
 import builtins, os, re
 shell = getattr(builtins, "EDGETERM_SHELL", None)
 path = shell.env.get("PWD", getattr(shell, "logical_cwd", os.getcwd())) if shell else os.environ.get("PWD", os.getcwd())
@@ -12050,13 +13409,1346 @@ match = re.search(r"/workspace-store/[^/]+(/home/.*)$", path)
 match.group(1) if match else path
 `);
         } catch {
-          return await pyodide.runPythonAsync("os.environ.get('PWD', os.getcwd())");
+          return pyodide.runPython("os.environ.get('PWD', os.getcwd())");
         }
       }
 
       async function updatePrompt() {
         const cwd = await getShellPromptPath();
         term.set_prompt(`${cwd} $ `);
+      }
+
+      function setWorkerPrompt(cwd = `/home/${activeUser()}`) {
+        currentPath = normalizePath(cwd || `/home/${activeUser()}`);
+        term.set_prompt(`${currentPath} $ `);
+      }
+
+      function createWorkerShellRequest() {
+        workerShellSequence += 1;
+        const id = workerShellSequence;
+        const promise = new Promise((resolve, reject) => workerShellRequests.set(id, { resolve, reject }));
+        return { id, promise };
+      }
+
+      function completeWorkerShellRequest(message) {
+        const request = workerShellRequests.get(message.id);
+        if (!request) return;
+        workerShellRequests.delete(message.id);
+        if (message.type === "error" || message.type === "fsError") request.reject(new Error(message.error || "Worker shell failed"));
+        else request.resolve(message);
+      }
+
+      function sendWorkerBridgeResponse(id, work) {
+        Promise.resolve()
+          .then(work)
+          .then((result) => workerShell?.postMessage({ type: "bridgeResponse", id, ok: true, result }))
+          .catch((error) =>
+            workerShell?.postMessage({
+              type: "bridgeResponse",
+              id,
+              ok: false,
+              error: error?.stack || error?.message || String(error),
+            })
+          );
+      }
+
+      async function runWorkerWineCommand(message) {
+        const alias = String(message.alias || "wine");
+        const argv = Array.from(message.args || []).map((arg) => String(arg));
+        let command = argv.join(" ").trim();
+        if (alias === "winecfg" || argv[0] === "winecfg") command = "winecfg";
+        else if (alias === "winetricks" || argv[0] === "winetricks") {
+          command = `winetricks ${argv.slice(argv[0] === "winetricks" ? 1 : 0).join(" ")}`.trim();
+        } else if (alias === "wineconsole") command = `wineconsole ${argv.join(" ")}`.trim();
+        else if (!command) command = "explorer";
+
+        const cwd = normalizePath(message.cwd || `/home/${activeUser()}`);
+        const env = message.env && typeof message.env === "object" ? message.env : {};
+        const options = message.options && typeof message.options === "object" ? message.options : {};
+        const prefix = normalizePath(
+          String(options.prefix || env.WINEPREFIX || activeWorkspace()?.settings?.appMode?.wine?.prefix || `/home/${activeUser()}/.wine`)
+        );
+        const process = {
+          id: `wine-worker-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          command,
+          cwd,
+          prefix,
+          title: options.title || command.split(/[\\/]/).pop() || "Wine",
+          fullscreen: !!options.fullscreen,
+        };
+        const manifest = message.wineManifest && typeof message.wineManifest === "object" ? message.wineManifest : null;
+        const assetRootCandidates = [
+          manifest?.assetRoot,
+          "https://raw.githubusercontent.com/EdwardLab/edgeterm-packages/main/packages/wine",
+          "/edgeterm-packages/packages/wine",
+        ]
+          .filter(Boolean)
+          .map((root) => String(root).replace(/\/+$/, ""));
+        let assetRoot = assetRootCandidates[0] || "";
+        const assetUrlFor = (relativePath, root = assetRoot) => {
+          if (/^https?:\/\//i.test(root)) return `${root}/${relativePath}`;
+          return new URL(`${root.replace(/^\/+/, "")}/${relativePath}`, location.href).toString();
+        };
+        const makeBlobAssetUrl = async (url, type = "application/octet-stream") => {
+          const response = await fetch(url, { cache: "force-cache" });
+          if (!response.ok) throw new Error(`failed to fetch Wine asset ${url}: HTTP ${response.status}`);
+          const objectUrl = URL.createObjectURL(new Blob([await response.arrayBuffer()], { type }));
+          appModeState.blobUrls.push(objectUrl);
+          return objectUrl;
+        };
+        const canUseThreadedWine = () => !!window.crossOriginIsolated && typeof SharedArrayBuffer !== "undefined";
+        const requestedThreading = String(options.threading || env.EDGETERM_WINE_THREADING || env.WINE_THREADING || "").toLowerCase();
+        const build = requestedThreading.includes("multi") && canUseThreadedWine()
+          ? "MultiThreaded"
+          : requestedThreading.includes("single")
+          ? "SingleThreaded"
+          : canUseThreadedWine()
+          ? "MultiThreaded"
+          : "SingleThreaded";
+        let probeUrl = assetUrlFor(`${build}/boxedwine.js`);
+        let lastProbeError = null;
+        try {
+          let found = false;
+          for (const candidate of assetRootCandidates) {
+            const candidateProbeUrl = assetUrlFor(`${build}/boxedwine.js`, candidate);
+            try {
+              const probe = await fetch(candidateProbeUrl, { method: "HEAD", cache: "no-store" });
+              if (!probe.ok) throw new Error(`HTTP ${probe.status}`);
+              assetRoot = candidate;
+              probeUrl = candidateProbeUrl;
+              found = true;
+              break;
+            } catch (err) {
+              lastProbeError = err;
+            }
+          }
+          if (!found) throw lastProbeError || new Error("asset probe failed");
+        } catch (err) {
+          renderDisplayMessage({
+            type: "html",
+            content: `
+              <section class="wine-status">
+                <div class="wine-status-header">
+                  <span class="wine-status-badge">Runtime missing</span>
+                  <h2>${escapeHtml(process.title)}</h2>
+                  <p>Wine is installed, but the BoxedWine browser assets could not be reached.</p>
+                </div>
+                <dl class="wine-status-meta">
+                  <div><dt>Command</dt><dd>${escapeHtml(process.command)}</dd></div>
+                  <div><dt>Asset roots</dt><dd>${escapeHtml(assetRootCandidates.join("\n"))}</dd></div>
+                </dl>
+                <pre>${escapeHtml(`wine: could not load ${probeUrl}\nwine: ${err?.message || err}\n`)}</pre>
+              </section>
+            `,
+          });
+          updateDisplayStatus(`Wine runtime missing: ${process.title}`);
+          return {
+            found: true,
+            code: 1,
+            stdout: `[DISPLAY] Wine runtime status opened for ${command}\n`,
+            stderr: `wine: BoxedWine assets are not reachable from ${assetRootCandidates.join(", ")}\n`,
+          };
+        }
+
+        const preferredResolution = selectedDisplayResolution();
+        const canvasWidth = process.fullscreen ? Math.max(preferredResolution.width, window.innerWidth || preferredResolution.width) : preferredResolution.width;
+        const canvasHeight = process.fullscreen ? Math.max(preferredResolution.height, window.innerHeight || preferredResolution.height) : preferredResolution.height;
+        const shellUrl = await makeBlobAssetUrl(assetUrlFor(`${build}/boxedwine-shell.js`), "text/javascript");
+        const loaderUrl = await makeBlobAssetUrl(assetUrlFor(`${build}/boxedwine.js`), "text/javascript");
+        const cssUrl = await makeBlobAssetUrl(assetUrlFor(`${build}/boxedwine.css`), "text/css");
+        const wasmUrl = await makeBlobAssetUrl(assetUrlFor(`${build}/boxedwine.wasm`), "application/wasm");
+        const rootZipUrl = await makeBlobAssetUrl(assetUrlFor(String(manifest?.wineRoot || "Wine11/boxedwine.zip")), "application/zip");
+        let appZipUrl = "";
+        let appProgram = process.command === "explorer" ? "" : process.command;
+        if (message.appFile?.bytes && message.appFile?.filename) {
+          const zip = new JSZip();
+          zip.file(String(message.appFile.filename || "app.exe"), new Uint8Array(message.appFile.bytes));
+          appProgram = String(message.appFile.filename || "app.exe");
+          const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+          appZipUrl = URL.createObjectURL(blob);
+          appModeState.blobUrls.push(appZipUrl);
+        }
+        const quoteParam = (value) => `%22${String(value || "").replace(/ /g, "%20")}%22`;
+        const urlParams = [
+          "auto=true",
+          process.command === "explorer" ? "desktop=true" : "desktop=false",
+          "sound=false",
+          "disableHideCursor=true",
+          `resolution=${canvasWidth}x${canvasHeight}`,
+          appProgram ? `p=${quoteParam(appProgram)}` : "",
+          appZipUrl ? "app=app.zip" : "",
+        ].filter(Boolean).join("&");
+        const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>EdgeTerm Wine - ${escapeHtml(process.title)}</title>
+  <link rel="stylesheet" href="${cssUrl}">
+  <style>
+    html, body, #dropzone, .emscripten_border { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050505; }
+    #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #dbeafe; background: #020617; z-index: 5; font: 14px system-ui, sans-serif; }
+    #canvas { width: 100%; height: 100%; display: block; outline: none; }
+    .emscripten, .emscripten_border { padding: 0; border: 0; }
+    #output, #startbtn, #uploadbtn, #downloadbtn, #sound-checkbox, #pointerLock, #showConsole, #resize, input[type=button], hr { display: none !important; }
+  </style>
+</head>
+<body>
+  <div id="loading"><div><div id="status">Preparing BoxedWine...</div><progress value="0" max="100" id="progress"></progress><figure id="spinner"></figure></div></div>
+  <button id="startbtn" style="display:none" onclick="start()">Start</button>
+  <button id="uploadbtn" style="display:none"></button>
+  <button id="downloadbtn" style="display:none"></button>
+  <span id="sound-checkbox" style="display:none"><input type="checkbox" id="soundToggle"></span>
+  <input type="checkbox" id="pointerLock">
+  <input type="checkbox" id="showConsole">
+  <input type="checkbox" id="resize">
+  <input type="button" value="Fullscreen">
+  <a style="display:none" id="modalLink" href="#openModal">Open</a>
+  <a style="display:none" id="modalLinkExe" href="#openModalExe">Open</a>
+  <input style="display:none" id="upload" type="file" multiple>
+  <div id="dropzone"><div class="emscripten_border"><canvas class="emscripten" id="canvas" width="${canvasWidth}" height="${canvasHeight}" oncontextmenu="event.preventDefault()"></canvas></div></div>
+  <textarea id="output"></textarea>
+  <div id="openModal" class="modalDialog"><div><a href="#close" class="close">X</a><input id="selectedItem"><div id="tree"></div><h3 id="loadStatus"></h3></div></div>
+  <div id="openModalExe" class="modalDialog"><div><a id="openModalExeClick" href="#close" class="close">X</a><div id="message"></div><div id="items"></div></div></div>
+  <script src="${shellUrl}"></script>
+  <script>
+    window.addEventListener("error", function(event) {
+      parent.postMessage({ type: "edgeterm-wine-log", stream: "stderr", text: String(event.message || "BoxedWine script error") }, "*");
+    });
+    window.addEventListener("unhandledrejection", function(event) {
+      parent.postMessage({ type: "edgeterm-wine-log", stream: "stderr", text: String((event.reason && event.reason.message) || event.reason || "BoxedWine promise rejection") }, "*");
+    });
+    var filename = "";
+    Config.urlParams = ${JSON.stringify(urlParams)};
+    Config.storageMode = STORAGE_MEMORY;
+    Config.showUploadDownload = false;
+    Config.locateRootBaseUrl = "";
+    const __edgeTermWineAssets = {
+      "boxedwine.wasm": ${JSON.stringify(wasmUrl)},
+      "boxedwine.zip": ${JSON.stringify(rootZipUrl)},
+      "app.zip": ${JSON.stringify(appZipUrl)}
+    };
+    const __edgeTermFetch = window.fetch.bind(window);
+    window.fetch = function(resource, init) {
+      const key = String(resource || "").split("/").pop();
+      if (__edgeTermWineAssets[key]) return __edgeTermFetch(__edgeTermWineAssets[key], init);
+      return __edgeTermFetch(resource, init);
+    };
+    Module.locateFile = function(path) {
+      const key = String(path || "").split("/").pop();
+      return __edgeTermWineAssets[key] || path;
+    };
+    Module.print = function(text) {
+      parent.postMessage({ type: "edgeterm-wine-log", stream: "stdout", text: String(text || "") }, "*");
+      console.log(text);
+    };
+    Module.printErr = function(text) {
+      parent.postMessage({ type: "edgeterm-wine-log", stream: "stderr", text: String(text || "") }, "*");
+      console.error(text);
+    };
+    const __edgeTermSetStatus = Module.setStatus;
+    Module.setStatus = function(text) {
+      __edgeTermSetStatus.call(Module, text);
+      parent.postMessage({ type: "edgeterm-wine-status", text: String(text || "") }, "*");
+      if (!text) document.getElementById("loading").style.display = "none";
+    };
+  </script>
+  <script async src="${loaderUrl}" onerror="parent.postMessage({ type: 'edgeterm-wine-log', stream: 'stderr', text: 'failed to load boxedwine.js' }, '*')"></script>
+</body>
+</html>`;
+        renderDisplayMessage({ type: "html", content: `<iframe class="wine-runtime-frame" sandbox="allow-scripts allow-same-origin allow-pointer-lock allow-downloads allow-forms" srcdoc="${escapeHtml(html)}"></iframe>` });
+        displayState.mode = "wine";
+        displayState.lastType = "wine";
+        displayState.wine = {
+          id: process.id,
+          command: process.command,
+          title: process.title,
+          prefix: process.prefix,
+          build,
+          threaded: build === "MultiThreaded",
+        };
+        updateDisplayStatus(`Wine: ${process.title} (${build})`);
+        if (process.fullscreen) setDisplayFullscreen(true);
+        const forcedMultiUnavailable = requestedThreading.includes("multi") && build !== "MultiThreaded";
+        return {
+          found: true,
+          code: forcedMultiUnavailable ? 1 : 0,
+          stdout: `[BOXEDWINE] Launching ${command} with ${build} + Wine11 build...\n[DISPLAY] Attached Wine window: ${process.title}\n`,
+          stderr: forcedMultiUnavailable
+            ? "wine: multi-threaded BoxedWine requires cross-origin isolation with SharedArrayBuffer. Use single-thread mode or COOP/COEP headers.\n"
+            : "",
+        };
+      }
+
+      function handleWorkerShellMessage(message) {
+        if (message.type === "stdout") {
+          const text = String(message.text || "").replaceAll("]]", "&rsqb;&rsqb;").replaceAll("[[", "&lsqb;&lsqb;");
+          if (text.trimEnd()) term.echo(text.trimEnd());
+          return;
+        }
+        if (message.type === "stderr") {
+          const text = String(message.text || "").trimEnd();
+          if (text) term.error(text);
+          return;
+        }
+        if (message.type === "boot") {
+          showBootStatus(message.message || "Starting worker shell...");
+          return;
+        }
+        if (message.type === "display") {
+          try {
+            renderDisplayMessage(message.message || { type: "switch" });
+          } catch (err) {
+            console.error("[DISPLAY] Worker display message failed:", err);
+          }
+          return;
+        }
+        if (message.type === "displayPixels") {
+          try {
+            const canvas = $id("displayCanvas");
+            if (!canvas) return;
+            const width = Number(message.width) || canvas.width || displayState.width;
+            const height = Number(message.height) || canvas.height || displayState.height;
+            if (canvas.width !== width || canvas.height !== height) setCanvasSize(width, height, "#000000");
+            setDisplayVisibility("canvas");
+            const bytes = new Uint8ClampedArray(message.buffer || new ArrayBuffer(0));
+            canvas.getContext("2d").putImageData(new ImageData(bytes, width, height), 0, 0);
+            displayState.mode = "canvas";
+            displayState.lastType = "pixels";
+            updateDisplayStatus(`Canvas ${canvas.width}x${canvas.height}`);
+          } catch (err) {
+            console.error("[DISPLAY] Worker pixel frame failed:", err);
+          }
+          return;
+        }
+        if (message.type === "inputRequest") {
+          term.read(message.prompt || "", (value) => {
+            workerShell?.postMessage({ type: "inputResponse", id: message.id, value: value ?? "" });
+          });
+          term.resume();
+          term.focus();
+          return;
+        }
+        if (message.type === "wineRun") {
+          sendWorkerBridgeResponse(message.id, () => runWorkerWineCommand(message));
+          return;
+        }
+        if (message.type === "edgeServeStart") {
+          sendWorkerBridgeResponse(message.id, () => runWorkerEdgeServeStart(message));
+          return;
+        }
+        if (message.type === "ready") {
+          workerShellReady = true;
+          setWorkerPrompt(message.cwd);
+          completeWorkerShellRequest({ ...message, id: 0 });
+          return;
+        }
+        if (message.type === "result" || message.type === "error" || message.type === "fsResult" || message.type === "fsError") {
+          completeWorkerShellRequest(message);
+        }
+      }
+
+      async function bootWorkerShell(bootStartedAt) {
+        markRuntimePhase("worker-shell-boot");
+        window.term = term;
+        workerShellReady = false;
+        workerShell = new Worker(`${assetUrl("pyodide-shell-worker.js")}?v=${EDGETERM_BOOT_BUNDLE_VERSION}`);
+        const readyPromise = new Promise((resolve, reject) => {
+          workerShellRequests.set(0, { resolve, reject });
+        });
+        workerShell.onmessage = (event) => handleWorkerShellMessage(event.data || {});
+        workerShell.onerror = (event) => {
+          const error = new Error(event.message || "Worker shell failed");
+          for (const request of workerShellRequests.values()) request.reject(error);
+          workerShellRequests.clear();
+        };
+        workerShell.postMessage({
+          type: "boot",
+          assetBase: ASSET_BASE || "/static/",
+          version: EDGETERM_BOOT_BUNDLE_VERSION,
+          user: activeUser(),
+          workspaceId: activeWorkspaceId,
+          displayInputSessionId,
+          users: activeWorkspace()?.users || ["user"],
+        });
+        await readyPromise;
+        console.info(`[BOOT] worker shell ready +${Math.round(performance.now() - bootStartedAt)}ms`);
+      }
+
+      async function runWorkerCommand(command) {
+        const line = command ?? "";
+        if (!line.trim()) return;
+        if (line.trim() === "exit") {
+          term.echo("Goodbye.");
+          return;
+        }
+        const { id, promise } = createWorkerShellRequest();
+        workerShell.postMessage({ type: "run", id, line });
+        const result = await promise;
+        setWorkerPrompt(result.cwd);
+      }
+
+      async function workerFs(op, payload = {}) {
+        if (!workerShell) throw new Error("Worker shell is not ready");
+        const { id, promise } = createWorkerShellRequest();
+        workerShell.postMessage({ type: "fs", id, op, payload });
+        const message = await promise;
+        return message.result;
+      }
+
+      async function workerFsTransfer(op, payload = {}, transfer = []) {
+        if (!workerShell) throw new Error("Worker shell is not ready");
+        const { id, promise } = createWorkerShellRequest();
+        workerShell.postMessage({ type: "fs", id, op, payload }, transfer);
+        const message = await promise;
+        return message.result;
+      }
+
+      async function workerFsStat(path) {
+        try {
+          return await workerFs("stat", { path: normalizePath(path || "/") });
+        } catch {
+          return { path: normalizePath(path || "/"), exists: false };
+        }
+      }
+
+      async function workerFsIsFile(path) {
+        const info = await workerFsStat(path);
+        return !!info.exists && !!info.isFile;
+      }
+
+      async function workerFsIsDir(path) {
+        const info = await workerFsStat(path);
+        return !!info.exists && !!info.isDir;
+      }
+
+      async function workerReadText(path) {
+        const result = await workerFs("readFile", { path: normalizePath(path || "/") });
+        if (!result.exists || result.isDir) throw new Error(`File not found: ${path}`);
+        return String(result.text || "");
+      }
+
+      async function workerReadBase64(path) {
+        const result = await workerFs("readFile", { path: normalizePath(path || "/"), encoding: "base64" });
+        if (!result.exists || result.isDir) throw new Error(`File not found: ${path}`);
+        return String(result.data || "");
+      }
+
+      async function responseFromWorkerFsFile(fsPath) {
+        const mime = mimeTypeForPath(fsPath);
+        if (isTextMimeType(mime)) {
+          return {
+            status: 200,
+            headers: { "content-type": mime, "x-edgeterm-fs-path": fsPath },
+            body: await workerReadText(fsPath),
+            bodyBase64: "",
+          };
+        }
+        return {
+          status: 200,
+          headers: { "content-type": mime, "x-edgeterm-fs-path": fsPath },
+          body: "",
+          bodyBase64: await workerReadBase64(fsPath),
+        };
+      }
+
+      async function dispatchWorkerStaticRequest(url, options, config, extra = {}) {
+        const { path } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
+        const root = normalizePath(config.staticRoot || "/home/user/public");
+        let fsPath = path === "/" ? resolveStaticEntrypoint(config) : resolveWorkspaceDirectory(root, `.${path}`);
+        const info = await workerFsStat(fsPath);
+        if (info.exists && info.isDir) fsPath = resolveWorkspacePath(fsPath, config.static.indexFile || "index.html");
+        if (!(await workerFsStat(fsPath)).exists) {
+          if (path.length > 1 && path.endsWith("/")) {
+            return await dispatchWorkerStaticRequest(path.slice(0, -1), options, config, extra);
+          }
+          return extra.silentNotFound
+            ? { status: 404, headers: { "content-type": "text/plain; charset=utf-8" }, body: "Not found", bodyBase64: "" }
+            : {
+                status: 404,
+                headers: { "content-type": "text/html; charset=utf-8" },
+                body: `<h1>404 Not Found</h1><p>No static app file for <code>${encodeHtml(path)}</code>.</p>`,
+                bodyBase64: "",
+              };
+        }
+        return await responseFromWorkerFsFile(fsPath);
+      }
+
+      async function resolvePhpRequestTargetWorker(instance, requestPath = "/") {
+        const routePath = normalizePath(requestPath || "/");
+        const documentRoot = normalizePath(instance.target || instance.workingDirectory || `/home/${activeUser()}`);
+        const entryScript = instance.entryScript ? normalizePath(instance.entryScript) : "";
+        if (entryScript) {
+          return {
+            kind: "php",
+            documentRoot,
+            scriptFsPath: entryScript,
+            scriptName: `/${entryScript.split("/").filter(Boolean).pop()}`,
+            pathInfo: routePath === "/" ? "" : routePath,
+            requestPath: routePath,
+          };
+        }
+
+        const candidate = routePath === "/" ? documentRoot : resolveWorkspaceDirectory(documentRoot, `.${routePath}`);
+        if (await workerFsIsFile(candidate)) {
+          if (/\.php$/i.test(candidate)) {
+            return {
+              kind: "php",
+              documentRoot,
+              scriptFsPath: candidate,
+              scriptName: routePath,
+              pathInfo: "",
+              requestPath: routePath,
+            };
+          }
+          return { kind: "static", documentRoot, fsPath: candidate, requestPath: routePath };
+        }
+
+        if (await workerFsIsDir(candidate)) {
+          const phpIndex = resolveWorkspaceDirectory(candidate, "index.php");
+          if (await workerFsIsFile(phpIndex)) {
+            let scriptName = routePath;
+            if (!scriptName.endsWith("/")) scriptName += "/";
+            scriptName += "index.php";
+            return {
+              kind: "php",
+              documentRoot,
+              scriptFsPath: phpIndex,
+              scriptName,
+              pathInfo: "",
+              requestPath: routePath,
+            };
+          }
+          const htmlIndex = resolveWorkspaceDirectory(candidate, "index.html");
+          if (await workerFsIsFile(htmlIndex)) return { kind: "static", documentRoot, fsPath: htmlIndex, requestPath: routePath };
+        }
+
+        const parts = routePath.split("/").filter(Boolean);
+        for (let index = parts.length; index >= 1; index -= 1) {
+          const scriptPath = `/${parts.slice(0, index).join("/")}`;
+          if (!scriptPath.endsWith(".php")) continue;
+          const scriptFsPath = resolveWorkspaceDirectory(documentRoot, `.${scriptPath}`);
+          if (!(await workerFsIsFile(scriptFsPath))) continue;
+          const remainder = parts.slice(index).join("/");
+          return {
+            kind: "php",
+            documentRoot,
+            scriptFsPath,
+            scriptName: scriptPath,
+            pathInfo: remainder ? `/${remainder}` : "",
+            requestPath: routePath,
+          };
+        }
+
+        const frontController = resolveWorkspacePath(documentRoot, "index.php");
+        if (await workerFsIsFile(frontController)) {
+          return {
+            kind: "php",
+            documentRoot,
+            scriptFsPath: frontController,
+            scriptName: "/index.php",
+            pathInfo: routePath === "/" ? "" : routePath,
+            requestPath: routePath,
+          };
+        }
+
+        return null;
+      }
+
+      function configureWorkerRuntimeBridges() {
+        window.EdgeTermWasmCLI = {
+          async runCommandJSON(command, argsJson = "[]", stdinText = "", cwd = "/", envJson = "{}") {
+            const result = await workerFs("wasmRunCommandJSON", { command, argsJson, stdinText, cwd, envJson });
+            return String(result.text || "{}");
+          },
+          runCommandText(command, argsJson, stdinText, cwd, envJson) {
+            return this.runCommandJSON(command, argsJson, stdinText, cwd, envJson);
+          },
+        };
+        window.EdgeTermServe ||= { instances: new Map() };
+        window.EdgeTermServe.instances ||= new Map();
+        window.EdgeTermServe.start = async (mode, target, workingDirectory = "") => {
+          return await runWorkerEdgeServeStart({ mode, target, cwd: workingDirectory || `/home/${activeUser()}` });
+        };
+      }
+
+      async function runWorkerEdgeServeStart(message = {}) {
+        const cwd = normalizePath(message.cwd || message.workingDirectory || `/home/${activeUser()}`);
+        const normalizedMode = String(message.mode || "flask").trim().toLowerCase();
+        const spec = String(message.target || "").trim();
+        const bridgedFromWorker = message.id !== undefined && message.id !== null;
+        if (!spec) throw new Error("Missing app target. Use module:object, a PHP file, or a static directory.");
+
+        if (normalizeEdgeServeRouteMode(normalizedMode) === "php") {
+          const targetPath = resolveWorkspaceDirectory(cwd, spec);
+          const isPhpFile = /\.php$/i.test(targetPath) && (bridgedFromWorker || (await workerFsIsFile(targetPath)));
+          const isDir = bridgedFromWorker ? !isPhpFile : await workerFsIsDir(targetPath);
+          if (!isPhpFile && !isDir) throw new Error(`PHP app target not found: ${targetPath}`);
+          const documentRoot = isPhpFile ? normalizePath(targetPath.split("/").slice(0, -1).join("/") || "/") : targetPath;
+          const identity = stableEdgeServeIdentity("php", spec, cwd);
+          const instance = {
+            id: identity.instanceId,
+            mode: "php",
+            requestedMode: "php",
+            target: documentRoot,
+            entryScript: isPhpFile ? targetPath : "",
+            routePrefix: identity.routePrefix,
+            workingDirectory: cwd,
+            label: spec,
+          };
+          window.EdgeTermServe ||= { instances: new Map() };
+          window.EdgeTermServe.instances ||= new Map();
+          window.EdgeTermServe.instances.set(instance.id, instance);
+          const serveConfig = normalizeAppModeConfig({
+            enabled: true,
+            runtime: "php",
+            entrypoint: isPhpFile ? targetPath : "",
+            workingDirectory: cwd,
+            staticRoot: documentRoot,
+            fullscreen: false,
+            autoStart: false,
+            preserveStateOnExit: false,
+            showLoadingOverlay: false,
+            python: {
+              framework: "edgeserve",
+              appSpec: spec,
+              instanceId: instance.id,
+              routePrefix: instance.routePrefix,
+              serveMode: "php",
+            },
+            ui: {
+              hideWorkspaceChrome: false,
+              allowDebugTerminal: true,
+            },
+          });
+          appModeState.config = serveConfig;
+          appModeState.renderTarget = "display";
+          createOrActivateDisplayBrowserTab(instance, `${instance.routePrefix}/`);
+          syncDisplayBrowserButtons();
+          const launch = () => enterAppMode(serveConfig, { initialUrl: `${instance.routePrefix}/`, forceReload: false, throwOnError: true });
+          if (bridgedFromWorker) setTimeout(() => launch().catch((err) => showAppModeError("App Mode startup failed.", formatInitError(err))), 0);
+          else await launch();
+          return instance;
+        }
+
+        if (normalizedMode === "static") {
+          const targetPath = resolveWorkspaceDirectory(cwd, spec);
+          const targetIsFile = bridgedFromWorker ? /\.[A-Za-z0-9]+$/.test(targetPath.split("/").pop() || "") : await workerFsIsFile(targetPath);
+          if (!bridgedFromWorker && !(await workerFsIsDir(targetPath)) && !targetIsFile) throw new Error(`Static app target not found: ${targetPath}`);
+          const staticRoot = targetIsFile ? normalizePath(targetPath.split("/").slice(0, -1).join("/") || "/") : targetPath;
+          const entrypoint = targetIsFile ? targetPath : resolveWorkspacePath(staticRoot, "index.html");
+          const serveConfig = normalizeAppModeConfig({
+            enabled: true,
+            runtime: "static",
+            entrypoint,
+            staticRoot,
+            workingDirectory: cwd,
+            fullscreen: false,
+            autoStart: false,
+            preserveStateOnExit: false,
+            showLoadingOverlay: false,
+            ui: {
+              hideWorkspaceChrome: false,
+              allowDebugTerminal: true,
+              showAddressBar: true,
+            },
+          });
+          appModeState.config = serveConfig;
+          appModeState.renderTarget = "display";
+          const launch = () => enterAppMode(serveConfig, { forceReload: false, throwOnError: true });
+          if (bridgedFromWorker) setTimeout(() => launch().catch((err) => showAppModeError("App Mode startup failed.", formatInitError(err))), 0);
+          else await launch();
+          return { id: stableEdgeServeIdentity("static", spec, cwd).instanceId, mode: "static", target: staticRoot, routePrefix: "/", workingDirectory: cwd, label: spec };
+        }
+
+        const routeMode = normalizeEdgeServeRouteMode(normalizedMode);
+        if (["wsgi", "django", "asgi"].includes(routeMode)) {
+          const identity = stableEdgeServeIdentity(normalizedMode, spec, cwd);
+          const instance = await workerFs("pythonAppCreate", {
+            mode: normalizedMode,
+            target: spec,
+            cwd,
+            instanceId: identity.instanceId,
+            routePrefix: identity.routePrefix,
+          });
+          instance.id ||= identity.instanceId;
+          instance.mode ||= routeMode;
+          instance.requestedMode ||= normalizedMode;
+          instance.routePrefix ||= identity.routePrefix;
+          instance.workingDirectory ||= cwd;
+          instance.label ||= spec;
+          window.EdgeTermServe ||= { instances: new Map() };
+          window.EdgeTermServe.instances ||= new Map();
+          window.EdgeTermServe.instances.set(instance.id, instance);
+          const serveConfig = normalizeAppModeConfig({
+            enabled: true,
+            runtime: "python",
+            entrypoint: "",
+            workingDirectory: cwd,
+            staticRoot: cwd,
+            fullscreen: false,
+            autoStart: false,
+            preserveStateOnExit: false,
+            showLoadingOverlay: false,
+            python: {
+              framework: "edgeserve",
+              appSpec: spec,
+              instanceId: instance.id,
+              routePrefix: instance.routePrefix,
+              serveMode: routeMode,
+            },
+            ui: {
+              hideWorkspaceChrome: false,
+              allowDebugTerminal: true,
+            },
+          });
+          appModeState.config = serveConfig;
+          appModeState.renderTarget = "display";
+          createOrActivateDisplayBrowserTab(instance, `${instance.routePrefix}/`);
+          syncDisplayBrowserButtons();
+          const launch = () => enterAppMode(serveConfig, { initialUrl: `${instance.routePrefix}/`, forceReload: false, throwOnError: true });
+          if (bridgedFromWorker) setTimeout(() => launch().catch((err) => showAppModeError("App Mode startup failed.", formatInitError(err))), 0);
+          else await launch();
+          return instance;
+        }
+
+        throw new Error(`${normalizedMode} EdgeServe is not supported yet.`);
+      }
+
+      function base64ToBytes(data = "") {
+        const binary = atob(String(data || ""));
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+        return bytes;
+      }
+
+      async function ensureWorkerAppModeConfigFile() {
+        if (!(await workerFsStat("/etc/appmode/config.json")).exists) {
+          await workerFs("writeFile", {
+            path: "/etc/appmode/config.json",
+            data: JSON.stringify(defaultAppModeConfig(), null, 2),
+          });
+        }
+      }
+
+      async function saveWorkerAppModeConfig(config) {
+        const normalized = normalizeAppModeConfig(config);
+        await workerFs("writeFile", {
+          path: "/etc/appmode/config.json",
+          data: JSON.stringify(normalized, null, 2),
+        });
+        appModeState.config = normalized;
+        return normalized;
+      }
+
+      async function createWorkerWorkspace() {
+        const name = await askText("New Workspace", "Workspace name", "New Workspace", { confirmLabel: "Create" });
+        if (!name) return;
+        const id = `ws-${Date.now()}`;
+        workspaces.push({ id, name, createdAt: Date.now(), rootfsVersion: DEFAULT_ROOTFS_VERSION, users: ["user"], userName: "user", storageType: "browser-storage" });
+        activeWorkspaceId = id;
+        saveWorkspaceRegistry();
+        location.reload();
+      }
+
+      async function deleteActiveWorkerWorkspace() {
+        if (workspaces.length <= 1) return showNotice("Keep at least one workspace");
+        const workspace = activeWorkspace();
+        if (!(await askConfirm("Delete Workspace", `Delete workspace "${workspace.name}"?`, { confirmLabel: "Delete", danger: true }))) return;
+        workspaces = workspaces.filter((item) => item.id !== workspace.id);
+        activeWorkspaceId = workspaces[0]?.id || "";
+        saveWorkspaceRegistry();
+        location.reload();
+      }
+
+      async function importWorkerRootfs(file) {
+        if (!file) return;
+        await withBusy("Importing rootfs...", async () => {
+          const zip = await JSZip.loadAsync(file);
+          const entries = Object.values(zip.files).filter((entry) => !entry.dir);
+          let index = 0;
+          for (const entry of entries) {
+            index += 1;
+            const normalized = String(entry.name || "").replaceAll("\\", "/").replace(/^\/+/, "");
+            if (!normalized || normalized.includes("..")) continue;
+            updateLoadingProgress({
+              current: index,
+              total: entries.length,
+              phase: "Importing rootfs...",
+              detail: normalized,
+            });
+            const bytes = await entry.async("uint8array");
+            await workerFs("writeFile", { path: `/${normalized}`, data: bytesToBase64(bytes), encoding: "base64" });
+          }
+          const workspace = activeWorkspace();
+          if (workspace) {
+            workspace.rootfsVersion = "custom";
+            workspace.updatedAt = Date.now();
+            saveWorkspaceRegistry();
+            renderWorkspaces();
+          }
+        });
+        hideProgressNotice();
+        showNotice("Imported rootfs");
+        await refreshWorkerFiles(currentPath);
+      }
+
+      async function importZipIntoWorkerWorkspace(id, file) {
+        const zip = await JSZip.loadAsync(await file.arrayBuffer());
+        const archivePrefix = detectWorkspaceArchive(zip);
+        const entries = collectZipEntries(zip, archivePrefix || "");
+        const fullWorkspace = archivePrefix !== null;
+        const total = entries.length;
+        const batchSize = 24;
+        let completed = 0;
+        let users = ["user"];
+        if (!total) throw new Error("Backup archive does not contain files to restore");
+        for (let start = 0; start < total; start += batchSize) {
+          const batch = [];
+          const transfers = [];
+          for (const { relative, entry } of entries.slice(start, start + batchSize)) {
+            if (entry.dir) {
+              batch.push({ relative, dir: true });
+              continue;
+            }
+            const bytes = await entry.async("uint8array");
+            const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+            transfers.push(buffer);
+            batch.push({ relative, dir: false, data: buffer });
+          }
+          const result = await workerFsTransfer("importWorkspaceEntries", {
+            workspaceId: id,
+            mode: fullWorkspace ? "workspace" : "rootfs",
+            clear: start === 0,
+            entries: batch,
+          }, transfers);
+          users = Array.isArray(result.users) && result.users.length ? result.users : users;
+          completed = Math.min(total, start + batch.length);
+          updateLoadingProgress({
+            current: completed,
+            total,
+            phase: fullWorkspace ? "Restoring workspace files..." : "Importing rootfs...",
+            detail: `${completed} of ${total} items`,
+          });
+          await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+        }
+        return { fullWorkspace, users };
+      }
+
+      async function createWorkerWorkspaceFromZip(name, file, options = {}) {
+        let createdId = "";
+        await withBusy(file ? "Importing workspace..." : "Creating workspace...", async () => {
+          const id = options.workspaceId || `ws-${Date.now()}`;
+          createdId = id;
+          let workspace = workspaces.find((item) => item.id === id);
+          if (!workspace) {
+            workspace = { id, name, createdAt: Date.now(), rootfsVersion: file ? "custom" : DEFAULT_ROOTFS_VERSION, users: ["user"], userName: "user", storageType: "browser-storage" };
+            workspaces.push(workspace);
+          } else {
+            workspace.name = name;
+            workspace.updatedAt = Date.now();
+          }
+          activeWorkspaceId = id;
+          if (file) {
+            const result = await importZipIntoWorkerWorkspace(id, file);
+            workspace.rootfsVersion = "custom";
+            workspace.users = result.users;
+            workspace.userName = workspace.users.includes("user") ? "user" : workspace.users[0];
+          } else {
+            await workerFs("switchWorkspace", { workspaceId: id, users: workspace.users || ["user"], clear: false });
+          }
+          saveWorkspaceRegistry();
+          renderWorkspaces();
+          setWorkerPrompt(`/home/${activeUser()}`);
+          await refreshWorkerFiles(`/home/${activeUser()}`);
+          syncShareWritebackState();
+        });
+        return createdId;
+      }
+
+      async function uploadWorkerFiles(files) {
+        if (!Array.isArray(files) || files.length === 0) return;
+        for (const file of files) {
+          const target = normalizePath(`${currentPath === "/" ? "" : currentPath}/${file.name}`);
+          await workerFs("writeFile", { path: target, data: bytesToBase64(new Uint8Array(await file.arrayBuffer())), encoding: "base64" });
+        }
+        await refreshWorkerFiles(currentPath);
+        showNotice(files.length === 1 ? `Uploaded ${files[0].name}` : `Uploaded ${files.length} files`);
+      }
+
+      async function addWorkerPathToZip(zip, sourcePath, zipPath) {
+        const info = await workerFsStat(sourcePath);
+        if (!info.exists) return;
+        if (info.isDir) {
+          const folder = zip.folder(zipPath);
+          const list = await workerFs("list", { path: sourcePath });
+          for (const entry of list.entries || []) await addWorkerPathToZip(folder, entry.path, entry.name);
+          return;
+        }
+        zip.file(zipPath, base64ToBytes(await workerReadBase64(sourcePath)));
+      }
+
+      async function downloadWorkerSelectedPaths(paths) {
+        const items = Array.from(paths || []).filter(Boolean);
+        if (!items.length) return;
+        if (items.length === 1 && (await workerFsIsFile(items[0]))) {
+          const blob = new Blob([base64ToBytes(await workerReadBase64(items[0]))], { type: mimeTypeForPath(items[0]) });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = items[0].split("/").filter(Boolean).pop() || "download";
+          link.click();
+          URL.revokeObjectURL(url);
+          return;
+        }
+        const zip = new JSZip();
+        for (const path of items) await addWorkerPathToZip(zip, path, path.split("/").filter(Boolean).pop() || "root");
+        const blob = await zip.generateAsync({ type: "blob" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "edgeterm-selection.zip";
+        link.click();
+        URL.revokeObjectURL(url);
+      }
+
+      async function exportActiveWorkerWorkspace() {
+        const workspace = activeWorkspace();
+        const zip = new JSZip();
+        const sourcePath = `/workspace-store/${activeWorkspaceId}`;
+        if ((await workerFsStat(sourcePath)).exists) {
+          await addWorkerPathToZip(zip, sourcePath, safeName(workspace?.name || "workspace"));
+        } else {
+          await addWorkerPathToZip(zip, `/home/${activeUser()}`, "home");
+          await addWorkerPathToZip(zip, "/packages", "packages");
+          await addWorkerPathToZip(zip, "/var/lib/pkg", "var/lib/pkg");
+          await addWorkerPathToZip(zip, "/var/cache/pkg", "var/cache/pkg");
+          await addWorkerPathToZip(zip, "/etc/appmode", "etc/appmode");
+        }
+        const blob = await zip.generateAsync({ type: "blob" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `${safeName(workspace?.name || "workspace")}.workspace.zip`;
+        link.click();
+        URL.revokeObjectURL(url);
+      }
+
+      async function resetWorkerEnvironment() {
+        const confirmed = await askConfirm(
+          "Reset Environment",
+          "This permanently deletes local EdgeTerm workspace entries and browser databases.",
+          { confirmLabel: "Reset", danger: true }
+        );
+        if (!confirmed) return;
+        for (const key of Object.keys(localStorage)) {
+          if (key.startsWith("edgeterm.")) localStorage.removeItem(key);
+        }
+        try {
+          const databases = typeof indexedDB.databases === "function" ? await indexedDB.databases() : [];
+          await Promise.all(
+            databases
+              .map((db) => db?.name || "")
+              .filter((name) => /edgeterm|EM_FS|workspace-store|FILE_DATA/i.test(name))
+              .map((name) => new Promise((resolve) => {
+                const req = indexedDB.deleteDatabase(name);
+                req.onsuccess = req.onerror = req.onblocked = () => resolve();
+              }))
+          );
+        } catch (err) {
+          console.warn("[RESET] IndexedDB cleanup skipped:", err);
+        }
+        location.reload();
+      }
+
+      async function readLocalDirectoryIntoWorker(handle, targetRoot) {
+        for await (const [name, child] of handle.entries()) {
+          if (name === "." || name === "..") continue;
+          const target = normalizePath(`${targetRoot}/${name}`);
+          if (child.kind === "directory") {
+            await workerFs("mkdir", { path: target });
+            await readLocalDirectoryIntoWorker(child, target);
+          } else {
+            const file = await child.getFile();
+            await workerFs("writeFile", { path: target, data: bytesToBase64(new Uint8Array(await file.arrayBuffer())), encoding: "base64" });
+          }
+        }
+      }
+
+      async function restoreWorkerWorkspaceFromLocalDirectory() {
+        if (!supportsLocalDirectoryStorage()) return showNotice("Local directory restore needs a browser with File System Access API");
+        const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+        if (!(await requestDirectoryPermission(handle, true))) return showNotice("Directory permission was not granted");
+        await withBusy("Restoring local directory workspace...", async () => {
+          await readLocalDirectoryIntoWorker(handle, `/home/${activeUser()}`);
+        });
+        await refreshWorkerFiles(`/home/${activeUser()}`);
+        showNotice("Restored local directory into home");
+      }
+
+      async function refreshWorkerFiles(path = currentPath) {
+        currentPath = normalizePath(path || `/home/${activeUser()}`);
+        clearSelection();
+        $id("filePath").value = currentPath;
+        const list = $id("fileList");
+        list.textContent = "Loading...";
+        hideContextMenu();
+        try {
+          const result = await workerFs("list", { path: currentPath });
+          list.textContent = "";
+          if (!result.exists) {
+            list.textContent = "Path not found.";
+            return;
+          }
+          if (!result.isDir) {
+            list.textContent = "Path is not a folder.";
+            return;
+          }
+          const fragment = document.createDocumentFragment();
+          for (const entry of result.entries || []) {
+            const row = document.createElement("div");
+            row.className = "file-row";
+            row.dataset.path = entry.path;
+            row.innerHTML = `
+              <input type="checkbox" class="file-check" aria-label="Select ${entry.name}" />
+              <div class="file-icon ${entry.isDir ? "dir" : "file"}"><i data-lucide="${entry.isDir ? "folder" : "file-code"}"></i></div>
+              <div class="file-name"></div>
+              <div class="file-muted">${entry.isDir ? "" : formatBytes(entry.size || 0)}</div>
+              <div class="file-muted">${new Date(entry.mtime || Date.now()).toLocaleString()}</div>
+            `;
+            row.querySelector(".file-name").textContent = entry.name;
+            const checkbox = row.querySelector(".file-check");
+            checkbox.addEventListener("click", (event) => {
+              event.stopPropagation();
+              if (checkbox.checked) selectedPaths.add(entry.path);
+              else selectedPaths.delete(entry.path);
+              selectedPath = entry.path;
+              syncRowSelectionUI();
+            });
+            row.addEventListener("click", () => {
+              if (suppressFileClick) return;
+              selectedPaths.clear();
+              selectedPaths.add(entry.path);
+              setPrimarySelection(entry.path);
+            });
+            row.addEventListener("dblclick", () => {
+              if (entry.isDir) void refreshWorkerFiles(entry.path);
+              else void openWorkerEditor(entry.path);
+            });
+            fragment.appendChild(row);
+          }
+          list.appendChild(fragment);
+          window.lucide?.createIcons({ attrs: { "stroke-width": 1.8 }, root: list });
+        } catch (err) {
+          list.textContent = `Failed to load files: ${err.message || err}`;
+        }
+      }
+
+      async function createWorkerFolderInCurrentPath() {
+        const name = await askText("New Folder", "Folder name", "", { confirmLabel: "Create" });
+        if (!name) return;
+        const trimmed = String(name).trim();
+        if (!trimmed || trimmed.includes("/")) return showNotice("Folder name cannot be empty or contain /");
+        const target = normalizePath(`${currentPath === "/" ? "" : currentPath}/${trimmed}`);
+        await workerFs("mkdir", { path: target });
+        await refreshWorkerFiles(currentPath);
+        showNotice(`Created folder ${trimmed}`);
+      }
+
+      async function createWorkerFileInCurrentPath() {
+        const name = await askText("New File", "File name", "", { confirmLabel: "Create" });
+        if (!name) return;
+        const trimmed = String(name).trim();
+        if (!trimmed || trimmed.endsWith("/") || trimmed.includes("/")) return showNotice("File name cannot be empty or contain /");
+        const target = normalizePath(`${currentPath === "/" ? "" : currentPath}/${trimmed}`);
+        await workerFs("writeFile", { path: target, data: "" });
+        await refreshWorkerFiles(currentPath);
+        showNotice(`Created file ${trimmed}`);
+      }
+
+      async function openWorkerTerminalAtPath(path = currentPath) {
+        const target = normalizePath(path || currentPath || `/home/${activeUser()}`);
+        const result = await workerFs("chdir", { path: target });
+        setView("terminalView");
+        setWorkerPrompt(result.cwd || target);
+        term?.focus?.();
+      }
+
+      async function openWorkerEditor(path = $id("editorPath")?.value || defaultEditorPath(), options = {}) {
+        await setupMonaco();
+        const targetName = options.target === "split" ? "split" : "main";
+        const target = normalizePath(path || defaultEditorPath());
+        const result = await workerFs("readFile", { path: target });
+        if (result.isDir) return showNotice("Editor can only open files");
+        const content = result.exists ? result.text || "" : "";
+        editorPathFieldForTarget(targetName).value = target;
+        if (targetName === "split") splitEditorPath = target;
+        replaceEditorModel(targetName, createEditorModel(target, content));
+        if (options.switchView !== false) setView("editorView");
+        if (targetName === "main") setEditorStatus(result.exists ? `Opened ${target}` : `New file ${target}`);
+        else setSplitEditorStatus(result.exists ? `Opened ${target}` : `New file ${target}`);
+        const instance = editorInstanceForTarget(targetName);
+        instance?.focus?.();
+        instance?.layout?.();
+      }
+
+      async function saveWorkerEditor() {
+        await setupMonaco();
+        const path = normalizePath($id("editorPath").value || defaultEditorPath());
+        const content = editor?.getValue?.() || "";
+        await workerFs("writeFile", { path, data: content });
+        setEditorStatus(`Saved ${path}`);
+        showNotice(`Saved ${path}`);
+        if (document.querySelector("#filesView")?.classList.contains("active")) await refreshWorkerFiles(currentPath);
+      }
+
+      function renderWorkerUsers() {
+        const list = $id("userList");
+        if (!list) return;
+        const workspace = activeWorkspace();
+        list.textContent = "";
+        for (const user of workspace?.users || ["user"]) {
+          const row = document.createElement("div");
+          row.className = "user-row";
+          row.innerHTML = `
+            <div>
+              <strong></strong>
+              <div class="file-muted"></div>
+            </div>
+            <div class="flex gap-2">
+              <button class="icon-button switch-user"><i data-lucide="log-in"></i>Switch</button>
+            </div>
+          `;
+          row.querySelector("strong").textContent = user;
+          row.querySelector(".file-muted").textContent = user === activeUser() ? "Active" : `/home/${user}`;
+          row.querySelector(".switch-user").addEventListener("click", async () => {
+            if (!workspace.users.includes(user)) return;
+            workspace.userName = user;
+            saveWorkspaceRegistry();
+            await workerFs("ensureUser", { user });
+            await openWorkerTerminalAtPath(`/home/${user}`);
+            renderWorkerUsers();
+          });
+          list.appendChild(row);
+        }
+        $id("activeUserLabel").textContent = activeUser();
+        $id("activeHomeLabel").textContent = `/home/${activeUser()}`;
+        window.lucide?.createIcons();
+      }
+
+      function setupWorkerEvents() {
+        const on = (id, event, handler) => $id(id)?.addEventListener(event, handler);
+        bindCloudAuthEvents();
+        configureWorkerRuntimeBridges();
+        window.EdgeTermAppModeBridge = {
+          navigate: async (url, options = {}) => navigateAppMode(url, options),
+          fetch: async (request) => {
+            const response = await dispatchAppModeRequest(request.url, request);
+            rememberAppModeCookies(response);
+            return {
+              status: response.status,
+              headers: response.headers || {},
+              body: response.body || "",
+              bodyBase64: response.bodyBase64 || "",
+            };
+          },
+          openTab: async (url, options = {}) => {
+            await openEdgeBrowserNewTab(url || "/", options);
+            return true;
+          },
+          websocketOpen: async (request) => dispatchAppModeWebSocketOpen(request),
+          websocketSend: async (request) => dispatchAppModeWebSocketSend(request),
+          websocketPoll: async (request) => dispatchAppModeWebSocketPoll(request),
+          websocketClose: async (request) => dispatchAppModeWebSocketClose(request),
+          edgeServeLog: (payload = {}) => {
+            edgeServePhpLog(payload.event || "browser", payload);
+            return true;
+          },
+          syncSiteData: (payload = {}) => {
+            applySyncedSiteData(payload);
+            return true;
+          },
+          keydown: (payload) => {
+            const synthetic = {
+              key: payload?.key || "",
+              ctrlKey: !!payload?.ctrlKey,
+              altKey: !!payload?.altKey,
+              shiftKey: !!payload?.shiftKey,
+              metaKey: !!payload?.metaKey,
+            };
+            if (appModeState.active && matchesHotkey(synthetic, payload?.exitHotkey || appModeState.config?.exit?.hotkey || "Escape")) {
+              if (appModeState.renderTarget === "display") closeDisplayBrowserTab();
+              else void exitAppMode();
+              return true;
+            }
+            if (appModeState.active && payload?.allowDebugTerminal && matchesHotkey(synthetic, payload?.debugHotkey || appModeState.config?.ui?.debugTerminalHotkey || "Ctrl+`")) {
+              void exitAppMode({ force: true, view: "terminalView" });
+              showNotice("Returned to terminal from App Mode");
+              return true;
+            }
+            return false;
+          },
+        };
+        const workerSafeViews = new Set(["terminalView", "displayView", "browserView", "filesView", "editorView", "usersView", "settingsView", "cloudView", "adminView"]);
+        document.querySelectorAll(".tab").forEach((tab) =>
+          tab.addEventListener("click", () => {
+            const view = tab.dataset.view;
+            if (workerSafeViews.has(view)) {
+              setView(view);
+              if (view === "filesView") void refreshWorkerFiles(currentPath || `/home/${activeUser()}`);
+              if (view === "editorView") void openWorkerEditor($id("editorPath")?.value || defaultEditorPath());
+              if (view === "usersView") renderWorkerUsers();
+            }
+          })
+        );
+        on("toggleSidebar", "click", () => {
+          const app = $id("app");
+          if (window.innerWidth <= 820) setSidebarOpen(!app.classList.contains("sidebar-open"));
+          else setSidebarOpen(app.classList.contains("sidebar-collapsed"));
+        });
+        on("sidebarBackdrop", "click", () => setSidebarOpen(false));
+        on("toggleFullscreen", "click", () => {
+          setView("terminalView");
+          setFullscreen(!$id("terminalView").classList.contains("terminal-fullscreen"));
+        });
+        on("exitFullscreen", "click", () => setFullscreen(false));
+        on("toggleTheme", "click", toggleAppTheme);
+        on("settingsToggleTheme", "click", toggleAppTheme);
+        on("filePath", "keydown", (event) => {
+          if (event.key === "Enter") void refreshWorkerFiles($id("filePath").value);
+        });
+        on("fileList", "mousedown", startMarqueeSelection);
+        on("goUp", "click", () => refreshWorkerFiles(currentPath.split("/").slice(0, -1).join("/") || "/"));
+        on("refreshFiles", "click", () => refreshWorkerFiles($id("filePath").value));
+        on("newFolder", "click", createWorkerFolderInCurrentPath);
+        on("newFile", "click", createWorkerFileInCurrentPath);
+        on("openTerminalHere", "click", () => openWorkerTerminalAtPath(currentPath));
+        on("selectAllFiles", "click", toggleSelectAllFiles);
+        on("uploadFile", "click", () => $id("fileUploader")?.click());
+        on("fileUploader", "change", async (event) => {
+          await uploadWorkerFiles(Array.from(event.target.files || []));
+          event.target.value = "";
+        });
+        on("downloadFile", "click", async () => {
+          const paths = getSelectedPaths();
+          if (paths.length) await downloadWorkerSelectedPaths(paths);
+        });
+        on("editorPath", "keydown", (event) => {
+          if (event.key === "Enter") void openWorkerEditor($id("editorPath").value);
+        });
+        on("editorUploader", "change", async (event) => {
+          const file = event.target.files?.[0];
+          if (!file) return;
+          const dir = normalizePath($id("editorPath").value).split("/").slice(0, -1).join("/") || `/home/${activeUser()}`;
+          const target = normalizePath(`${dir}/${file.name}`);
+          await workerFs("writeFile", { path: target, data: bytesToBase64(new Uint8Array(await file.arrayBuffer())), encoding: "base64" });
+          await openWorkerEditor(target);
+          event.target.value = "";
+        });
+        on("createUser", "click", async () => {
+          const rawName = await askText("Create Workspace User", "Linux username", "developer", { confirmLabel: "Create" });
+          if (!rawName) return;
+          const user = safeName(rawName).toLowerCase();
+          if (!/^[a-z_][a-z0-9_-]*$/.test(user)) return showNotice("Use lowercase letters, numbers, dash, or underscore");
+          const workspace = activeWorkspace();
+          if (!workspace.users.includes(user)) workspace.users.push(user);
+          saveWorkspaceRegistry();
+          await workerFs("ensureUser", { user });
+          renderWorkerUsers();
+          showNotice(`Created user ${user}`);
+        });
+        on("newWorkspace", "click", createWorkerWorkspace);
+        on("deleteWorkspace", "click", deleteActiveWorkerWorkspace);
+        on("importRootfs", "click", () => $id("rootfsPicker")?.click());
+        on("settingsImportRootfs", "click", () => $id("rootfsPicker")?.click());
+        on("rootfsPicker", "change", async (event) => {
+          await importWorkerRootfs(event.target.files?.[0]);
+          event.target.value = "";
+        });
+        on("exportWorkspace", "click", exportActiveWorkerWorkspace);
+        on("settingsExportWorkspace", "click", exportActiveWorkerWorkspace);
+        on("settingsUpdateRootfs", "click", () => location.reload());
+        on("settingsResetEnvironment", "click", resetWorkerEnvironment);
+        on("restoreWorkspaceFromLocalDirectory", "click", restoreWorkerWorkspaceFromLocalDirectory);
+        on("chooseWorkspaceLocalDirectory", "click", restoreWorkerWorkspaceFromLocalDirectory);
+        on("saveAppModeConfig", "click", async () => {
+          await saveWorkerAppModeConfig(collectAppModeSettings());
+          showNotice("Saved App Mode config");
+        });
+        on("launchAppMode", "click", async () => {
+          const config = await saveWorkerAppModeConfig(collectAppModeSettings());
+          if (!config.enabled) return showNotice("Enable App Mode first");
+          await enterAppMode(config, { forceReload: true });
+        });
+        on("openAppModeConfigEditor", "click", async () => {
+          await ensureWorkerAppModeConfigFile();
+          await openWorkerEditor("/etc/appmode/config.json");
+        });
+        on("appModeErrorBack", "click", () => exitAppMode({ force: true }));
+        on("appModeErrorOpenConfig", "click", async () => {
+          await exitAppMode({ force: true });
+          await ensureWorkerAppModeConfigFile();
+          await openWorkerEditor("/etc/appmode/config.json");
+        });
+        on("appModeAddressBar", "submit", async (event) => {
+          event.preventDefault();
+          try {
+            await navigateAppMode($id("appModeUrlInput")?.value || "/", { updateHistory: false });
+          } catch (err) {
+            showNotice(`Navigation failed: ${err.message || err}`);
+          }
+        });
+        on("appModeRefreshButton", "click", async () => {
+          try {
+            await navigateAppMode(appModeState.currentPath || "/", { updateHistory: false, replaceDisplayHistory: true });
+          } catch (err) {
+            showNotice(`Refresh failed: ${err.message || err}`);
+          }
+        });
+        on("clearDisplay", "click", () => {
+          clearDisplaySurface();
+          showNotice("Display cleared");
+        });
+        on("displayResolution", "change", applyDisplayResolutionSelection);
+        on("focusDisplay", "click", () => {
+          $id("displayCanvas")?.focus();
+          showNotice("Display focused");
+        });
+        on("fullscreenDisplay", "click", () => {
+          setView("displayView");
+          setDisplayFullscreen(!displayState.fullscreen);
+        });
+        on("displayBrowserBar", "submit", async (event) => {
+          event.preventDefault();
+          if (!appModeState.active || appModeState.renderTarget !== "display") return showNotice("Start edgeserve first");
+          try {
+            await navigateAppMode(normalizeDisplayBrowserUrl($id("displayUrlInput").value), { updateHistory: false });
+          } catch (err) {
+            showNotice(`Preview failed: ${err.message || err}`);
+          }
+        });
+        on("displayBackButton", "click", async () => {
+          if (appModeState.browserHistoryIndex <= 0) return;
+          appModeState.browserHistoryIndex -= 1;
+          syncDisplayBrowserButtons();
+          const target = appModeState.browserHistory[appModeState.browserHistoryIndex] || "/";
+          await navigateAppMode(target, { updateHistory: false, skipDisplayHistory: true });
+        });
+        on("displayRefreshButton", "click", async () => {
+          if (!appModeState.active || appModeState.renderTarget !== "display") return;
+          const current = appModeState.browserHistory[appModeState.browserHistoryIndex] || normalizeDisplayBrowserUrl($id("displayUrlInput")?.value || "/");
+          await navigateAppMode(current, { updateHistory: false, skipDisplayHistory: true, replaceDisplayHistory: true });
+        });
+        on("focusBrowser", "click", () => {
+          ensureDisplayAppModeFrame()?.focus();
+          showNotice("Browser focused");
+        });
+        on("fullscreenBrowser", "click", () => {
+          setView("browserView");
+          void toggleDisplayViewportFullscreen();
+        });
+        document.addEventListener("fullscreenchange", () => {
+          setDisplayFullscreen(document.fullscreenElement === $id("displayView") || document.fullscreenElement === $id("browserView"));
+        });
       }
 
       function startTerminalBootLoader(label = "Starting EdgeTerm services") {
@@ -12123,6 +14815,11 @@ match.group(1) if match else path
       }
 
       async function bootShell() {
+        const shellBootStartedAt = performance.now();
+        const shellPhase = async (label) => {
+          console.info(`[BOOT] shell:${label} +${Math.round(performance.now() - shellBootStartedAt)}ms`);
+          await Promise.resolve();
+        };
         const readTerminalInput = async (prompt = "") => {
           return await new Promise((resolve) => {
             term.read(prompt ?? "", (value) => resolve(value ?? ""));
@@ -12133,14 +14830,20 @@ match.group(1) if match else path
 
         window.term = term;
         window.terminal = { input: readTerminalInput };
+        await shellPhase("terminal bridge ready");
+        const shellTrace = (tag) => console.info(`[BOOT-TRACE] shell:${tag} +${Math.round(performance.now() - shellBootStartedAt)}ms`);
+        shellTrace("pre-globals-set");
         pyodide.globals.set("input", pyodide.toPy(readTerminalInput));
         pyodide.globals.set("__edgeterm_user", activeUser());
         pyodide.globals.set("__edgeterm_rootfs_lib", `${activeRootfsPath()}/usr/lib`);
-        await pyodide.runPythonAsync(`
+        shellTrace("pre-runPython-env");
+        pyodide.runPython(`
 import os
 os.environ["EDGE_USER"] = __edgeterm_user
 os.environ["EDGETERM_ROOTFS_LIB"] = __edgeterm_rootfs_lib
 `);
+        shellTrace("post-runPython-env");
+        await shellPhase("environment ready");
 
         const rehydrateRuntimePackages = async () => {
           const browserReport = await rehydrateBrowserRuntimePackages();
@@ -12167,7 +14870,8 @@ json.dumps(await rehydrate_runtime_installs())
         };
         pyodide.setStdout({ batched: (s) => term.echo(s.replaceAll("]]", "&rsqb;&rsqb;").replaceAll("[[", "&lsqb;&lsqb;")) });
         pyodide.setStderr({ batched: (s) => term.error(s.trimEnd()) });
-        await pyodide.runPythonAsync(`
+        shellTrace("pre-runPython-stdio");
+        pyodide.runPython(`
 import os
 import sys
 
@@ -12184,6 +14888,8 @@ try:
 except Exception:
     pass
 `);
+        shellTrace("post-runPython-stdio");
+        await shellPhase("stdio ready");
 
         term.clear();
         setDisplayFullscreen(false);
@@ -12199,7 +14905,9 @@ except Exception:
           const shellBootstrapPath = `${activeRootfsPath()}/bin/shell.py`;
           const code = pyodide.FS.readFile(shellBootstrapPath, { encoding: "utf8" });
           bootLoader.phase("Starting shell service");
-          edgeTermShell = await pyodide.runPythonAsync(`
+          await shellPhase("starting shell service");
+          shellTrace("pre-runPython-shell-service");
+          edgeTermShell = pyodide.runPython(`
 ${code}
 import builtins
 import os
@@ -12248,29 +14956,43 @@ if "run_rc_local" not in globals():
 
 shell
 `);
-          bootLoader.phase("Running rc.local services");
-          await pyodide.runPythonAsync("await run_rc_local()");
+          shellTrace("post-runPython-shell-service");
+          await shellPhase("shell service ready");
           bootLoader.done("EdgeTerm services ready");
-          term.echo("Welcome to EdgeTerm!");
         } catch (err) {
           bootLoader.fail("EdgeTerm service startup failed");
           term.error("[INIT] " + formatInitError(err));
         }
         await updatePrompt();
-        rehydrateRuntimePackages()
-          .then((packageRehydrateReport) => {
-            if (packageRehydrateReport?.loaded?.length) {
-              term.echo(`[PACKAGES] Restored runtime support for ${packageRehydrateReport.loaded.join(", ")}`);
-            }
-            if (packageRehydrateReport?.failed?.length) {
-              term.error(
-                `[PACKAGES] Some installed packages still need network/package reload: ${packageRehydrateReport.failed
-                  .map((item) => item.name)
-                  .join(", ")}`
-              );
-            }
-          })
-          .catch((err) => console.warn("[PIP] Runtime rehydrate skipped:", err));
+        term.echo("Welcome to EdgeTerm!");
+        console.info(`[BOOT] shell:interactive +${Math.round(performance.now() - shellBootStartedAt)}ms`);
+        const startPackageRehydrate = () => {
+          markRuntimePhase("package-rehydrate-idle-callback");
+          console.info("[BOOT-TRACE] package rehydrate idle callback skipped");
+          // Avoid automatic async Python during boot. On some large Chrome
+          // profiles the first Pyodide async evaluation can randomly block
+          // the renderer for about a minute after refresh.
+          markRuntimePhase("root-idle");
+          return;
+          if (pageIsUnloading) return;
+          rehydrateRuntimePackages()
+            .then((packageRehydrateReport) => {
+              if (packageRehydrateReport?.loaded?.length) {
+                term.echo(`[PACKAGES] Restored runtime support for ${packageRehydrateReport.loaded.join(", ")}`);
+              }
+              if (packageRehydrateReport?.failed?.length) {
+                term.error(
+                  `[PACKAGES] Some installed packages still need network/package reload: ${packageRehydrateReport.failed
+                    .map((item) => item.name)
+                    .join(", ")}`
+                );
+              }
+            })
+            .catch((err) => console.warn("[PIP] Runtime rehydrate skipped:", err));
+        };
+        // Package rehydrate is disabled during boot, so do not schedule an
+        // idle callback that can give Chrome a chance to run expensive
+        // storage/cache work before the terminal is usable.
       }
 
       async function switchWorkspace(id, options = {}) {
@@ -12402,12 +15124,15 @@ shell
         await clearWorkspaceJournal(workspace.id);
         await syncfs(false);
         if (mountedWorkspaceId === workspace.id) {
-          try {
-            pyodide.FS.unmount(workspacePath(workspace.id));
-          } catch (err) {
-            console.warn("[PERSIST] Workspace unmount skipped:", err);
+          if (mountedWorkspaceStorageReal) {
+            try {
+              pyodide.FS.unmount(workspacePath(workspace.id));
+            } catch (err) {
+              console.warn("[PERSIST] Workspace unmount skipped:", err);
+            }
           }
           mountedWorkspaceId = "";
+          mountedWorkspaceStorageReal = false;
         }
         workspaces = workspaces.filter((item) => item.id !== workspace.id);
         activeWorkspaceId = workspaces[0].id;
@@ -12618,10 +15343,8 @@ shell
           showNotice(deleted ? "Deleted stored site data" : "Stored site data was already gone");
         });
         $id("deleteWorkspace").addEventListener("click", deleteActiveWorkspace);
+        bindCloudAuthEvents();
         if (CLOUD_ENABLED) {
-          $id("cloudLogin")?.addEventListener("click", () => loginOrRegister("login"));
-          $id("cloudRegister")?.addEventListener("click", () => loginOrRegister("register"));
-          $id("cloudLogout")?.addEventListener("click", logoutCloud);
           $id("syncToCloud")?.addEventListener("click", () => syncActiveWorkspaceToCloud());
           $id("shareWriteback")?.addEventListener("click", writeBackSharedWorkspace);
           $id("guestShareWriteback")?.addEventListener("click", writeBackSharedWorkspaceAsGuest);
@@ -12989,6 +15712,7 @@ shell
           clearDisplaySurface();
           showNotice("Display cleared");
         });
+        $id("displayResolution")?.addEventListener("change", applyDisplayResolutionSelection);
         $id("displayBrowserBar")?.addEventListener("submit", async (event) => {
           event.preventDefault();
           if (!appModeState.active || appModeState.renderTarget !== "display") {
@@ -13076,22 +15800,87 @@ shell
           }
         });
 
-        const syncOnExit = () => {
+        const stopWineFramesForUnload = () => {
           try {
-            if ((localStorage.getItem(AUTO_SYNC_KEY) || "off") === "exit") {
-              void syncActiveWorkspaceToCloud({ silent: true });
-            }
-            syncRootOverlayToWorkspace();
-            syncHomeToWorkspace();
+            document.querySelectorAll(".wine-runtime-frame").forEach((frame) => {
+              try {
+                frame.removeAttribute("src");
+                frame.removeAttribute("srcdoc");
+                frame.remove();
+              } catch {}
+            });
+            activeWineProcesses?.clear?.();
+          } catch {}
+        };
+        const cancelBackgroundMaintenanceForUnload = () => {
+          if (fullRootfsHydrationTimer) {
+            clearTimeout(fullRootfsHydrationTimer);
+            fullRootfsHydrationTimer = null;
+          }
+          if (defaultStoragePruneTimer) {
+            clearTimeout(defaultStoragePruneTimer);
+            defaultStoragePruneTimer = null;
+          }
+          if (persistedDefaultRootfsPruneTimer) {
+            clearTimeout(persistedDefaultRootfsPruneTimer);
+            persistedDefaultRootfsPruneTimer = null;
+          }
+          if (persistTimeout) {
+            clearTimeout(persistTimeout);
+            persistTimeout = null;
+          }
+          if (workspaceFlushTimeout) {
+            clearTimeout(workspaceFlushTimeout);
+            workspaceFlushTimeout = null;
+          }
+          if (workspaceJournalFlushTimeout) {
+            clearTimeout(workspaceJournalFlushTimeout);
+            workspaceJournalFlushTimeout = null;
+          }
+        };
+        const syncOnExit = () => {
+          if (unloadPersistStarted) return;
+          unloadPersistStarted = true;
+          pageIsUnloading = true;
+          try {
+            cancelBackgroundMaintenanceForUnload();
+            stopWineFramesForUnload();
+            persistPackageMetadataCache();
+            try {
+              edgeTermShell?.destroy?.();
+            } catch {}
+            edgeTermShell = null;
+            try {
+              workerShell?.terminate?.();
+            } catch {}
+            workerShell = null;
+            workerShellReady = false;
+            workerShellRequests.clear();
+            try {
+              term?.disable?.();
+              term?.destroy?.();
+            } catch {}
+            term = null;
+            window.term = null;
+            window.terminal = null;
+            try {
+              pyodide?.setStdout?.({});
+              pyodide?.setStderr?.({});
+              pyodide?.FS?.chdir?.("/");
+            } catch {}
+            globalThis.pyodide = null;
+            pyodide = null;
+            displayInputQueue = [];
+            displayMessageHistory = [];
+            appModeState.staticTextCache?.clear?.();
+            appModeState.browserTabs?.clear?.();
+            appModeState.webSockets?.clear?.();
           } catch (err) {
             console.error("Workspace sync error:", err);
           }
-          pyodide?.FS?.syncfs?.(false, (err) => {
-            if (err) console.error("Sync error:", err);
-          });
         };
-        window.addEventListener("pagehide", syncOnExit);
-        window.addEventListener("beforeunload", syncOnExit);
+        window.addEventListener("pagehide", syncOnExit, { capture: true });
+        window.addEventListener("beforeunload", syncOnExit, { capture: true });
         window.addEventListener("popstate", () => {
           const shareRoute = appModeState.shareRoute;
           const localRoute = appModeState.localRoute;
@@ -13131,57 +15920,111 @@ shell
       }
 
       async function setupMonaco() {
-        await new Promise((resolve) => {
-          window.require.config({ paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs" } });
-          window.require(["vs/editor/editor.main"], resolve);
-        });
-        editorTheme = monacoThemeForAppTheme(appTheme);
-        editor = monaco.editor.create($id("editor"), {
-          value: "",
-          language: "python",
-          theme: editorTheme,
-          automaticLayout: true,
-          minimap: { enabled: false },
-        });
-        splitEditor = monaco.editor.create($id("editorSplit"), {
-          value: "",
-          language: "python",
-          theme: editorTheme,
-          automaticLayout: true,
-          readOnly: false,
-          minimap: { enabled: false },
-        });
-        applyEditorOptions();
-        registerDefaultEditorCommands();
-        renderEditorChrome();
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-          saveEditorFromShortcut("main").catch((err) => {
-            console.error("[EDITOR] Save failed:", err);
-            showNotice(`Save failed: ${err.message || err}`);
+        if (editor && splitEditor) return;
+        if (monacoSetupPromise) return await monacoSetupPromise;
+        monacoSetupPromise = (async () => {
+          markRuntimePhase("monaco-setup");
+          console.info("[MONACO] setup start");
+          console.info("[MONACO] setup caller", new Error("Monaco setup caller").stack);
+          await new Promise((resolve) => {
+            window.require.config({ paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs" } });
+            window.require(["vs/editor/editor.main"], resolve);
           });
-        });
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, () => editor.getAction("actions.find")?.run());
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, () => editor.getAction("editor.action.startFindReplaceAction")?.run());
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runCurrentFile().catch((err) => showNotice(err.message || err)));
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyP, () => openCommandPalette("files"));
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyP, () => openCommandPalette("commands"));
-        splitEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
-          saveEditorFromShortcut("split").catch((err) => {
-            console.error("[EDITOR] Split save failed:", err);
-            showNotice(`Split save failed: ${err.message || err}`);
+          editorTheme = monacoThemeForAppTheme(appTheme);
+          editor = monaco.editor.create($id("editor"), {
+            value: "",
+            language: "python",
+            theme: editorTheme,
+            automaticLayout: true,
+            minimap: { enabled: false },
           });
+          splitEditor = monaco.editor.create($id("editorSplit"), {
+            value: "",
+            language: "python",
+            theme: editorTheme,
+            automaticLayout: true,
+            readOnly: false,
+            minimap: { enabled: false },
+          });
+          applyEditorOptions();
+          registerDefaultEditorCommands();
+          renderEditorChrome();
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+            saveEditorFromShortcut("main").catch((err) => {
+              console.error("[EDITOR] Save failed:", err);
+              showNotice(`Save failed: ${err.message || err}`);
+            });
+          });
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyF, () => editor.getAction("actions.find")?.run());
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyH, () => editor.getAction("editor.action.startFindReplaceAction")?.run());
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => runCurrentFile().catch((err) => showNotice(err.message || err)));
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyP, () => openCommandPalette("files"));
+          editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyP, () => openCommandPalette("commands"));
+          splitEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+            saveEditorFromShortcut("split").catch((err) => {
+              console.error("[EDITOR] Split save failed:", err);
+              showNotice(`Split save failed: ${err.message || err}`);
+            });
+          });
+          splitEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyP, () => openSplitEditorPrompt());
+          editor.onDidChangeModelContent(() => {
+            setEditorStatus("Modified");
+          });
+          splitEditor.onDidChangeModelContent(() => {
+            setSplitEditorStatus("Modified");
+          });
+          window.editor = editor;
+          console.info("[MONACO] setup ready");
+          markRuntimePhase("root-idle");
+        })().catch((err) => {
+          monacoSetupPromise = null;
+          markRuntimePhase("root-idle");
+          throw err;
         });
-        splitEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyP, () => openSplitEditorPrompt());
-        editor.onDidChangeModelContent(() => {
-          setEditorStatus("Modified");
-        });
-        splitEditor.onDidChangeModelContent(() => {
-          setSplitEditorStatus("Modified");
-        });
-        window.editor = editor;
+        return await monacoSetupPromise;
+      }
+
+      async function lazyMountWorkspaceAfterBoot() {
+        return;
+        // Defer the IDBFS workspace mount until after the shell is interactive.
+        // For large (200MB+) IndexedDB databases, Chrome can freeze the main
+        // thread for 60+ seconds when processing the IDB connection. Running
+        // this after boot prevents the freeze from blocking the shell UI.
+        setTimeout(async () => {
+          if (pageIsUnloading) return;
+          const workspaceId = activeWorkspaceId;
+          if (!workspaceId) return;
+          try {
+            // Save cwd before remount so we can restore it after the symlink swap
+            let savedCwd = "/home/user";
+            try { savedCwd = pyodide.FS.cwd; } catch {}
+            try { pyodide.FS.chdir("/"); } catch {}
+
+            await mountWorkspaceStorage(workspaceId, { load: false });
+            prepareActiveMounts();
+
+            // Restore cwd (now resolves through /home/user → workspace symlink)
+            try { pyodide.FS.chdir(savedCwd); } catch { try { pyodide.FS.chdir("/home/user"); } catch {} }
+            console.info("[BOOT] Lazy workspace mount complete");
+          } catch (err) {
+            console.warn("[BOOT] Lazy workspace mount failed:", err);
+          }
+        }, 300);
       }
 
       async function main() {
+        const bootStartedAt = performance.now();
+        try {
+          console.clear();
+        } catch {}
+        console.info(`[BOOT] EdgeTerm bundle ${EDGETERM_BOOT_BUNDLE_VERSION}`);
+        installRuntimeHangDiagnostics();
+        const bootPhase = async (label) => {
+          markRuntimePhase(label);
+          const elapsed = Math.round(performance.now() - bootStartedAt);
+          console.info(`[BOOT] ${label} +${elapsed}ms`);
+          await Promise.resolve();
+        };
         applyAppTheme(appTheme);
         applyEditionMode();
         revealApp();
@@ -13192,66 +16035,188 @@ shell
         renderWorkspaces();
         window.lucide?.createIcons();
         initializeTerminal();
+        bindCloudAuthEvents();
         showBootStatus("Loading EdgeTerm runtime...");
+        await bootPhase("ui ready");
 
         const bootWatchdog = setTimeout(() => {
           revealApp();
           showBootStatus(
-            "EdgeTerm is still loading the browser Python runtime. If this message stays here, try a hard refresh so Chrome fetches the latest app files.",
+            `EdgeTerm is still loading the browser Python runtime after ${Math.round((performance.now() - bootStartedAt) / 1000)}s. If this stays here, the browser is still initializing Pyodide/WASM for this tab.`,
             true
           );
         }, 20000);
 
-        const { loadPyodide } = await import("https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.mjs");
+        if (WORKER_SHELL_ENABLED) {
+          const bootTrace = (tag) => {
+            markRuntimePhase(tag);
+            console.info(`[BOOT-TRACE] ${tag} +${Math.round(performance.now() - bootStartedAt)}ms`);
+          };
+          bootTrace("pre-setupWorkerEvents");
+          setupWorkerEvents();
+          bootTrace("pre-configureDisplayBridge");
+          configureDisplayBridge();
+          bootTrace("pre-renderCloud");
+          renderCloud();
+          bootTrace("pre-renderWorkspaces");
+          renderWorkspaces();
+          bootTrace("pre-lucideIcons");
+          window.lucide?.createIcons();
+          bootTrace("pre-revealApp");
+          revealApp();
+          bootTrace("pre-pruneWorkerBootStorage");
+          await pruneWorkerBootHeavyStorageBeforeMount(activeWorkspaceId);
+          bootTrace("post-pruneWorkerBootStorage");
+          bootTrace("pre-workerShell");
+          await bootWorkerShell(bootStartedAt);
+          await bootPhase("shell interactive");
+          bootTrace("boot-main-complete");
+          clearTimeout(bootWatchdog);
+          markRuntimePhase("root-idle");
+          return;
+        }
+
+        const pyodideIndexURL = "https://cdn.jsdelivr.net/pyodide/v0.27.5/full/";
+        const { loadPyodide } = await import(`${pyodideIndexURL}pyodide.mjs`);
         showBootStatus("Starting Python runtime...");
-        pyodide = await loadPyodide();
+        await bootPhase("pyodide module imported");
+        markRuntimePhase("loadPyodide");
+        pyodide = await withPyodideBootLock(
+          async () => await loadPyodide({
+            indexURL: pyodideIndexURL,
+            fullStdLib: false,
+          }),
+          bootStartedAt
+        );
         globalThis.pyodide = pyodide;
+        console.info(`[BOOT] Pyodide ready in ${Math.round(performance.now() - bootStartedAt)}ms`);
+        await bootPhase("pyodide ready");
+        // Diagnostic: measure how long the first Python execution takes.
+        // The previous "import os, sys" warm-up took 60s — we need to
+        // know if it's ALL Python execution or just import.
+        /*
+        const pyExecStart = performance.now();
+        try {
+          await pyodide.runPythonAsync("1+1");
+          console.info(`[BOOT] Python first exec (trivial): ${Math.round(performance.now() - pyExecStart)}ms`);
+        } catch (e) {
+          console.warn("[BOOT] Python first exec failed:", e);
+        }
+        await bootPhase("python warmed");
+        */
 
         showBootStatus("Opening workspace storage...");
         loadWorkspaceRegistry();
         const active = activeWorkspace();
         if (active) {
           showBootStatus(`Preparing ${active.name}...`);
-          await mountWorkspaceStorage(active.id);
-          await ensureWorkspaceLayout(active.id);
-          await restoreWorkspaceJournal(active.id);
+          await bootPhase("mount workspace start");
+          prepareWorkspaceBootStub(active.id);
+          /*
+          // Skip mountWorkspaceStorage (IDBFS) during boot. For large
+          // (200MB+) IndexedDB databases, Chrome can block the main thread
+          // for 60+ seconds when processing the IDB connection. Boot the
+          // shell with lightweight MEMFS directories, then lazily mount
+          // IDBFS after the shell is interactive.
+          ensureDir("/workspace-store");
+          ensureDir(workspacePath(active.id));
+          ensureDir(workspacePath(active.id, "/home"));
+          ensureDir(workspacePath(active.id, "/home/user"));
+          ensureDir(workspacePath(active.id, "/overlay/upper"));
+          ensureDir(workspacePath(active.id, "/overlay/work"));
+          mountedWorkspaceId = active.id;
+          */
+          await bootPhase("workspace mounted");
+          await seedDefaultRootfs(active.id);
+          await bootPhase("boot rootfs ready");
+          restorePackageMetadataCache();
+          ensureDir(workspacePath(active.id, "/home/user"));
+          ensureDir(workspacePath(active.id, "/overlay/upper"));
+          ensureDir(workspacePath(active.id, "/overlay/work"));
           if (!active.rootfsVersion) active.rootfsVersion = DEFAULT_ROOTFS_VERSION;
+          await bootPhase("workspace prepared");
         }
         saveWorkspaceRegistry();
         prepareActiveMounts();
+        /*
+        // Minimal shell boot setup — skip prepareActiveMounts() which
+        // touches IDBFS workspace paths. Create root links and /home/user
+        // in MEMFS for the shell to boot.
+        createRootLinks();
+        refreshWasmCommandLinks();
+        ensureDir("/home/user");
+        try { pyodide.FS.chdir("/home/user"); } catch {}
+        */
         ensureAppModeConfigFile();
+        await bootPhase("runtime configured");
 
+        const bootTrace = (tag) => {
+          markRuntimePhase(tag);
+          console.info(`[BOOT-TRACE] ${tag} +${Math.round(performance.now() - bootStartedAt)}ms`);
+        };
+        bootTrace("pre-setupEvents");
         setupEvents();
+        bootTrace("pre-configureDisplayBridge");
         configureDisplayBridge();
+        bootTrace("pre-configurePackageRuntime");
+        configurePackageRuntime();
+        bootTrace("pre-configureWineRuntime");
+        configureWineRuntime();
+        bootTrace("pre-configureWasmRuntime");
         configureWasmRuntime();
-        if (CLOUD_ENABLED) await refreshCloudState();
-        else renderCloud();
+        bootTrace("pre-renderCloud");
+        if (CLOUD_ENABLED) {
+          renderCloud();
+        } else {
+          renderCloud();
+        }
+        bootTrace("pre-renderWorkspaces");
         renderWorkspaces();
+        bootTrace("pre-lucideIcons");
         window.lucide?.createIcons();
+        bootTrace("pre-shareLocator");
         const initialShareLocator = currentShareLocator();
         const bootIntoDirectApp = initialShareLocator?.kind === "app-share" || initialShareLocator?.kind === "local-app";
         if (bootIntoDirectApp) document.body.classList.add("app-mode-active");
+        bootTrace("pre-revealApp");
         revealApp();
+        bootTrace("pre-bootShell");
         if (!bootIntoDirectApp) {
           await bootShell();
           currentPath = `/home/${activeUser()}`;
+          scheduleFullRootfsHydration();
+          // Mount the real workspace (IDBFS) lazily — avoids 60s IndexedDB
+          // freeze during boot with large rootfs databases
+          lazyMountWorkspaceAfterBoot();
+          await bootPhase("shell interactive");
         }
         if (PAGE_KIND === "admin" && CLOUD_ENABLED) setView("adminView");
+        bootTrace("pre-openShareFromUrl");
         await openShareFromUrl(initialShareLocator);
-        if (!bootIntoDirectApp) {
-          await maybeAutoStartAppMode();
+        bootTrace("post-openShareFromUrl");
+        const explicitAutoStart = new URLSearchParams(location.search).get("autostart") === "1" || new URLSearchParams(location.search).get("appMode") === "1";
+        if (!bootIntoDirectApp && (initialShareLocator || explicitAutoStart)) {
+          bootTrace("schedule-autoStartAppMode");
+          setTimeout(() => {
+            if (pageIsUnloading) return;
+            markRuntimePhase("autoStartAppMode");
+            void maybeAutoStartAppMode().catch((err) => console.warn("[BOOT] auto-start app mode skipped:", err));
+          }, 0);
+        } else if (!bootIntoDirectApp) {
+          bootTrace("skip-autoStartAppMode");
         } else if (!appModeState.active && !edgeTermShell) {
+          bootTrace("pre-direct-bootShell");
           await bootShell();
           currentPath = `/home/${activeUser()}`;
+          scheduleFullRootfsHydration();
+          lazyMountWorkspaceAfterBoot();
+          bootTrace("post-direct-bootShell");
         }
+        bootTrace("boot-main-complete");
         clearTimeout(bootWatchdog);
+        markRuntimePhase("root-idle");
 
-        setupMonaco().catch((err) => {
-          console.error("[MONACO] Failed:", err);
-          term?.error?.("[EDITOR] Monaco failed to load: " + formatError(err));
-        });
-        scheduleWorkspaceFlush(5000);
-        if (activeWorkspaceId) schedulePersistedDefaultRootfsPrune(activeWorkspaceId);
+        if (isWorkspaceStorageLoaded(activeWorkspaceId)) scheduleWorkspaceFlush(5000);
       }
 
       main().catch((err) => {

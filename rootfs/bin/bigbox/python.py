@@ -401,18 +401,47 @@ def _remember_env(state, *keys):
         state["environ"].setdefault(key, os.environ.get(key))
 
 
+async def _rehydrate_runtime_installs():
+    try:
+        from edgeterm_pip import rehydrate_runtime_installs
+
+        report = await rehydrate_runtime_installs()
+        failed = report.get("failed") or []
+        for item in failed:
+            name = item.get("name") if isinstance(item, dict) else ""
+            error = item.get("error") if isinstance(item, dict) else item
+            if name or error:
+                print(f"python: warning: runtime package rehydrate failed for {name or 'package'}: {error}", file=sys.stderr)
+    except Exception as exc:
+        print(f"python: warning: runtime package rehydrate skipped: {exc}", file=sys.stderr)
+
+
 def _install_pygame_compat():
     if getattr(builtins, "_EDGETERM_PYGAME_COMPAT_INSTALLED", False):
+        patch_existing = getattr(builtins, "_EDGETERM_PATCH_PYGAME", None)
+        pygame = sys.modules.get("pygame")
+        if pygame is not None and callable(patch_existing):
+            patch_existing(pygame)
         return
 
     original_import = builtins.__import__
-    patched_ids = set()
+
+    def _edge_display_bridge():
+        try:
+            return js.globalThis.EdgeTermDisplay
+        except Exception:
+            try:
+                return js.window.EdgeTermDisplay
+            except Exception:
+                return None
 
     def _edge_display_send(payload):
         try:
             import json as _json
 
-            bridge = js.window.EdgeTermDisplay
+            bridge = _edge_display_bridge()
+            if bridge is None:
+                return False
             bridge.send(_json.dumps(payload))
             return True
         except Exception as exc:
@@ -421,10 +450,6 @@ def _install_pygame_compat():
             return False
 
     def _patch_pygame(pygame):
-        if id(pygame) in patched_ids:
-            return pygame
-        patched_ids.add(id(pygame))
-
         pygame._edgeterm_compat = True
 
         def _safe_display_canvas(size=None):
@@ -448,102 +473,318 @@ def _install_pygame_compat():
             )
 
         try:
-            display = pygame.display
-            original_set_mode = display.set_mode
-            original_flip = display.flip
-            original_update = display.update
-            caption = ["", ""]
+            if not getattr(pygame, "_edgeterm_display_compat", False):
+                display = pygame.display
+                original_flip = display.flip
+                original_update = display.update
+                caption = ["", ""]
+                current_surface = [None]
+                current_size = [(0, 0)]
+                last_frame_at = [0.0]
 
-            def set_mode(size=(0, 0), flags=0, depth=0, display=0, vsync=0):
-                _safe_display_canvas(size)
-                try:
-                    return original_set_mode(size, flags, depth, display, vsync)
-                except Exception as exc:
-                    if "Invalid window" not in str(exc):
-                        raise
+                def set_mode(size=(0, 0), flags=0, depth=0, display=0, vsync=0):
                     _safe_display_canvas(size)
-                    surface = None
+                    width, height = 960, 640
                     try:
-                        surface = pygame.Surface(size)
+                        width, height = int(size[0]), int(size[1])
                     except Exception:
                         pass
-                    if surface is not None:
-                        return surface
-                    raise
+                    width = max(1, width)
+                    height = max(1, height)
+                    current_size[0] = (width, height)
+                    surface = pygame.Surface((width, height))
+                    current_surface[0] = surface
+                    return surface
 
-            def _yield_to_browser():
-                try:
-                    import time as _time
+                def _send_surface_frame(force=False):
+                    surface = current_surface[0]
+                    if surface is None:
+                        return False
+                    try:
+                        import time as _time
 
-                    _time.sleep(0)
-                except Exception:
-                    pass
+                        now = _time.monotonic()
+                        if not force and now - last_frame_at[0] < 1 / 30:
+                            return False
+                        last_frame_at[0] = now
+                        width, height = surface.get_size()
+                        pixels = pygame.image.tostring(surface, "RGBA")
+                        # Fast worker/main-page pixel path (avoids base64 + JSON overhead).
+                        try:
+                            bridge = _edge_display_bridge()
+                            if bridge is not None and hasattr(bridge, "sendPixels") and bridge.sendPixels(pixels, width, height):
+                                return True
+                        except Exception:
+                            pass
+                        # Fallback to base64-encoded JSON path
+                        import base64 as _base64
+                        return _edge_display_send(
+                            {
+                                "type": "pixels",
+                                "width": width,
+                                "height": height,
+                                "data": _base64.b64encode(pixels).decode("ascii"),
+                                "focus": False,
+                            }
+                        )
+                    except Exception as exc:
+                        if os.environ.get("EDGETERM_DEBUG_PYGAME") == "1":
+                            print(f"[pygame-compat] surface frame failed: {exc!r}", file=sys.stderr)
+                        return False
 
-            def flip():
-                try:
-                    result = original_flip()
-                except Exception as exc:
-                    if "Invalid window" not in str(exc):
-                        raise
+                def _yield_to_browser():
+                    try:
+                        import time as _time
+
+                        _time.sleep(0)
+                    except Exception:
+                        pass
+
+                def flip():
                     result = None
-                _yield_to_browser()
-                return result
+                    if current_surface[0] is None:
+                        try:
+                            result = original_flip()
+                        except Exception as exc:
+                            if "Invalid window" not in str(exc):
+                                raise
+                    else:
+                        _send_surface_frame(force=True)
+                    _yield_to_browser()
+                    return result
 
-            def update(*args, **kwargs):
-                try:
-                    result = original_update(*args, **kwargs)
-                except Exception as exc:
-                    if "Invalid window" not in str(exc):
-                        raise
+                def update(*args, **kwargs):
                     result = None
-                _yield_to_browser()
-                return result
+                    if current_surface[0] is None:
+                        try:
+                            result = original_update(*args, **kwargs)
+                        except Exception as exc:
+                            if "Invalid window" not in str(exc):
+                                raise
+                    else:
+                        _send_surface_frame(force=True)
+                    _yield_to_browser()
+                    return result
 
-            def set_caption(title, icontitle=None):
-                caption[0] = str(title or "")
-                caption[1] = str(icontitle if icontitle is not None else title or "")
+                def set_caption(title, icontitle=None):
+                    caption[0] = str(title or "")
+                    caption[1] = str(icontitle if icontitle is not None else title or "")
 
-            def get_caption():
-                return tuple(caption)
+                def get_caption():
+                    return tuple(caption)
 
-            display.set_mode = set_mode
-            display.flip = flip
-            display.update = update
-            display.set_caption = set_caption
-            display.get_caption = get_caption
-            display.set_icon = lambda *args, **kwargs: None
-            display.quit = lambda *args, **kwargs: None
+                display.set_mode = set_mode
+                display.get_surface = lambda *args, **kwargs: current_surface[0]
+                display.get_window_size = lambda *args, **kwargs: current_size[0]
+                display.get_desktop_sizes = lambda *args, **kwargs: [current_size[0]]
+                display.flip = flip
+                display.update = update
+                display.set_caption = set_caption
+                display.get_caption = get_caption
+                display.init = lambda *args, **kwargs: None
+                display.get_init = lambda *args, **kwargs: True
+                display.set_icon = lambda *args, **kwargs: None
+                display.quit = lambda *args, **kwargs: None
+                pygame._edgeterm_display_compat = True
         except Exception as exc:
             if os.environ.get("EDGETERM_DEBUG_PYGAME") == "1":
                 print(f"[pygame-compat] display patch failed: {exc!r}", file=sys.stderr)
 
         try:
-            original_pygame_init = pygame.init
-
             def init():
-                initialized = 0
-                failed = 0
-                for module_name in ("display", "font", "joystick"):
-                    module = getattr(pygame, module_name, None)
-                    init_func = getattr(module, "init", None)
-                    if not init_func:
-                        continue
-                    try:
-                        init_func()
-                        initialized += 1
-                    except Exception:
-                        failed += 1
-                if initialized or failed:
-                    return initialized, failed
-                try:
-                    return original_pygame_init()
-                except Exception:
-                    return 0, 1
+                # In Pyodide, SDL subsystem init can synchronously block while
+                # probing browser-backed devices. EdgeTerm opens its canvas in
+                # display.set_mode(), so keep pygame.init() lightweight.
+                return 1, 0
 
-            pygame.init = init
-            pygame.quit = lambda *args, **kwargs: None
-        except Exception:
-            pass
+            pygame.__dict__["init"] = init
+            pygame.__dict__["get_init"] = lambda *args, **kwargs: True
+            pygame.__dict__["quit"] = lambda *args, **kwargs: None
+        except Exception as exc:
+            if os.environ.get("EDGETERM_DEBUG_PYGAME") == "1":
+                print(f"[pygame-compat] init patch failed: {exc!r}", file=sys.stderr)
+
+        key_state = set()
+        key_linger_until = {}
+        mouse_state = {
+            "pos": (0, 0),
+            "buttons": (False, False, False),
+        }
+        queued_events = []
+
+        def _to_python(value):
+            try:
+                if hasattr(value, "to_py"):
+                    return value.to_py()
+            except Exception:
+                pass
+            try:
+                return js.JSON.parse(js.JSON.stringify(value)).to_py()
+            except Exception:
+                pass
+            return value
+
+        def _key_codes(payload):
+            values = []
+            key_text = str(payload.get("key") or "")
+            code_text = str(payload.get("code") or "")
+            if len(key_text) == 1:
+                values.append(ord(key_text.lower()))
+            aliases = {
+                "arrowleft": pygame.K_LEFT,
+                "arrowright": pygame.K_RIGHT,
+                "arrowup": pygame.K_UP,
+                "arrowdown": pygame.K_DOWN,
+                " ": pygame.K_SPACE,
+                "space": pygame.K_SPACE,
+                "escape": pygame.K_ESCAPE,
+                "enter": pygame.K_RETURN,
+                "tab": pygame.K_TAB,
+                "backspace": pygame.K_BACKSPACE,
+                "shift": pygame.K_LSHIFT,
+                "control": pygame.K_LCTRL,
+                "alt": pygame.K_LALT,
+            }
+            lowered_key = key_text.lower()
+            lowered_code = code_text.lower()
+            if lowered_key in aliases:
+                values.append(aliases[lowered_key])
+            if lowered_code.startswith("key") and len(lowered_code) == 4:
+                values.append(ord(lowered_code[-1]))
+            elif lowered_code.startswith("digit") and len(lowered_code) == 6:
+                values.append(ord(lowered_code[-1]))
+            return values
+
+        def _consume_display_events():
+            try:
+                bridge = _edge_display_bridge()
+                raw_events = bridge.consumeInputEvents() if bridge is not None else []
+            except Exception:
+                raw_events = []
+            try:
+                events = list(raw_events)
+            except Exception:
+                events = _to_python(raw_events)
+            for event_payload in events or []:
+                event_payload = _to_python(event_payload) or {}
+                if not isinstance(event_payload, dict):
+                    continue
+                event_type = str(event_payload.get("type") or "")
+                if event_type in {"keydown", "keyup"}:
+                    codes = _key_codes(event_payload)
+                    for code in codes:
+                        if event_type == "keydown":
+                            key_state.add(code)
+                            key_linger_until.pop(code, None)
+                        else:
+                            try:
+                                import time as _time
+
+                                key_linger_until[code] = _time.monotonic() + 0.18
+                            except Exception:
+                                key_state.discard(code)
+                    event_code = pygame.KEYDOWN if event_type == "keydown" else pygame.KEYUP
+                    key_value = codes[0] if codes else 0
+                    queued_events.append(pygame.event.Event(event_code, key=key_value, unicode=str(event_payload.get("key") or "")))
+                elif event_type in {"pointerdown", "pointermove", "pointerup", "wheel"}:
+                    try:
+                        x = int(float(event_payload.get("x") or 0))
+                        y = int(float(event_payload.get("y") or 0))
+                        mouse_state["pos"] = (x, y)
+                    except Exception:
+                        pass
+                    buttons = int(event_payload.get("buttons") or 0)
+                    if event_type == "pointerdown" and not buttons:
+                        button = int(event_payload.get("button") or 0)
+                        buttons = 1 << max(0, button)
+                    mouse_state["buttons"] = (bool(buttons & 1), bool(buttons & 4), bool(buttons & 2))
+                    if event_type in {"pointerdown", "pointerup"}:
+                        event_code = pygame.MOUSEBUTTONDOWN if event_type == "pointerdown" else pygame.MOUSEBUTTONUP
+                        queued_events.append(
+                            pygame.event.Event(event_code, pos=mouse_state["pos"], button=int(event_payload.get("button") or 0) + 1)
+                        )
+                    elif event_type == "pointermove":
+                        queued_events.append(pygame.event.Event(pygame.MOUSEMOTION, pos=mouse_state["pos"], rel=(0, 0), buttons=mouse_state["buttons"]))
+
+        try:
+            event = pygame.event
+
+            def pump(*args, **kwargs):
+                _consume_display_events()
+
+            def get(*args, **kwargs):
+                _consume_display_events()
+                events = list(queued_events)
+                queued_events.clear()
+                return events
+
+            def peek(*args, **kwargs):
+                _consume_display_events()
+                return bool(queued_events)
+
+            def clear(*args, **kwargs):
+                queued_events.clear()
+
+            def poll(*args, **kwargs):
+                _consume_display_events()
+                if queued_events:
+                    return queued_events.pop(0)
+                return pygame.event.Event(pygame.NOEVENT)
+
+            event.pump = pump
+            event.get = get
+            event.peek = peek
+            event.clear = clear
+            event.wait = poll
+            event.poll = poll
+        except Exception as exc:
+            if os.environ.get("EDGETERM_DEBUG_PYGAME") == "1":
+                print(f"[pygame-compat] event patch failed: {exc!r}", file=sys.stderr)
+
+        try:
+            key = pygame.key
+
+            class _PressedKeys:
+                def __getitem__(self, index):
+                    try:
+                        import time as _time
+
+                        now = _time.monotonic()
+                        for code, expires_at in list(key_linger_until.items()):
+                            if expires_at <= now:
+                                key_linger_until.pop(code, None)
+                                key_state.discard(code)
+                    except Exception:
+                        pass
+                    return int(index) in key_state
+
+                def __len__(self):
+                    return 512
+
+                def __iter__(self):
+                    return (index in key_state for index in range(512))
+
+            key.get_pressed = lambda *args, **kwargs: _PressedKeys()
+            key.get_mods = lambda *args, **kwargs: 0
+            key.set_mods = lambda *args, **kwargs: None
+            key.set_repeat = lambda *args, **kwargs: None
+            key.get_repeat = lambda *args, **kwargs: (0, 0)
+            key.name = getattr(key, "name", lambda value: str(value))
+        except Exception as exc:
+            if os.environ.get("EDGETERM_DEBUG_PYGAME") == "1":
+                print(f"[pygame-compat] key patch failed: {exc!r}", file=sys.stderr)
+
+        try:
+            mouse = pygame.mouse
+            mouse.get_pressed = lambda *args, **kwargs: mouse_state["buttons"]
+            mouse.get_pos = lambda *args, **kwargs: mouse_state["pos"]
+            mouse.set_pos = lambda *args, **kwargs: None
+            mouse.get_rel = lambda *args, **kwargs: (0, 0)
+            mouse.set_visible = lambda *args, **kwargs: True
+            mouse.get_visible = lambda *args, **kwargs: True
+        except Exception as exc:
+            if os.environ.get("EDGETERM_DEBUG_PYGAME") == "1":
+                print(f"[pygame-compat] mouse patch failed: {exc!r}", file=sys.stderr)
 
         try:
             mixer = pygame.mixer
@@ -678,6 +919,11 @@ def _install_pygame_compat():
                 _patch_pygame(pygame)
         return module
 
+    existing_pygame = sys.modules.get("pygame")
+    if existing_pygame is not None:
+        _patch_pygame(existing_pygame)
+
+    builtins._EDGETERM_PATCH_PYGAME = _patch_pygame
     builtins.__import__ = _import
     builtins._EDGETERM_PYGAME_COMPAT_INSTALLED = True
 
@@ -1405,6 +1651,7 @@ async def main(args):
     try:
         _apply_flags(options)
         _remember_env(state, "DJANGO_ALLOW_ASYNC_UNSAFE", "DJANGO_SETTINGS_MODULE")
+        await _rehydrate_runtime_installs()
         if options["command"] is not None:
             namespace = await _run_code(options["command"], argv0="-c", argv_tail=options["script_args"])
         elif options["module"] is not None:

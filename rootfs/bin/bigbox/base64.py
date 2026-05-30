@@ -1,8 +1,56 @@
-import base64 as base64_mod
+import binascii
 import os
 import sys
 
 VERSION = "base64 (EdgeTerm bigbox) 1.0"
+
+
+def b64encode(data, altchars=None):
+    """Small stdlib-compatible shim so this command cannot shadow base64."""
+    encoded = binascii.b2a_base64(bytes(data), newline=False)
+    if altchars is not None:
+        encoded = encoded.translate(bytes.maketrans(b"+/", bytes(altchars)))
+    return encoded
+
+
+def b64decode(data, altchars=None, validate=False):
+    """Decode base64 data; mirrors the stdlib entry points used by packages."""
+    raw = data.encode("ascii") if isinstance(data, str) else bytes(data)
+    if altchars is not None:
+        raw = raw.translate(bytes.maketrans(bytes(altchars), b"+/"))
+    if not validate:
+        raw = bytes(ch for ch in raw if chr(ch) in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n\t ")
+    return binascii.a2b_base64(raw, strict_mode=bool(validate))
+
+
+def standard_b64encode(data):
+    return b64encode(data)
+
+
+def standard_b64decode(data):
+    return b64decode(data)
+
+
+def urlsafe_b64encode(data):
+    return b64encode(data, altchars=b"-_")
+
+
+def urlsafe_b64decode(data):
+    raw = data.encode("ascii") if isinstance(data, str) else bytes(data)
+    padding = b"=" * (-len(raw) % 4)
+    return b64decode(raw + padding, altchars=b"-_")
+
+
+def encodebytes(data):
+    return binascii.b2a_base64(bytes(data))
+
+
+def decodebytes(data):
+    return b64decode(data)
+
+
+encodestring = encodebytes
+decodestring = decodebytes
 
 
 def print_help():
@@ -20,7 +68,7 @@ def print_help():
 
 def encode_data(data, wrap=76):
     """Base64 encode data with optional line wrapping."""
-    encoded = base64_mod.b64encode(data).decode("ascii")
+    encoded = b64encode(data).decode("ascii")
     if wrap > 0:
         lines = []
         for i in range(0, len(encoded), wrap):
@@ -37,7 +85,7 @@ def decode_data(data, ignore_garbage=False):
         cleaned = "".join(ch for ch in data if ch in valid_chars)
         data = cleaned
     try:
-        decoded = base64_mod.b64decode(data)
+        decoded = b64decode(data)
         return decoded
     except Exception as e:
         print(f"base64: invalid input: {e}", file=sys.stderr)

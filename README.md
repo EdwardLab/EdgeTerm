@@ -8,7 +8,7 @@ The backend, when enabled, handles accounts, metadata, snapshots, sharing, tiers
 
 - Editions: Offline Edition and Cloud Edition from the same frontend runtime.
 - Workspace storage: browser IndexedDB/IDBFS, local-directory sync through the File System Access API, ZIP import/export, and cloud snapshots.
-- Terminal runtime: Pyodide Python, bundled shell tools, `pip`/`micropip` package flow, WASM CLI packages, and PHP CLI/runtime support.
+- Terminal runtime: Pyodide Python, bundled shell tools, `pip`/`micropip` package flow, `pkg` for browser-native WASM binary packages, WASM CLI packages, and PHP CLI/runtime support.
 - Web app preview: EdgeServe for Flask/WSGI, ASGI/FastAPI/Starlette, Django WSGI, PHP document roots, PHP files, and static sites.
 - App Mode: workspace apps that open directly as Python, PHP, or static HTML app surfaces.
 - Display output: canvas, SVG, image, trusted HTML, table output, matplotlib helpers, pandas table helpers, and SDL/pygame-style canvas binding.
@@ -61,6 +61,7 @@ Related docs:
 
 - `EdgeTerm App Mode.md`
 - `EdgeTerm Display API.md`
+- `docs/pkg.md`
 
 ## Install and build
 
@@ -152,12 +153,37 @@ Supported terminal/runtime features:
 - `python`, `python3`, `pip`, `pip3`, and `micropip`
 - runtime package rehydration for installed Python packages where supported
 - PHP through the bundled php-wasm package system
+- `pkg` for static repositories of browser-native WASM/Emscripten binary packages
+- experimental BoxedWine/Wine launch bridge for browser-local Win32 apps
 - common shell commands through Bigbox-style helpers
 - workspace filesystem access from Python and PHP
 - WSGI/ASGI request dispatch without host sockets
 - WASM CLI execution for supported command packages
 
+EdgeTerm's binary package manager is available as `pkg`. It reads `/etc/sources.list`, downloads static repository indexes, resolves dependencies, installs archives into `/packages/<name>/`, records state in `/var/lib/pkg/status.json`, caches archives under `/var/cache/pkg/`, and registers package binaries through `/bin/<command>` for the WASM command bridge.
+
+```bash
+pkg source add https://example.com/edgeterm/repo
+pkg update
+pkg install sqlite
+sqlite3 test.db
+```
+
+Repository and manifest details live in `docs/pkg.md`.
+
 Common bundled commands include file, archive, text, process-like, and network-style tools such as `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `grep`, `sed`, `awk`, `tar`, `zip`, `unzip`, `curl`, and `wget`. Some commands are compatibility implementations for the browser filesystem rather than full native Linux binaries.
+
+Experimental Wine commands are reserved for the BoxedWine runtime path:
+
+```bash
+edgepkg install boxedwine wine-runtime
+wine notepad.exe
+wine explorer
+winecfg
+winetricks
+```
+
+The Wine path is browser-only. It prepares `/home/user/.wine`, attaches the EdgeTerm Display canvas as the BoxedWine SDL/OpenGL target, streams launch/status logs to the terminal, and keeps Wine prefix state inside workspace persistence, exports, imports, and cloud snapshots. Cloud Edition stores metadata and snapshots only; it never executes Win32 code.
 
 Runtime constraints:
 
@@ -379,6 +405,7 @@ Supported App Mode runtimes:
 - `python`: Pyodide-powered Flask/WSGI apps.
 - `php`: php-wasm requests with static-file fallback.
 - `static`: HTML apps rendered from the workspace filesystem.
+- `wine`: experimental browser-local BoxedWine/Wine app launch.
 
 App Mode config file:
 
@@ -425,13 +452,13 @@ Run locally:
 
 ```bash
 cd backend
-python app.py --host 127.0.0.1 --port 8082
+python app.py --host 127.0.0.1 --port 8080
 ```
 
 Local preview:
 
-- http://127.0.0.1:8082/
-- http://127.0.0.1:8082/admin
+- http://127.0.0.1:8080/
+- http://127.0.0.1:8080/admin
 
 Cloud features:
 

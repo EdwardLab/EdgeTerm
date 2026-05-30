@@ -29,5 +29,12 @@
   "static": {
     "indexFile": "index.html",
     "allowInlineScripts": true
+  },
+  "wine": {
+    "prefix": "/home/user/.wine",
+    "runtimePackage": "boxedwine",
+    "winePackage": "wine-runtime",
+    "display": true,
+    "sharedApp": true
   }
 }

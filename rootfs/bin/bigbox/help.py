@@ -148,6 +148,13 @@ def main(args):
         # --- Python / App Hosting ---
         "python":   "run the Python interpreter (python3, pip, pip3, micropip)",
         "edgeserve":   "start a local WSGI/ASGI app server",
+        "edgepkg":     "install optional browser runtime packages",
+        "pkg":         "install browser-native packages",
+        "wine":        "run Win32 programs through browser BoxedWine/Wine",
+        "wine11":      "run Win32 programs with the Wine 11 root filesystem",
+        "wineconsole": "run a Wine console program",
+        "winecfg":     "open Wine configuration",
+        "winetricks":  "run Wine helper verbs",
         "edgeflask":   "Flask wrapper for EdgeServe",
         "edgeasgi":    "ASGI wrapper for EdgeServe",
 
@@ -205,7 +212,8 @@ def main(args):
         ]),
         ("Python / App Hosting", [
             "python", "python3", "pip", "pip3", "micropip",
-            "edgeserve", "edgeflask", "edgeasgi",
+            "edgeserve", "edgeflask", "edgeasgi", "edgepkg",
+            "wine", "wine11", "wineconsole", "winecfg", "winetricks",
         ]),
         ("Databases", [
             "sqlite3",

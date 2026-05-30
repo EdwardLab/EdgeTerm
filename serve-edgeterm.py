@@ -26,6 +26,7 @@ CLOUD_BLOB_DIR = None
 ADMIN_GATE_USER = None
 ADMIN_GATE_PASSWORD_HASH = None
 SECURE_COOKIES = False
+EXTERNAL_PACKAGES_ROOT = None
 
 TIERS = {
     "free": {
@@ -359,6 +360,20 @@ def validate_snapshot_zip(path, max_size):
 
 class EdgeTermHandler(SimpleHTTPRequestHandler):
     server_version = "EdgeTermCloud/1.0"
+
+    def translate_path(self, path):
+        parsed = urlparse(path)
+        if parsed.path == "/edgeterm-packages" or parsed.path.startswith("/edgeterm-packages/"):
+            root = EXTERNAL_PACKAGES_ROOT
+            if root:
+                relative = parsed.path.removeprefix("/edgeterm-packages").lstrip("/")
+                candidate = (root / relative).resolve()
+                try:
+                    candidate.relative_to(root)
+                    return str(candidate)
+                except ValueError:
+                    return str(root / "__invalid__")
+        return super().translate_path(path)
 
     def admin_gate_authorized(self):
         if not ADMIN_GATE_PASSWORD_HASH:
@@ -1111,17 +1126,21 @@ def main():
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--dir", default=".")
     parser.add_argument("--cloud-dir", default=".edgeterm-cloud")
+    parser.add_argument("--packages-dir", default="../edgeterm-packages")
     parser.add_argument("--admin-gate-user", default=os.environ.get("EDGETERM_ADMIN_GATE_USER", "admin"))
     parser.add_argument("--admin-gate-password", default=os.environ.get("EDGETERM_ADMIN_GATE_PASSWORD", ""))
     parser.add_argument("--secure-cookies", action="store_true", default=os.environ.get("EDGETERM_SECURE_COOKIES", "").lower() in {"1", "true", "yes"})
     args = parser.parse_args()
 
+    global EXTERNAL_PACKAGES_ROOT
     os.chdir(args.dir)
+    EXTERNAL_PACKAGES_ROOT = Path(args.packages_dir).resolve()
     init_cloud(args.cloud_dir)
     configure_admin_gate(args.admin_gate_user, args.admin_gate_password, args.secure_cookies)
     server = ThreadingHTTPServer((args.host, args.port), EdgeTermHandler)
     print(f"Serving EdgeTerm on http://{args.host}:{args.port}/")
     print(f"Cloud backend storage: {CLOUD_ROOT}")
+    print(f"External package root: {EXTERNAL_PACKAGES_ROOT}")
     print("/admin is protected by the EdgeTerm admin login session.")
     try:
         server.serve_forever()

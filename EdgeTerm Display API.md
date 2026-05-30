@@ -308,6 +308,18 @@ That will:
 
 Pyodide SDL support is still subject to Pyodide’s browser/runtime constraints.
 
+## BoxedWine / Wine Surfaces
+
+Experimental Wine launches use the same canvas binding path:
+
+```text
+Wine app -> BoxedWine SDL/OpenGL surface -> EdgeTerm Display canvas
+```
+
+The browser runtime creates a Wine process record, switches to Display, binds the canvas for SDL/OpenGL where the BoxedWine build supports it, and forwards pointer/keyboard events through the Display input queue. Window title, command, process id, and prefix metadata are stored on the active Display state so tabs/window-manager UI can present Wine windows consistently.
+
+Known constraints include WASM32 memory limits, no real Linux kernel, restricted threading/fork behavior, browser storage quotas, audio latency, and limited Direct3D/OpenGL/WebGL compatibility. The intended first targets are lightweight Win32 utilities, installers/tools, retro apps/games, educational software, and classic productivity apps.
+
 ## Input Events
 
 The Display panel collects a small input queue from the active canvas:

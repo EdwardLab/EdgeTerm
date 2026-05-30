@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 
 from admin import bp as admin_bp
 from auth import bp as auth_bp
@@ -19,6 +19,8 @@ from snapshots import bp as snapshots_bp
 
 TTY_SESSIONS = {}
 TTY_LOCK = threading.Lock()
+DISPLAY_INPUT_SESSIONS = {}
+DISPLAY_INPUT_LOCK = threading.Lock()
 
 
 def load_dotenv_file(*paths: Path):
@@ -51,7 +53,7 @@ def tty_session(session_id):
         return session
 
 
-def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | None = None):
+def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | None = None, packages_dir: str | Path | None = None):
     backend_dir = Path(__file__).resolve().parent
     repo_root = backend_dir.parent
     load_dotenv_file(repo_root / ".env", backend_dir / ".env")
@@ -64,8 +66,12 @@ def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | N
             "database": os.environ.get("EDGETERM_DB_NAME", "edgeterm"),
         }
     app = Flask(__name__, static_folder="static", template_folder="templates")
+    app.config["TEMPLATES_AUTO_RELOAD"] = True
+    app.jinja_env.auto_reload = True
     store = CloudStore(Path(cloud_dir), mysql_config=mysql_config)
     app.extensions["edgeterm_store"] = store
+    package_root = Path(packages_dir or os.environ.get("EDGETERM_PACKAGES_DIR") or (repo_root.parent / "edgeterm-packages")).resolve()
+    app.extensions["edgeterm_packages_root"] = package_root
 
     def bearer_token(db):
         auth = request.headers.get("Authorization", "")
@@ -107,7 +113,12 @@ def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | N
     def add_headers(response):
         request_path = request.path or ""
         is_static_asset = request.endpoint == "static" or request_path.startswith("/static/")
-        if is_static_asset:
+        is_boot_asset = request_path in {
+            "/static/index.html",
+            "/static/bootfs.json",
+            "/static/wasm-cli-worker.js",
+        } or request_path.startswith("/static/assets/main.js")
+        if is_static_asset and not is_boot_asset:
             response.headers["Cache-Control"] = "public, max-age=120, must-revalidate"
             response.headers.pop("Pragma", None)
             response.headers.pop("Expires", None)
@@ -128,6 +139,14 @@ def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | N
     @app.get("/index.html")
     def index():
         return render_template("index.html")
+
+    @app.get("/edgeterm-packages/")
+    @app.get("/edgeterm-packages/<path:asset_path>")
+    def external_package_asset(asset_path=""):
+        root = app.extensions.get("edgeterm_packages_root")
+        if not root or not Path(root).exists():
+            abort(404)
+        return send_from_directory(root, asset_path or "index.json", conditional=True)
 
     @app.get("/app")
     @app.get("/app/")
@@ -210,6 +229,34 @@ def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | N
                 cond.notify_all()
         return jsonify({"ok": True})
 
+    @app.post("/__edgeterm_display_input")
+    def display_input_write():
+        session_id = request.args.get("id", "")
+        if not session_id:
+            return jsonify({"error": "missing display input session id"}), 400
+        payload = request.get_json(silent=True)
+        events = payload.get("events") if isinstance(payload, dict) else None
+        if not isinstance(events, list):
+            event = payload.get("event") if isinstance(payload, dict) else payload
+            events = [event] if isinstance(event, dict) else []
+        cleaned = [event for event in events if isinstance(event, dict)]
+        with DISPLAY_INPUT_LOCK:
+            queue = DISPLAY_INPUT_SESSIONS.setdefault(session_id, [])
+            queue.extend(cleaned)
+            if len(queue) > 400:
+                del queue[:-400]
+        return jsonify({"ok": True})
+
+    @app.get("/__edgeterm_display_input")
+    def display_input_read():
+        session_id = request.args.get("id", "")
+        if not session_id:
+            return jsonify({"error": "missing display input session id"}), 400
+        with DISPLAY_INPUT_LOCK:
+            events = DISPLAY_INPUT_SESSIONS.get(session_id, [])
+            DISPLAY_INPUT_SESSIONS[session_id] = []
+        return jsonify({"events": events})
+
     @app.post("/__edgeterm_http_proxy")
     def http_proxy():
         payload = request.get_json(silent=True) or {}
@@ -244,6 +291,7 @@ def main():
     parser.add_argument("--host", default=os.environ.get("EDGETERM_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("EDGETERM_PORT", "8081")))
     parser.add_argument("--cloud-dir", default=os.environ.get("EDGETERM_CLOUD_DIR", ".edgeterm-cloud"))
+    parser.add_argument("--packages-dir", default=os.environ.get("EDGETERM_PACKAGES_DIR", "../edgeterm-packages"))
     parser.add_argument("--db-host", default=os.environ.get("EDGETERM_DB_HOST", ""))
     parser.add_argument("--db-port", type=int, default=int(os.environ.get("EDGETERM_DB_PORT", "3306")))
     parser.add_argument("--db-user", default=os.environ.get("EDGETERM_DB_USER", ""))
@@ -259,10 +307,11 @@ def main():
             "password": args.db_password,
             "database": args.db_name,
         }
-    app = create_app(args.cloud_dir, mysql_config=mysql_config)
+    app = create_app(args.cloud_dir, mysql_config=mysql_config, packages_dir=args.packages_dir)
     backend_driver = getattr(app.extensions.get("edgeterm_store"), "driver", "unknown")
     print(f"Serving EdgeTerm Cloud Edition on http://{args.host}:{args.port}/ ({backend_driver})")
-    app.run(host=args.host, port=args.port, debug=False)
+    print(f"External package root: {app.extensions.get('edgeterm_packages_root')}")
+    app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
 
 if __name__ == "__main__":

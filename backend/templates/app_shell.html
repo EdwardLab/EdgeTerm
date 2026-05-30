@@ -84,6 +84,15 @@
                 <div class="toolbar">
                   <div id="displayStatus" class="file-muted">Display ready</div>
                   <div class="ml-auto flex gap-2">
+                    <select id="displayResolution" class="display-resolution-select" title="Display resolution" aria-label="Display resolution">
+                      <option value="800x600">800 x 600</option>
+                      <option value="960x640" selected>960 x 640</option>
+                      <option value="1024x768">1024 x 768</option>
+                      <option value="1280x720">1280 x 720</option>
+                      <option value="1280x800">1280 x 800</option>
+                      <option value="1366x768">1366 x 768</option>
+                      <option value="1600x900">1600 x 900</option>
+                    </select>
                     <button id="clearDisplay" class="icon-only" title="Clear display"><i data-lucide="eraser"></i></button>
                   <button id="focusDisplay" class="icon-only" title="Focus display"><i data-lucide="crosshair"></i></button>
                   <button id="fullscreenDisplay" class="icon-only" title="Fullscreen display"><i data-lucide="expand"></i></button>
@@ -975,6 +984,6 @@
       window.EDGETERM_PAGE_KIND = "{{ page_kind }}";
       window.EDGETERM_ASSET_BASE = "{{ url_for('static', filename='') }}";
     </script>
-    <script type="module" src="{{ url_for('static', filename='assets/main.js') }}?v=php-wasm-v140"></script>
+    <script type="module" src="{{ url_for('static', filename='assets/main.js') }}?v=refresh-worker-unload-v119"></script>
   </body>
 </html>

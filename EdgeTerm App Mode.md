@@ -15,6 +15,7 @@ Current runtimes:
 - `python`: Pyodide-powered Flask/WSGI apps.
 - `php`: php-wasm app requests with static-file fallback from the document root.
 - `static`: HTML apps rendered from the workspace filesystem.
+- `wine`: experimental BoxedWine/Wine launches rendered through EdgeTerm Display.
 
 Future runtimes can plug into the same loader later, including Lua or generic WASM apps.
 
@@ -261,6 +262,31 @@ When App Mode exits:
 - Loads local files from the workspace filesystem
 - Renders them inside the App Mode surface
 
+## Wine Runtime
+
+Experimental Wine App Mode config:
+
+```json
+{
+  "enabled": true,
+  "runtime": "wine",
+  "entrypoint": "notepad.exe",
+  "workingDirectory": "/home/user",
+  "fullscreen": true,
+  "autoStart": true,
+  "preserveStateOnExit": true,
+  "wine": {
+    "prefix": "/home/user/.wine",
+    "runtimePackage": "boxedwine",
+    "winePackage": "wine-runtime",
+    "display": true,
+    "sharedApp": true
+  }
+}
+```
+
+Wine App Mode is local-first: BoxedWine and Wine run in the browser through WebAssembly, GUI output attaches to Display, and the Wine prefix persists in the workspace. Cloud shares/snapshots can carry the prefix and package files, but the backend does not execute Win32 code.
+
 ## Current limitations
 
 - Flask apps run in-process through WSGI; raw sockets and real port binding are not available.
@@ -269,7 +295,8 @@ When App Mode exits:
 - Browser history and URL bar are not treated like a normal hosted website.
 - Debug terminal hotkey currently returns to the normal terminal view rather than opening a live terminal drawer inside the app.
 - No cloud publish or share URL support yet.
-- No Lua/WASM App Mode runtime yet.
+- BoxedWine/Wine support is experimental and requires a compatible browser WASM asset bundle.
+- No Lua App Mode runtime yet.
 
 ## Future extension points
 
@@ -277,6 +304,7 @@ The loader is designed to grow into more runtimes without changing workspace-lev
 
 - Lua runtime
 - generic WebAssembly app runtime
+- BoxedWine loader adapters for SDL/OpenGL, clipboard, and multi-window metadata
 - richer static router behavior
 - SPA history synchronization
 - app-to-terminal debug drawer

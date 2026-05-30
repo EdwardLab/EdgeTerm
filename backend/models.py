@@ -730,10 +730,11 @@ def validate_snapshot_zip(path: Path, max_size: int):
             names = [name.replace("\\", "/").lstrip("/") for name in archive.namelist()]
             if any(".." in name.split("/") for name in names):
                 raise ValueError("snapshot contains unsafe paths")
-            has_rootfs = any(name.startswith("rootfs/") or "/rootfs/" in name for name in names)
             has_home = any(name.startswith("home/") or "/home/" in name for name in names)
             has_overlay = any(name.startswith("overlay/") or "/overlay/" in name for name in names)
-            if not has_rootfs or not (has_home or has_overlay):
-                raise ValueError("snapshot must contain rootfs plus home or overlay data")
+            has_workspace_meta = any(name.endswith("/edgeterm-workspace.json") or name == "edgeterm-workspace.json" for name in names)
+            has_appmode_config = any(name.endswith("/etc/appmode/config.json") or name == "etc/appmode/config.json" for name in names)
+            if not (has_home or has_overlay or has_workspace_meta or has_appmode_config):
+                raise ValueError("snapshot must contain workspace home, overlay, or metadata data")
     except zipfile.BadZipFile as exc:
         raise ValueError("snapshot must be a valid zip archive") from exc

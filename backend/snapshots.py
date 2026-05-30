@@ -60,9 +60,13 @@ def upload_snapshot():
     blob_path.write_bytes(raw)
     try:
         validate_snapshot_zip(blob_path, int(perms["storageQuota"]))
-    except Exception:
+    except ValueError as exc:
         blob_path.unlink(missing_ok=True)
-        raise
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        blob_path.unlink(missing_ok=True)
+        current_app.logger.exception("snapshot validation failed")
+        return jsonify({"error": "snapshot validation failed"}), 400
 
     name = request.headers.get("X-EdgeTerm-Name") or request.args.get("name", "Workspace Backup")
     workspace_id = request.headers.get("X-EdgeTerm-Workspace") or request.args.get("workspaceId", "")

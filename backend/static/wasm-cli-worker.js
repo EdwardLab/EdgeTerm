@@ -1,6 +1,7 @@
 "use strict";
 
 let stdinControl = null;
+let importedFsSnapshot = null;
 let stdinData = null;
 let debugEnabled = false;
 let ttyBrokerUrl = "";
@@ -298,8 +299,63 @@ function ensureModuleParentDirs(moduleFs, path) {
   }
 }
 
+function exportedFsDelta(moduleFs, syncRoots, snapshot) {
+  const result = [];
+  const seen = new Set();
+  for (const root of syncRoots) {
+    deltaWalk(moduleFs, root, snapshot, result, seen);
+  }
+  if (snapshot) {
+    for (const path of snapshot.keys()) {
+      if (!seen.has(path)) {
+        result.push({ path, dir: false, deleted: true });
+      }
+    }
+  }
+  return result;
+}
+
+function deltaWalk(moduleFs, sourcePath, snapshot, out, seen) {
+  let stat;
+  try { stat = moduleFs.stat(sourcePath); } catch { return; }
+  if (moduleFs.isDir(stat.mode)) {
+    out.push({ path: sourcePath, dir: true });
+    seen.add(sourcePath);
+    try {
+      for (const name of moduleFs.readdir(sourcePath)) {
+        if (name === "." || name === "..") continue;
+        deltaWalk(moduleFs, sourcePath + "/" + name, snapshot, out, seen);
+      }
+    } catch {}
+    return;
+  }
+  seen.add(sourcePath);
+  const oldData = snapshot ? snapshot.get(sourcePath) : undefined;
+  if (oldData === undefined) {
+    out.push({ path: sourcePath, dir: false, data: moduleFs.readFile(sourcePath) });
+    return;
+  }
+  const newData = moduleFs.readFile(sourcePath);
+  if (newData.length !== oldData.length) {
+    out.push({ path: sourcePath, dir: false, data: newData });
+    return;
+  }
+  for (let j = 0; j < newData.length; j++) {
+    if (newData[j] !== oldData[j]) {
+      out.push({ path: sourcePath, dir: false, data: newData });
+      return;
+    }
+  }
+}
+
 function importFsEntries(moduleFs, entries) {
   for (const entry of entries) {
+    if (entry.deleted) {
+      try {
+        moduleFs.unlink(entry.path);
+      } catch {}
+      continue;
+    }
     if (entry.dir) {
       try {
         moduleFs.mkdir(entry.path);
@@ -481,6 +537,14 @@ self.onmessage = async (event) => {
     debug(`${command}: runtime initialized`);
 
     importFsEntries(moduleInstance.FS, data.fsEntries || []);
+    importedFsSnapshot = new Map();
+    for (const entry of (data.fsEntries || [])) {
+      if (entry.deleted && entry.path) {
+        importedFsSnapshot.delete(entry.path);
+      } else if (!entry.dir && entry.path) {
+        importedFsSnapshot.set(entry.path, entry.data);
+      }
+    }
     try {
       ensureModuleParentDirs(moduleInstance.FS, (data.cwd || "/").endsWith("/") ? `${data.cwd}._` : `${data.cwd}/._`);
       moduleInstance.FS.chdir(data.cwd || "/");
@@ -525,8 +589,12 @@ self.onmessage = async (event) => {
       }
     }
 
-    const fsEntries = [];
-    for (const root of data.syncRoots || []) exportFsTree(moduleInstance.FS, root, fsEntries);
+    const fsEntries = data.skipFsExport ? [] : exportedFsDelta(moduleInstance.FS, data.syncRoots || [], importedFsSnapshot);
+    for (const entry of fsEntries) {
+      if (!entry?.path) continue;
+      if (entry.deleted) importedFsSnapshot?.delete(entry.path);
+      else if (!entry.dir) importedFsSnapshot?.set(entry.path, entry.data);
+    }
     if (interactiveRequested && !stdinBuffer && code === 0) {
       code = 1;
       stderr.push(

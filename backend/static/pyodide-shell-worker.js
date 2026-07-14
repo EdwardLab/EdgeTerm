@@ -33,6 +33,9 @@ const pendingPageBridgeRequests = new Map();
 const post = (payload) => self.postMessage(payload);
 let packageAssetManifestPromise = null;
 let syncfsPromise = null;
+let fsEntriesCache = new Map();
+let fsEntriesDirtyPaths = new Set();
+let phpRequestQueue = Promise.resolve();
 let syncfsAgain = false;
 let workspaceStorageLoadPromise = null;
 let displayInputQueue = [];
@@ -699,10 +702,23 @@ function collectWasmSyncRoots(cwd, args, entry, env = {}) {
     const path = String(arg).startsWith("/") ? normalizePath(arg) : normalizePath(`${cwd || "/"}/${arg}`);
     if (pyodide.FS.analyzePath(path).exists) roots.add(path);
   }
-  return [...roots].sort();
+  const sorted = [...roots].sort();
+  const deduped = [];
+  for (const root of sorted) {
+    if (!deduped.some((p) => root === p || root.startsWith(p + "/"))) {
+      deduped.push(root);
+    }
+  }
+  return deduped;
 }
 
 function serializeFsTree(sourcePath, targetPath = sourcePath, out = []) {
+  const cached = fsEntriesCache.get(sourcePath);
+  if (cached !== undefined) {
+    for (const entry of cached) out.push(entry);
+    return out;
+  }
+  const startLength = out.length;
   if (!pyodide.FS.analyzePath(sourcePath).exists) return out;
   const stat = pyodide.FS.stat(sourcePath);
   if (pyodide.FS.isDir(stat.mode)) {
@@ -711,21 +727,120 @@ function serializeFsTree(sourcePath, targetPath = sourcePath, out = []) {
       if (entry === "." || entry === "..") continue;
       serializeFsTree(`${sourcePath}/${entry}`, `${targetPath}/${entry}`, out);
     }
+    if (targetPath === sourcePath) fsEntriesCache.set(sourcePath, out.slice(startLength));
     return out;
   }
   out.push({ path: targetPath, dir: false, data: pyodide.FS.readFile(sourcePath) });
+  if (targetPath === sourcePath) fsEntriesCache.set(sourcePath, out.slice(startLength));
   return out;
 }
 
-function applyFsEntries(entries = []) {
-  for (const entry of entries) {
-    if (!entry?.path) continue;
-    if (entry.dir) {
-      ensureDir(entry.path);
+function invalidateFsEntriesCache(changedPath) {
+  if (!changedPath || fsEntriesCache.size === 0) return;
+  for (const root of fsEntriesCache.keys()) {
+    if (changedPath === root) {
+      fsEntriesCache.delete(root);
       continue;
     }
-    ensureDir(entry.path.split("/").slice(0, -1).join("/") || "/");
-    pyodide.FS.writeFile(entry.path, new Uint8Array(entry.data || []));
+    if (changedPath.startsWith(root + "/")) {
+      const entries = fsEntriesCache.get(root);
+      if (!entries) continue;
+      const idx = entries.findIndex((e) => e.path === changedPath);
+      if (idx >= 0) entries.splice(idx, 1);
+    }
+  }
+}
+
+function markFsEntryDirty(filePath) {
+  if (filePath) fsEntriesDirtyPaths.add(filePath);
+}
+
+function clearFsEntryDirty(filePath) {
+  if (filePath) fsEntriesDirtyPaths.delete(filePath);
+}
+
+function updateFsEntriesCacheEntry(filePath, data, { dirty = true } = {}) {
+  if (!filePath) return;
+  if (fsEntriesCache.size === 0) {
+    if (dirty) markFsEntryDirty(filePath);
+    return;
+  }
+  for (const root of fsEntriesCache.keys()) {
+    if (filePath.startsWith(root + "/")) {
+      const entries = fsEntriesCache.get(root);
+      if (!entries) continue;
+      const idx = entries.findIndex((e) => e.path === filePath);
+      if (idx >= 0) {
+        entries[idx] = { path: filePath, dir: false, data: data };
+      } else {
+        entries.push({ path: filePath, dir: false, data: data });
+      }
+      if (dirty) markFsEntryDirty(filePath);
+      return;
+    }
+  }
+  if (dirty) markFsEntryDirty(filePath);
+}
+
+function collectDirtyFsEntries(syncRoots = []) {
+  const entries = [];
+  for (const path of fsEntriesDirtyPaths) {
+    if (!syncRoots.some((root) => path === root || path.startsWith(root + "/"))) continue;
+    if (!pyodide.FS.analyzePath(path).exists) {
+      entries.push({ path, dir: false, deleted: true });
+      continue;
+    }
+    const stat = pyodide.FS.stat(path);
+    if (pyodide.FS.isDir(stat.mode)) entries.push({ path, dir: true });
+    else entries.push({ path, dir: false, data: pyodide.FS.readFile(path) });
+  }
+  return entries;
+}
+
+function clearDirtyFsEntries(entries = []) {
+  for (const entry of entries) clearFsEntryDirty(entry.path);
+}
+
+function phpRequestFromEnv(env = {}) {
+  try {
+    return env.EDGETERM_PHP_SAPI_REQUEST ? JSON.parse(String(env.EDGETERM_PHP_SAPI_REQUEST || "{}")) : null;
+  } catch {
+    return null;
+  }
+}
+
+function canSkipPhpFsExport(request = null) {
+  const method = String(request?.method || "GET").toUpperCase();
+  return ["GET", "HEAD", "OPTIONS"].includes(method);
+}
+
+function applyFsEntries(entries = [], { markDirty = true } = {}) {
+  for (const entry of entries) {
+    if (!entry?.path) continue;
+    if (entry.deleted) {
+      if (pyodide.FS.analyzePath(entry.path).exists) {
+        invalidateFsEntriesCache(entry.path);
+        pyodide.FS.unlink(entry.path);
+        if (markDirty) markFsEntryDirty(entry.path);
+        else clearFsEntryDirty(entry.path);
+      }
+      continue;
+    }
+    if (entry.dir) {
+      if (!pyodide.FS.analyzePath(entry.path).exists) {
+        invalidateFsEntriesCache(entry.path);
+        ensureDir(entry.path);
+        if (markDirty) markFsEntryDirty(entry.path);
+        else clearFsEntryDirty(entry.path);
+      }
+      continue;
+    }
+    const newData = new Uint8Array(entry.data || []);
+    const targetDir = entry.path.split("/").slice(0, -1).join("/") || "/";
+    ensureDir(targetDir);
+    pyodide.FS.writeFile(entry.path, newData);
+    updateFsEntriesCacheEntry(entry.path, newData, { dirty: markDirty });
+    if (!markDirty) clearFsEntryDirty(entry.path);
   }
 }
 
@@ -773,6 +888,19 @@ function restoreExternalPackageManifestsFromStatus() {
 }
 
 async function runWasmPackageCommand(command, argsJson = "[]", stdinText = "", cwd = "/", envJson = "{}") {
+  const env = JSON.parse(envJson || "{}");
+  const isPhpSapi = env.EDGETERM_PHP_SAPI_REQUEST && command === "php";
+  if (isPhpSapi) {
+    const run = phpRequestQueue.then(() => runWasmPackageCommandNow(command, argsJson, stdinText, cwd, envJson, env, isPhpSapi));
+    phpRequestQueue = run.catch(() => {});
+    return await run;
+  }
+  return await runWasmPackageCommandNow(command, argsJson, stdinText, cwd, envJson, env, isPhpSapi);
+}
+
+async function runWasmPackageCommandNow(command, argsJson = "[]", stdinText = "", cwd = "/", envJson = "{}", env = null, isPhpSapi = false) {
+  env ||= JSON.parse(envJson || "{}");
+  if (workspaceMounted || pendingWorkspaceHydration || workspaceStorageLoadPromise) await waitForWorkspaceStorageReady();
   const entry = findWasmCommand(command);
   if (!entry) return { found: false, code: 127, stdout: "", stderr: "" };
   if (!pyodide.FS.analyzePath(entry.launcherPath).exists || !pyodide.FS.analyzePath(entry.wasmPath).exists) {
@@ -785,11 +913,11 @@ async function runWasmPackageCommand(command, argsJson = "[]", stdinText = "", c
     return { found: true, code: 1, stdout: "", stderr: `${command}: wasm binary is missing from package ${entry.packageName}\n` };
   }
   const args = JSON.parse(argsJson || "[]");
-  const env = JSON.parse(envJson || "{}");
   const effectiveArgs = entry.command === "sqlite3" && !stdinText && args.length === 0 ? ["-interactive"] : args;
   const syncRoots = collectWasmSyncRoots(cwd || "/", effectiveArgs, entry, env);
   const fsEntries = [];
   for (const root of syncRoots) serializeFsTree(root, root, fsEntries);
+  const phpRequest = phpRequestFromEnv(env);
   const nestedWorker = new Worker(`${workerAssetBase}wasm-cli-worker.js?v=${encodeURIComponent(workerAssetVersion)}`);
   return await new Promise((resolve) => {
     let settled = false;
@@ -811,7 +939,8 @@ async function runWasmPackageCommand(command, argsJson = "[]", stdinText = "", c
         return;
       }
       if (data.type === "done") {
-        applyFsEntries(data.fsEntries || []);
+        applyFsEntries(data.fsEntries || [], { markDirty: !isPhpSapi });
+        if (isPhpSapi) clearDirtyFsEntries(fsEntries);
         if (workspaceMounted) await syncfs(false);
         finish({
           found: true,
@@ -846,8 +975,9 @@ async function runWasmPackageCommand(command, argsJson = "[]", stdinText = "", c
       },
       fsEntries,
       syncRoots,
+      skipFsExport: isPhpSapi && canSkipPhpFsExport(phpRequest),
       streamOutput: (entry.packageName === "php" || entry.command === "php") && String(env.EDGETERM_PHP_STREAM || "") !== "0",
-      phpRequest: env.EDGETERM_PHP_SAPI_REQUEST ? JSON.parse(String(env.EDGETERM_PHP_SAPI_REQUEST || "{}")) : null,
+      phpRequest,
       ttyBrokerUrl: self.location.origin,
       ttySessionId: `worker-tty-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       debug: false,
@@ -857,6 +987,9 @@ async function runWasmPackageCommand(command, argsJson = "[]", stdinText = "", c
 
 async function runFsOperation(op, payload = {}) {
   const path = String(payload.path || "/");
+  if (op !== "switchWorkspace" && op !== "importWorkspaceEntries") {
+    await waitForWorkspaceStorageReady();
+  }
   if (op === "list") {
     const normalized = path.startsWith("/") ? path : `/${path}`;
     if (!pyodide.FS.analyzePath(normalized).exists) return { path: normalized, exists: false, entries: [] };
@@ -874,6 +1007,13 @@ async function runFsOperation(op, payload = {}) {
   }
   if (op === "mkdir") {
     ensureDir(path);
+    for (const root of fsEntriesCache.keys()) {
+      if (path.startsWith(root + "/") || path === root) {
+        const entries = fsEntriesCache.get(root);
+        if (entries) entries.push({ path, dir: true });
+      }
+    }
+    markFsEntryDirty(path);
     if (workspaceMounted) await syncfs(false);
     return { ok: true };
   }
@@ -881,6 +1021,8 @@ async function runFsOperation(op, payload = {}) {
     ensureDir(path.split("/").slice(0, -1).join("/") || "/");
     const data = payload.encoding === "base64" ? decodeBase64Bytes(payload.data) : String(payload.data || "");
     pyodide.FS.writeFile(path, data);
+    const cacheData = data instanceof Uint8Array ? data : new TextEncoder().encode(String(data || ""));
+    updateFsEntriesCacheEntry(path, cacheData);
     if (workspaceMounted) await syncfs(false);
     return { ok: true };
   }
@@ -903,7 +1045,7 @@ async function runFsOperation(op, payload = {}) {
     return { ...statInfo(path), exists: true };
   }
   if (op === "unlink") {
-    if (pyodide.FS.analyzePath(path).exists) pyodide.FS.unlink(path);
+    if (pyodide.FS.analyzePath(path).exists) { pyodide.FS.unlink(path); invalidateFsEntriesCache(path); markFsEntryDirty(path); }
     if (workspaceMounted) await syncfs(false);
     return { ok: true };
   }
@@ -1109,6 +1251,11 @@ function startPendingWorkspaceHydration() {
     });
 }
 
+async function waitForWorkspaceStorageReady() {
+  if (pendingWorkspaceHydration && !workspaceStorageLoadPromise) startPendingWorkspaceHydration();
+  if (workspaceStorageLoadPromise) await workspaceStorageLoadPromise;
+}
+
 async function terminalInput(prompt = "") {
   inputSequence += 1;
   const id = inputSequence;
@@ -1188,6 +1335,7 @@ getattr(builtins.EDGETERM_SHELL, "logical_cwd", "/home/user")
 
 async function runCommand(id, line) {
   if (!shellReady) throw new Error("Worker shell is still starting");
+  await waitForWorkspaceStorageReady();
   pyodide.globals.set("__edgeterm_line", String(line || ""));
   await pyodide.runPythonAsync(`
 import builtins

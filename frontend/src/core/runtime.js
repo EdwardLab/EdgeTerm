@@ -6064,7 +6064,6 @@ try {
                 "/tmp",
                 "/var",
                 "/etc",
-                "/packages",
                 "/packages/php",
               ]),
             })
@@ -8554,7 +8553,7 @@ def data():
           "background:transparent",
           "color:transparent",
           "caret-color:transparent",
-          "pointer-events:auto",
+          "pointer-events:none",
         ].join(";");
         surface.appendChild(keyboardSink);
         const gameKeyCodeForChar = (value) => {

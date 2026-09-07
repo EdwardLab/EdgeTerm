@@ -3227,6 +3227,7 @@ export class EdgeTermExternalShellRuntime {
     ) {
       await this.stageAptRepository(root, command);
       if (!this.stagedAptArchivePaths.length) {
+        await this.warmup(commandCwd, root, { omitInstalledPayload: !referencesInstalledPackageFilesystem(command) });
         return await this.runDormantCommand(command, root, { commandCwd });
       }
       await this.stopDormantSession();

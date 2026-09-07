@@ -311,7 +311,11 @@ export function isAptMetadataRefresh(source) {
   return ["apt", "apt-get"].includes(program) && words.slice(1).includes("update");
 }
 
-function referencesInstalledPackageFilesystem(source) {
+export function referencesInstalledPackageFilesystem(source) {
+  const words = parseSimpleShellWords(String(source || "").trim());
+  const program = String(words?.[0] || "").replace(/^.*\//, "");
+  if (["apt", "apt-get"].includes(program) && words.some((word) => ["remove", "purge", "autoremove", "upgrade", "full-upgrade", "dist-upgrade"].includes(word))) return true;
+  if (program === "dpkg" && words.some((word) => ["-r", "--remove", "-P", "--purge"].includes(word))) return true;
   return /(?:^|[\s'"=])\/(?:usr\/local|opt)(?:\/|[\s'";]|$)/.test(String(source || ""));
 }
 

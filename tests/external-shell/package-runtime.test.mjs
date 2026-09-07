@@ -811,3 +811,14 @@ test("Bridge exposes original APT transaction operations", () => {
   assert.match(runtime, /evidence\?\.kind === \"apt-package-state\"/);
   assert.match(runtime, /checkpoint_id: checkpoint\?\.id \|\| null/);
 });
+
+
+test("package removal and upgrades require the installed filesystem", async () => {
+  const { referencesInstalledPackageFilesystem } = await import("../../frontend/src/external-shell/runtime-controller.js");
+  for (const command of ["apt remove -y tree", "apt-get purge tree", "apt autoremove", "apt upgrade", "dpkg --remove tree", "test -f /usr/local/bin/tree"]) {
+    assert.equal(referencesInstalledPackageFilesystem(command), true, command);
+  }
+  for (const command of ["apt update", "apt-cache policy tree", "echo hello"]) {
+    assert.equal(referencesInstalledPackageFilesystem(command), false, command);
+  }
+});

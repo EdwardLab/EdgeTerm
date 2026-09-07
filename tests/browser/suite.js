@@ -18,6 +18,9 @@ async function save() {
   await fetch("/__test/results", { method: "POST", body: JSON.stringify({ timestamp: new Date().toISOString(), userAgent: navigator.userAgent, passed, failed: results.length - passed, results }) });
 }
 async function test(name, run) {
+  const options = new URLSearchParams(location.search);
+  if (options.get("focus") === "lifecycle" && !["Bridge connection", "Create isolated workspace", "APT package lifecycle"].includes(name)) return;
+  if (options.has("production") && name === "Unavailable repository fails clearly") return;
   status.textContent = `Running: ${name}`;
   const started = performance.now();
   try {

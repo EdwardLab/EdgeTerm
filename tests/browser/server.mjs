@@ -35,7 +35,7 @@ createServer(async (req, res) => {
         chunks.push(chunk);
       }
       const value = JSON.parse(Buffer.concat(chunks).toString());
-      if (url.pathname.endsWith("results")) await writeFile(report, JSON.stringify({ ...value, artifacts, index_sha256: createHash("sha256").update(indexText).digest("hex") }, null, 2));
+      if (url.pathname.endsWith("results")) await writeFile(report, JSON.stringify({ ...value, artifacts, repository_origin: process.env.EDGETERM_TEST_REPOSITORY_ORIGIN || "local-fixture", index_sha256: createHash("sha256").update(indexText).digest("hex") }, null, 2));
       else repositoryUnavailable = value.unavailable === true;
       res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true}');
       return;

@@ -1,0 +1,613 @@
+{
+  "timestamp": "2026-09-07T14:49:11.706Z",
+  "origin": "https://packages.digitalplat.org/local-flat",
+  "verified": 101,
+  "packages": [
+    {
+      "name": "actionlint",
+      "version": "1.7.12-1edgeterm1",
+      "sha256": "57bfe624d80cc153664ad789f73be7321eae8fa1b6b51ee90d73e63376bf7cc3",
+      "bytes": 1928366
+    },
+    {
+      "name": "bash",
+      "version": "5.3.0-1edgeterm1",
+      "sha256": "855182dfade96b00e54d26887d09955b43f3d7b1eda306fdc8ad00c596b36b0e",
+      "bytes": 1303234
+    },
+    {
+      "name": "bat",
+      "version": "0.26.1-1edgeterm1",
+      "sha256": "3079925d023836301563981e0628526194460a7c434ef4cd973e2b25ca49ec0a",
+      "bytes": 1891754
+    },
+    {
+      "name": "bc",
+      "version": "1.08.2-1edgeterm1",
+      "sha256": "32caa0a1a524e0197446d7fd67178c83ea1b6cb3fd10333e58d908662ce07968",
+      "bytes": 108932
+    },
+    {
+      "name": "bison",
+      "version": "3.8.2-1edgeterm7",
+      "sha256": "575f69e85137fd7bfb4e5fa83bcd15ceec1863a143f40d5830d335bdf505a216",
+      "bytes": 1356420
+    },
+    {
+      "name": "brotli",
+      "version": "1.2.0-1edgeterm2",
+      "sha256": "679fb365decebb2a5b70b369c80874c5d118e755a429681efc708ef26993c096",
+      "bytes": 351332
+    },
+    {
+      "name": "byacc",
+      "version": "20241231-1edgeterm2",
+      "sha256": "aaf1fdbcda788f1fe7704c236487a52ffc8d091cb8d69d18cb591e8bfc8aa28f",
+      "bytes": 65472
+    },
+    {
+      "name": "bzip2",
+      "version": "1.0.8-1edgeterm2",
+      "sha256": "df1522f55a6587d8c967ec67ca1926f3b7ed664de2ef6e679b3f69387ceda049",
+      "bytes": 82674
+    },
+    {
+      "name": "cflow",
+      "version": "1.8-1edgeterm2",
+      "sha256": "c5e2c2a9da386854418ae54ab7fbe25c18cb92b3930afc3763ba9f10ddc1154c",
+      "bytes": 241396
+    },
+    {
+      "name": "chibi-scheme",
+      "version": "0.12-1edgeterm1",
+      "sha256": "c59315b73f41daadd9d5e67c9c51bcea20d34a2c99b007aef92c97a3ae69c5cc",
+      "bytes": 833372
+    },
+    {
+      "name": "choose",
+      "version": "1.3.7-1edgeterm1",
+      "sha256": "536b0ec9e8cee992fa7f391a83b32414d7f431aea0666f3e4f979f06b56a70f3",
+      "bytes": 413322
+    },
+    {
+      "name": "cmark",
+      "version": "0.31.2-1edgeterm1",
+      "sha256": "273fecd3c068aca44cc31cbdea8f699c5991bedd0f83605d2954f056e1c00fda",
+      "bytes": 120510
+    },
+    {
+      "name": "cpio",
+      "version": "2.15-1edgeterm1",
+      "sha256": "10cf0fe13c4c6e582005e2d9d62d158dfd6623370d8c52715f76a531ddecc474",
+      "bytes": 124428
+    },
+    {
+      "name": "coreutils",
+      "version": "9.11-1edgeterm2",
+      "sha256": "297acdcf3682abc869ad3ff1771f9f14e12e8719fec6fc5703680e3f6ad8fad9",
+      "bytes": 1906742
+    },
+    {
+      "name": "dash",
+      "version": "0.5.13.5-2edgeterm1",
+      "sha256": "2d1e5373ee8c9f6ec3d24cc1b5cf307f07253bb51bbae3ab44e18d93847b6abc",
+      "bytes": 242648
+    },
+    {
+      "name": "curl",
+      "version": "8.21.0-1edgeterm3",
+      "sha256": "8144095dbcfa71b72c9d0e3dc993c1c12c260a3bde2a39bfc132c9b0e3c62df7",
+      "bytes": 904540
+    },
+    {
+      "name": "datamash",
+      "version": "1.9-1edgeterm2",
+      "sha256": "8a7ccd7ed76771ae7cd213fee3f8329da5f07d09b9395c1047ee52733606927f",
+      "bytes": 351312
+    },
+    {
+      "name": "dialog",
+      "version": "1.3-20250116-1edgeterm1",
+      "sha256": "871a6d76a37deb4f1d10a754a9f1fadd8cf4af865cae0d6c031c6509239ede3e",
+      "bytes": 590362
+    },
+    {
+      "name": "diffutils",
+      "version": "3.12-1edgeterm1",
+      "sha256": "cb7fb8ae6803fa96815bfea69f6980dda57705425e8a84775eb8edf58daab363",
+      "bytes": 216090
+    },
+    {
+      "name": "dos2unix",
+      "version": "7.5.6-1edgeterm1",
+      "sha256": "b108bc2be1e2ff10884bd26488f351ee2f8ef07cf8eb8b475d06a45b1c7b6ecb",
+      "bytes": 94368
+    },
+    {
+      "name": "dnsutils",
+      "version": "9.20.26-1edgeterm2",
+      "sha256": "1aec9b4878aa6809f9406d70798004096f78bd40d8e74d639e5cddd1be640f2f",
+      "bytes": 3017928
+    },
+    {
+      "name": "ed",
+      "version": "1.22.5-1edgeterm1",
+      "sha256": "a61f77a7a4595b11ff509abbe37647b2fc1db67a4775ace993575ac6c0724dba",
+      "bytes": 187614
+    },
+    {
+      "name": "expat",
+      "version": "2.7.1-1edgeterm1",
+      "sha256": "5719dfcb2a91622b30f8c1b9b438966c3be55940e0880041d6386cfd80f4292a",
+      "bytes": 155524
+    },
+    {
+      "name": "cmake",
+      "version": "4.4.2-1edgeterm3",
+      "sha256": "5ec7099970603a36a39d8a412f85ac646dda038c7fbee0772e088ca5bbf1693f",
+      "bytes": 17026852
+    },
+    {
+      "name": "eza",
+      "version": "0.23.5-1edgeterm2",
+      "sha256": "07c6e61d32472bfb759145e67866112ae37027c8153b0c17392751e404c93440",
+      "bytes": 384088
+    },
+    {
+      "name": "fd-find",
+      "version": "10.4.2-1edgeterm1",
+      "sha256": "19005f6d019aa7a61dc02a7795712b6eb7d25790a4ef65f23cfeaf2c639a1cc9",
+      "bytes": 618192
+    },
+    {
+      "name": "fennel",
+      "version": "1.6.1-1edgeterm1",
+      "sha256": "cb6466dff935ad1eb7042cd0793025a32a078bd351d9ddd168ca102fecaf3533",
+      "bytes": 110708
+    },
+    {
+      "name": "file",
+      "version": "5.48-1edgeterm1",
+      "sha256": "a4656fc1833d704633c26fcfb69b42cb8a2195570bae418f1762324f75cf2574",
+      "bytes": 535368
+    },
+    {
+      "name": "findutils",
+      "version": "4.11.0-1edgeterm2",
+      "sha256": "68ada37fae65b1668a90cb7a1e2863f23f8a8857cb23ff839dcf6e9e64ee770e",
+      "bytes": 349190
+    },
+    {
+      "name": "flex",
+      "version": "2.6.4-1edgeterm5",
+      "sha256": "f5b45de8b910cc7f2a45ad2189d4003cfe07a87b90e347342716dbca603b7bfe",
+      "bytes": 426084
+    },
+    {
+      "name": "gawk",
+      "version": "5.4.1-1edgeterm1",
+      "sha256": "4923f2388b8720d2878e57505619e4f801b9aea8779b085934933c2e868a2371",
+      "bytes": 981160
+    },
+    {
+      "name": "git",
+      "version": "2.55.0-1edgeterm4",
+      "sha256": "43dc64dda9f70920c391eac9ee761c36770969ba436a2e68405a009974a56998",
+      "bytes": 1803836
+    },
+    {
+      "name": "gojq",
+      "version": "0.12.19-1edgeterm1",
+      "sha256": "d144a45afc03af10ac6dc4c7c6fed96585f34ffc9b0e91a625f682d6faa0a251",
+      "bytes": 1471580
+    },
+    {
+      "name": "gperf",
+      "version": "3.3-1edgeterm1",
+      "sha256": "4998c0a5bb4c232659095683f3d92541189fea283a21634dcbb734f91a99fa11",
+      "bytes": 120462
+    },
+    {
+      "name": "gettext",
+      "version": "1.0-1edgeterm4",
+      "sha256": "ed87479ea08d39bef227c32cbf0330ccb1f9df071b5164f1868a1995f12be429",
+      "bytes": 5698634
+    },
+    {
+      "name": "grep",
+      "version": "3.12-1edgeterm2",
+      "sha256": "19c2d748fc7987481e30b76c9f40f85689c195ab371eb1d9b705d810659d90b8",
+      "bytes": 169554
+    },
+    {
+      "name": "gzip",
+      "version": "1.14-1edgeterm2",
+      "sha256": "54237320e2946f0df7a55f2e293dcc7ef45c2425d72f464378ffaa8914c7601b",
+      "bytes": 121694
+    },
+    {
+      "name": "grex",
+      "version": "1.4.6-1edgeterm1",
+      "sha256": "cc58f35adbce58b4493d7bd262448f792e6a00bd6f376e45434f5cff2b500da9",
+      "bytes": 465882
+    },
+    {
+      "name": "hexedit",
+      "version": "1.6-1edgeterm1",
+      "sha256": "b152ea00a77734a26c84d90e985e9d61d7a59b4d62cb96997016516183abf623",
+      "bytes": 247834
+    },
+    {
+      "name": "htmlq",
+      "version": "0.4.0-1edgeterm1",
+      "sha256": "1caf79170eb02354ffd4f12cd43b7e6a1f378d16aab2c17a5e9114ab9058d421",
+      "bytes": 448862
+    },
+    {
+      "name": "hexyl",
+      "version": "0.17.0-1edgeterm1",
+      "sha256": "c2de8aea6ba505b5e93af30fc5b24a27107bdbe7fe9da01cc7ef907172082962",
+      "bytes": 208658
+    },
+    {
+      "name": "hyperfine",
+      "version": "1.20.0-1edgeterm1",
+      "sha256": "0355bb5cf07553fc9f3a19c0dc3a1465a5af33544ec7df4433b86ab8146dea9e",
+      "bytes": 270514
+    },
+    {
+      "name": "indent",
+      "version": "2.2.13-1edgeterm1",
+      "sha256": "00f65ffe0010169d8d212079761475d220ff0c0700cb34f79ca8440dc18f885f",
+      "bytes": 68802
+    },
+    {
+      "name": "jq",
+      "version": "1.8.2-1edgeterm2",
+      "sha256": "0cb58306cce872828e4f40182cb062822424ae017a2bad7cf09cd6b11c469864",
+      "bytes": 537732
+    },
+    {
+      "name": "just",
+      "version": "1.58.0-1edgeterm1",
+      "sha256": "f4577f011567e1b9c6469c928b320814152616e0fc7cefb55849dc947cee1dcf",
+      "bytes": 984048
+    },
+    {
+      "name": "less",
+      "version": "708-1edgeterm1",
+      "sha256": "2ead160446e70e581b8b517b41d486ad33b7ecf54e372b3cd47649bf2893cd6c",
+      "bytes": 373896
+    },
+    {
+      "name": "libarchive",
+      "version": "3.8.1-1edgeterm1",
+      "sha256": "f59f640fc1dd63d7c8c69bb3bd656738f9a4f7a74c0585b43cdc82abf5c56af8",
+      "bytes": 575004
+    },
+    {
+      "name": "libdeflate",
+      "version": "1.24-1edgeterm1",
+      "sha256": "fda7de71dbf8c52a2aae2ee59322f5ee42b8d0a4a36e715dde6b627e01f89784",
+      "bytes": 73706
+    },
+    {
+      "name": "lz4",
+      "version": "1.10.0-1edgeterm2",
+      "sha256": "a7706ab93e1997d6733c61f3196b7216006e93d82144720f1aeb8a2ebd90dff7",
+      "bytes": 83020
+    },
+    {
+      "name": "lua",
+      "version": "5.5.0-1edgeterm3",
+      "sha256": "391a70c88997729d605fea596c848356c31b03a78c3b46e38f8cb6426ae27f5f",
+      "bytes": 532244
+    },
+    {
+      "name": "lzip",
+      "version": "1.25-1edgeterm1",
+      "sha256": "079aec564dc57772f40efc487f7fd8f8191c21bd0edd615c06be78d2569eb468",
+      "bytes": 99544
+    },
+    {
+      "name": "m4",
+      "version": "1.4.21-1edgeterm2",
+      "sha256": "c034576141ed0fa23bcbd8f87d8b95fb17d00a62ced56c7cc391e4e173fac4fa",
+      "bytes": 597992
+    },
+    {
+      "name": "make",
+      "version": "4.4.1-1edgeterm2",
+      "sha256": "ac5c44100942d5e0aeb8a2f1332fb200c07bf6ce62b3eb203d74f06a917da9e5",
+      "bytes": 285222
+    },
+    {
+      "name": "mawk",
+      "version": "1.3.4-20250131-1edgeterm1",
+      "sha256": "96fc1c39d6e80b6b6eca00538e1c4fc060b94e306fcea64305b7d502d423f95c",
+      "bytes": 265058
+    },
+    {
+      "name": "mujs",
+      "version": "1.3.7-1edgeterm1",
+      "sha256": "c1f9523a8ba8a70d6acfd4b735a1e86fdf3754041aa8d803ddf455edf09ebccd",
+      "bytes": 476518
+    },
+    {
+      "name": "ncdu",
+      "version": "1.22-1edgeterm7",
+      "sha256": "f5c073e702093b098a429fa94241c41eec7153736b02ddca7c2d8bb81b27053b",
+      "bytes": 302990
+    },
+    {
+      "name": "nano",
+      "version": "9.2-1edgeterm1",
+      "sha256": "cdc876b25ee5584bdb802020370b51020f91432182c354c4053e2c704112c3f9",
+      "bytes": 716434
+    },
+    {
+      "name": "ncompress",
+      "version": "5.0-1edgeterm3",
+      "sha256": "0830f29e8bcbd43c80c33b1b2fe4a9f881073000d5775552380bda68d3be3a1b",
+      "bytes": 38728
+    },
+    {
+      "name": "netcat-openbsd",
+      "version": "1.238-1edgeterm1",
+      "sha256": "985bf8d16bdb27fca8c9a43143ad40d5702f0d1a653b83a7645f2d149d85a5b0",
+      "bytes": 92770
+    },
+    {
+      "name": "ninja-build",
+      "version": "1.13.2-1edgeterm1",
+      "sha256": "d7c864ec7c10af7b8c4668ce52d9db3daa1d7b9bd2303d416c8011724749213a",
+      "bytes": 179642
+    },
+    {
+      "name": "ncurses",
+      "version": "6.6-1edgeterm1",
+      "sha256": "5049cbf23502ed71c269df2e54889d41519fac7adf1280291113b147f82644d0",
+      "bytes": 1502638
+    },
+    {
+      "name": "openssh-client",
+      "version": "10.4p1-1edgeterm2",
+      "sha256": "4cf1da674c1c0c7a78bfe48c01bf059ca72f595e27468b9319f9e193b3c103be",
+      "bytes": 1916424
+    },
+    {
+      "name": "p7zip",
+      "version": "17.06-1edgeterm2",
+      "sha256": "47889c8ec34f9767cac1bb1a38125be5c2ce7f90291551c087c66c41572c742c",
+      "bytes": 965314
+    },
+    {
+      "name": "openssl",
+      "version": "3.6.3-1edgeterm1",
+      "sha256": "e9100c7307c1cb651e8d45f30b84a487ac7cccc6f6c7748e73ef379744895587",
+      "bytes": 3029552
+    },
+    {
+      "name": "pastel",
+      "version": "0.12.0-1edgeterm1",
+      "sha256": "338a56379ec9a0c4801411261f14f31b85ec02ceba56ea0b9899db6af3929da2",
+      "bytes": 206174
+    },
+    {
+      "name": "patch",
+      "version": "2.8-1edgeterm2",
+      "sha256": "ad52dca4ec1691ec93ccd630d9c53d3c4acd499bc26e84a203d708add8b9d1a0",
+      "bytes": 116746
+    },
+    {
+      "name": "pcre2",
+      "version": "10.46-1edgeterm1",
+      "sha256": "ee1d4e3988662f7f99b804784af416886a383c37bfdcce776e36bee37cd4f80b",
+      "bytes": 575792
+    },
+    {
+      "name": "picoc",
+      "version": "3.2.2-1edgeterm1",
+      "sha256": "28d9af93172d06c50c0513b2f32c83fa0d46a5ad725ec654bf41633e3c4bc25f",
+      "bytes": 205306
+    },
+    {
+      "name": "pkgconf",
+      "version": "3.0.5-1edgeterm1",
+      "sha256": "9bcdb246f940a59b56a20569680dabc263704dcde5ce4c035e25cdd6d4f058e2",
+      "bytes": 166148
+    },
+    {
+      "name": "pv",
+      "version": "1.11.0-1edgeterm1",
+      "sha256": "885eeb61f2cbe4139806ef7c0c0b4498bc5ff0fcb4d08c0a31f83bae3b258882",
+      "bytes": 134930
+    },
+    {
+      "name": "quickjs",
+      "version": "2026-06-04-1edgeterm3",
+      "sha256": "54101f80c5e3c990a12ce26bdaa5c835a14e76e4d08cf617f37bcab46d5b4765",
+      "bytes": 2315994
+    },
+    {
+      "name": "re2c",
+      "version": "4.3-1edgeterm1",
+      "sha256": "50c66631ef3407dcb321dd250af5dd2eac8c944e25c72079abd58d26761365e9",
+      "bytes": 278750
+    },
+    {
+      "name": "php",
+      "version": "8.4.23-1edgeterm2",
+      "sha256": "ab04f5fe995bb58e9428ec85bda993b729c9e647f8f00a1937748ddec84fc21e",
+      "bytes": 7103518
+    },
+    {
+      "name": "rhash",
+      "version": "1.4.6-1edgeterm1",
+      "sha256": "a0ca1f1ad76722ba664a889e3abb223dcf0323bff19112443e069aaef312f6e6",
+      "bytes": 168718
+    },
+    {
+      "name": "rsync",
+      "version": "3.4.4-1edgeterm1",
+      "sha256": "770bb64675d57287ef4ff58141201fdb7f8104caa4c770eda5945c5b76c6859b",
+      "bytes": 824452
+    },
+    {
+      "name": "ripgrep",
+      "version": "15.2.0-1edgeterm1",
+      "sha256": "421c29b761e619f8e69b4f1cf5a7f299a80c593a2b8e5d7eaaaf7a880d506cc8",
+      "bytes": 3756734
+    },
+    {
+      "name": "ruplacer",
+      "version": "0.10.0-1edgeterm1",
+      "sha256": "6659a4149ea8794b43060a429f7fd6420be7f25dc27b72dbe769d808ac33e85d",
+      "bytes": 490546
+    },
+    {
+      "name": "sd",
+      "version": "1.1.0-1edgeterm1",
+      "sha256": "52e3dddd3b487417919dccb22db4beddafadbf2f13e16a788e2d2e8cebcf0348",
+      "bytes": 386844
+    },
+    {
+      "name": "sed",
+      "version": "4.10-1edgeterm1",
+      "sha256": "2da79311cf80f9b0536aa334bc85fc6e3558da2649f27ea03890053e91e213a9",
+      "bytes": 168112
+    },
+    {
+      "name": "shfmt",
+      "version": "3.13.1-1edgeterm1",
+      "sha256": "6efcc65babf5a061b4e78907c9b3bc310ec8b7a03a1b21d7a711f91fd27c33f3",
+      "bytes": 1152878
+    },
+    {
+      "name": "sqlite3",
+      "version": "3.53.4-1edgeterm1",
+      "sha256": "6de6c2937b7e0a24321c80d8f1f34897a5fe0a6b6ec55f3645bf8178a9289951",
+      "bytes": 1004964
+    },
+    {
+      "name": "squirrel",
+      "version": "3.2-1edgeterm1",
+      "sha256": "3011a55338f89ded0c7ab16144a4fda0c6330693ec71b4958e5005823c38d2a3",
+      "bytes": 336258
+    },
+    {
+      "name": "tar",
+      "version": "1.35-1edgeterm2",
+      "sha256": "215f31df14fb67848ac4f9f6d70c6a4e2331a1108f4526e9c658ae6d2f520140",
+      "bytes": 518460
+    },
+    {
+      "name": "tree",
+      "version": "2.3.2-1edgeterm1",
+      "sha256": "17bda3ba7c4a2251ea8fcecf0a59f15b6482026cd09108cb3ee2378f1745d1bc",
+      "bytes": 69916
+    },
+    {
+      "name": "tcl",
+      "version": "9.0.4-1edgeterm1",
+      "sha256": "c03419370359098b4e3991e6ac27d336e12e85c0984106b6921d617e35e5b2f8",
+      "bytes": 3350136
+    },
+    {
+      "name": "universal-ctags",
+      "version": "6.2.0-1edgeterm2",
+      "sha256": "79839d2d4307a69ada1af0fbdaa7ff5308a5dc0eff0890e56dd22616bed82185",
+      "bytes": 1704090
+    },
+    {
+      "name": "uncrustify",
+      "version": "0.81.0-1edgeterm1",
+      "sha256": "5544061448ee747f6d846481851fdfd58aaf75dab741a744e22f1dfb599757f6",
+      "bytes": 456610
+    },
+    {
+      "name": "unzip",
+      "version": "6.0-1edgeterm2",
+      "sha256": "23e890fd6e975a3424e34b5e248b1d37d87e9101bdaf36a625bb0e958566923d",
+      "bytes": 136860
+    },
+    {
+      "name": "wabt",
+      "version": "1.0.41-1edgeterm1",
+      "sha256": "60349101edea40b8c39e5370cba88ffeecc63834c11d671e61e5d084d2bbc5e0",
+      "bytes": 790278
+    },
+    {
+      "name": "wasm3",
+      "version": "0.5.0-1edgeterm1",
+      "sha256": "34833c4a0aaa017e25e32c2dd1bedebe999bdb6b65a59396a0b7ecb216311c51",
+      "bytes": 73000
+    },
+    {
+      "name": "wasm-tools",
+      "version": "1.256.0-1edgeterm1",
+      "sha256": "43591ca8e078176158a4fb90bbe624ad8f591add18379511a3bcdd708d9fde19",
+      "bytes": 2438874
+    },
+    {
+      "name": "wget",
+      "version": "1.25.0-1edgeterm1",
+      "sha256": "bb13c084167cbff84f41b0a15abde831ab9c736d1d0a0e61efa4e37490003907",
+      "bytes": 461046
+    },
+    {
+      "name": "xdelta3",
+      "version": "3.1.0-1edgeterm2",
+      "sha256": "ca6d9af475cd455b2a0cbaf8f1a77dd5da9e852f882a58bdb56233068efbd8d6",
+      "bytes": 99216
+    },
+    {
+      "name": "xxhash",
+      "version": "0.8.3-1edgeterm1",
+      "sha256": "7851d85a7cb1a55744ef12f0dfe7731b2eb4d9a3129636660631f478fbccf381",
+      "bytes": 56936
+    },
+    {
+      "name": "xz-utils",
+      "version": "5.8.3-1edgeterm2",
+      "sha256": "1be490e3c99ebbb4ef6bed553afc3f69e32e909d7ef8f8238eaa79b948dfe795",
+      "bytes": 293928
+    },
+    {
+      "name": "zip",
+      "version": "3.0-1edgeterm1",
+      "sha256": "863f165a3acf512953710727e6b3d53f867f305971b57509fe566a2abd287e84",
+      "bytes": 174080
+    },
+    {
+      "name": "yamlfmt",
+      "version": "0.21.0-1edgeterm3",
+      "sha256": "8490a5e75261f08b782313932bef0c64d4aa8ba06dc6222b8277a575b032480a",
+      "bytes": 1603922
+    },
+    {
+      "name": "zopfli",
+      "version": "1.0.3-1edgeterm1",
+      "sha256": "13bd207ebfe4afca414b62ba8ffaeecb2512378029bbcea43dbd4a5bb615429b",
+      "bytes": 159710
+    },
+    {
+      "name": "zoxide",
+      "version": "0.10.0-1edgeterm1",
+      "sha256": "dc0e5419567e882c2cb3b4177941f47f7aef77667c8f50cc5877616fdcadcff9",
+      "bytes": 199338
+    },
+    {
+      "name": "yq",
+      "version": "4.53.3-1edgeterm1",
+      "sha256": "5125525cccc6cc4e877ceb92d551e7bc743130b3c87e18f7d57fb1ea430ff64f",
+      "bytes": 4470888
+    },
+    {
+      "name": "zstd",
+      "version": "1.5.7-1edgeterm1",
+      "sha256": "5a021b70dc5b1c16dc928f79faf3c43672a68fefc2683409179de9971dd9b714",
+      "bytes": 211814
+    }
+  ]
+}

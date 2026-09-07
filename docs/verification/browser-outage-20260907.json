@@ -1,0 +1,31 @@
+{
+  "timestamp": "2026-09-07T14:30:50.939Z",
+  "scope": "Controlled HTTP 503 repository failure check extracted from the local-fixture suite",
+  "result": {
+    "name": "Unavailable repository fails clearly",
+    "passed": true,
+    "durationMs": 365,
+    "evidence": {
+      "execution_id": "0962f3d9-88d2-4e2d-a68d-1a8d43f9160c",
+      "command": "apt update",
+      "cwd": "/home/user",
+      "exit_code": 1,
+      "stdout": "",
+      "stderr": "[BusyBox] Error: The package repository is unavailable or not configured: HTTP 503 for InRelease. Check http://127.0.0.1:3100/edgeterm-packages/local-flat/ and run apt update again.",
+      "truncated": false,
+      "cancelled": false,
+      "started_at": "2026-09-07T14:29:38.635Z",
+      "completed_at": "2026-09-07T14:29:38.993Z",
+      "duration_ms": 357,
+      "request_id": "mtrc79aj-1h",
+      "idempotency_key": "mtrc79aj-1h",
+      "status": "failed",
+      "error_code": "command_failed",
+      "recoverable": true,
+      "summary": "terminal.run failed (exit 1)",
+      "artifact_handles": [],
+      "workspace_generation": "ws-1788791273644:1788791273644",
+      "finished_at": "2026-09-07T14:29:38.993Z"
+    }
+  }
+}

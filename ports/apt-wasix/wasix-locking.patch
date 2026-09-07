@@ -1,0 +1,15 @@
+--- a/apt-pkg/contrib/fileutl.cc
++++ b/apt-pkg/contrib/fileutl.cc
+@@ -273,6 +273,12 @@ int GetLock(string const &File,bool Errors)
+    }
+    SetCloseExec(FD,true);
+ 
++#ifdef __wasi__
++   // EdgeTerm serializes package transactions at the runtime boundary because
++   // browser-backed filesystems do not expose advisory process locks.
++   return FD;
++#endif
++
+    // Acquire a write lock
+    struct flock fl;
+    fl.l_type = F_WRLCK;

@@ -1,0 +1,52 @@
+--- a/apt-pkg/acquire.cc
++++ b/apt-pkg/acquire.cc
+@@ -724,5 +724,5 @@
+       SetFds(Highest,&RFds,&WFds);
+ 
+       // Shorten the select() cycle in case we have items about to become ready
+-      auto now = clock::now();
++      auto now = edgeterm_clock_now<clock>();
+       auto fetchAfter = time_point{};
+@@ -1227,5 +1227,5 @@
+    // Look for a queable item
+    QItem *I = Items;
+    int ActivePriority = 0;
+-   auto currentTime = clock::now();
++   auto currentTime = edgeterm_clock_now<clock>();
+    while (PipeDepth < static_cast<decltype(PipeDepth)>(MaxPipeDepth))
+@@ -1384,4 +1384,4 @@
+ static struct timeval GetTimevalFromSteadyClock()
+ {
+-   return SteadyDurationToTimeVal(std::chrono::steady_clock::now().time_since_epoch());
++   return SteadyDurationToTimeVal(edgeterm_clock_now<std::chrono::steady_clock>().time_since_epoch());
+ }
+--- a/apt-pkg/acquire-item.cc
++++ b/apt-pkg/acquire-item.cc
+@@ -1587,5 +1587,5 @@
+ 	 which is native/foreign arch, specific order of preference of translations, … */
+       auto range_start = IndexTargets.begin();
+-      auto seed = (std::chrono::high_resolution_clock::now().time_since_epoch() /  std::chrono::nanoseconds(1)) ^ getpid();
++      auto seed = (edgeterm_clock_now<std::chrono::high_resolution_clock>().time_since_epoch() /  std::chrono::nanoseconds(1)) ^ getpid();
+       std::default_random_engine g(seed);
+       do {
+--- a/apt-pkg/acquire-worker.cc
++++ b/apt-pkg/acquire-worker.cc
+@@ -688,6 +688,6 @@
+ 				       std::string const &Message, bool const errTransient, bool const errAuthErr)
+ {
+-   auto currentTime = clock::now();
+-   auto currentWall = std::chrono::system_clock::now();
++   auto currentTime = edgeterm_clock_now<clock>();
++   auto currentWall = edgeterm_clock_now<std::chrono::system_clock>();
+    for (auto const Owner : ItmOwners)
+    {
+--- a/apt-pkg/contrib/progress.cc
++++ b/apt-pkg/contrib/progress.cc
+@@ -120,6 +120,6 @@
+    
+    // Check time delta
+-   auto const Now = std::chrono::steady_clock::now().time_since_epoch();
++   auto const Now = edgeterm_clock_now<std::chrono::steady_clock>().time_since_epoch();
+    auto const Now_sec = std::chrono::duration_cast<std::chrono::seconds>(Now);
+    auto const Now_usec = std::chrono::duration_cast<std::chrono::microseconds>(Now - Now_sec);
+    struct timeval NowTime = { static_cast<time_t>(Now_sec.count()), static_cast<suseconds_t>(Now_usec.count()) };

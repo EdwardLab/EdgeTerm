@@ -12,9 +12,7 @@ VERSION = "1.0.0 (bigbox)"
 
 
 def main(args):
-    if not args:
-        args = ["--help"]
-    if args[0] == "--help":
+    if args and args[0] == "--help":
         print("Usage: id [OPTION]... [USER]")
         print("  -u    print only the effective user ID")
         print("  -g    print only the effective group ID")
@@ -22,7 +20,7 @@ def main(args):
         print("  -n    print name instead of number")
         print("  -r    print real ID instead of effective")
         sys.exit(0)
-    if args[0] == "--version":
+    if args and args[0] == "--version":
         print(VERSION)
         sys.exit(0)
 
@@ -93,8 +91,8 @@ def main(args):
         return
 
     # Default output
-    print(f"uid={info['uid']}({info['name']}) gid={info['gid']}({info['gid_name']}) "
-          f"groups={' '.join(f'{g[\"gid\"]}({g[\"name\"]})' for g in info['groups'])}")
+    groups = " ".join(f"{group['gid']}({group['name']})" for group in info["groups"])
+    print(f"uid={info['uid']}({info['name']}) gid={info['gid']}({info['gid_name']}) groups={groups}")
 
 
 def get_current_user_info():

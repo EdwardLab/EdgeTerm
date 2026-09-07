@@ -1,0 +1,461 @@
+diff --git a/apt-pkg/cachefilter-patterns.cc b/apt-pkg/cachefilter-patterns.cc
+index 73157765e..ae805981b 100644
+--- a/apt-pkg/cachefilter-patterns.cc
++++ b/apt-pkg/cachefilter-patterns.cc
+@@ -85,14 +85,20 @@ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parseTop()
+    skipSpace();
+ 
+    if (node == nullptr)
+-      throw Error{Node{0, sentence.size()}, "Expected pattern"};
++      return fail(Node{0, sentence.size()}, "Expected pattern");
+ 
+    if (node->end != sentence.size())
+-      throw Error{Node{node->end, sentence.size()}, "Expected end of file"};
++      return fail(Node{node->end, sentence.size()}, "Expected end of file");
+ 
+    return node;
+ }
+ 
++std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::fail(Node location, std::string message)
++{
++   errorState.emplace(std::move(location), std::move(message));
++   return nullptr;
++}
++
+ // Parse any pattern
+ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parse()
+ {
+@@ -117,7 +123,7 @@ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parseOr()
+       auto node = parseAnd();
+ 
+       if (node == nullptr)
+-	 throw Error{Node{state.offset, sentence.size()}, "Expected pattern after |"};
++	 return fail(Node{state.offset, sentence.size()}, "Expected pattern after |");
+ 
+       nodes.push_back(std::move(node));
+    }
+@@ -177,7 +183,7 @@ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parseUnary()
+    auto primary = parsePrimary();
+ 
+    if (primary == nullptr)
+-      throw Error{Node{start, sentence.size()}, "Expected pattern"};
++      return fail(Node{start, sentence.size()}, "Expected pattern");
+ 
+    auto node = std::make_unique<PatternNode>();
+    node->start = start;
+@@ -211,13 +217,11 @@ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parseGroup()
+    skipSpace();
+    auto node = parse();
+    if (node == nullptr)
+-      throw Error{Node{state.offset, sentence.size()},
+-		  "Expected pattern after '('"};
++      return fail(Node{state.offset, sentence.size()}, "Expected pattern after '('");
+    skipSpace();
+ 
+    if (sentence[state.offset] != ')')
+-      throw Error{Node{state.offset, sentence.size()},
+-		  "Expected closing parenthesis"};
++      return fail(Node{state.offset, sentence.size()}, "Expected closing parenthesis");
+ 
+    auto end = ++state.offset;
+    node->start = start;
+@@ -235,8 +239,7 @@ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parseArgument(bool s
+    if ((node = parse()) != nullptr)
+       return node;
+ 
+-   throw Error{Node{state.offset, sentence.size()},
+-	       "Expected pattern, quoted word, or word"};
++   return fail(Node{state.offset, sentence.size()}, "Expected pattern, quoted word, or word");
+ }
+ 
+ // Parse a short pattern
+@@ -265,7 +268,7 @@ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parseShortPattern()
+       return node;
+    }
+ 
+-   throw Error{Node{state.offset, sentence.size()}, "Unknown short pattern"};
++   return fail(Node{state.offset, sentence.size()}, "Unknown short pattern");
+ }
+ 
+ // Parse a list pattern (or function call pattern)
+@@ -290,7 +293,7 @@ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parsePattern()
+    node->term = sentence.substr(node->start, state.offset - node->start);
+ 
+    if (node->term.size() <= 1)
+-      throw Error{*node, "Pattern must have a term/name"};
++      return fail(*node, "Pattern must have a term/name");
+ 
+    node->end = skipSpace();
+    // We don't have any arguments, return node;
+@@ -323,8 +326,8 @@ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parsePattern()
+ 
+    node->end = state.offset;
+    if (sentence[state.offset] != ')')
+-      throw Error{node->arguments.empty() ? *node : *node->arguments[node->arguments.size() - 1],
+-		  rstrprintf("Expected closing parenthesis or comma after last argument, received %c", sentence[state.offset])};
++      return fail(node->arguments.empty() ? *node : *node->arguments[node->arguments.size() - 1],
++		  rstrprintf("Expected closing parenthesis or comma after last argument, received %c", sentence[state.offset]));
+ 
+    node->end = ++state.offset;
+    return node;
+@@ -347,7 +350,7 @@ std::unique_ptr<PatternTreeParser::Node> PatternTreeParser::parseQuotedWord()
+ 
+    // End of string
+    if (sentence[state.offset] != '"')
+-      throw Error{*node, "Could not find end of string"};
++      return fail(*node, "Could not find end of string");
+    state.offset++;
+ 
+    node->end = state.offset;
+@@ -403,7 +406,8 @@ std::ostream &PatternTreeParser::WordNode::render(std::ostream &os)
+ 
+ std::nullptr_t PatternTreeParser::Node::error(std::string message)
+ {
+-   throw Error{*this, message};
++   _error->Error("%s", message.c_str());
++   return nullptr;
+ }
+ 
+ bool PatternTreeParser::PatternNode::matches(std::string_view name, int min, int max)
+@@ -411,15 +415,15 @@ bool PatternTreeParser::PatternNode::matches(std::string_view name, int min, int
+    if (name != term)
+       return false;
+    if (max != 0 && !haveArgumentList)
+-      error(rstrprintf("%.*s expects an argument list", (int)term.size(), term.data()));
++      return error(rstrprintf("%.*s expects an argument list", (int)term.size(), term.data())), false;
+    if (max == 0 && haveArgumentList)
+-      error(rstrprintf("%.*s does not expect an argument list", (int)term.size(), term.data()));
++      return error(rstrprintf("%.*s does not expect an argument list", (int)term.size(), term.data())), false;
+    if (min >= 0 && min == max && (arguments.size() != size_t(min)))
+-      error(rstrprintf("%.*s expects %d arguments, but received %d arguments", (int)term.size(), term.data(), min, arguments.size()));
++      return error(rstrprintf("%.*s expects %d arguments, but received %d arguments", (int)term.size(), term.data(), min, arguments.size())), false;
+    if (min >= 0 && arguments.size() < size_t(min))
+-      error(rstrprintf("%.*s expects at least %d arguments, but received %d arguments", (int)term.size(), term.data(), min, arguments.size()));
++      return error(rstrprintf("%.*s expects at least %d arguments, but received %d arguments", (int)term.size(), term.data(), min, arguments.size())), false;
+    if (max >= 0 && arguments.size() > size_t(max))
+-      error(rstrprintf("%.*s expects at most %d arguments, but received %d arguments", (int)term.size(), term.data(), max, arguments.size()));
++      return error(rstrprintf("%.*s expects at most %d arguments, but received %d arguments", (int)term.size(), term.data(), max, arguments.size())), false;
+    return true;
+ }
+ 
+@@ -428,7 +432,7 @@ std::unique_ptr<APT::CacheFilter::Matcher> PatternParser::aPattern(std::unique_p
+    assert(nodeP != nullptr);
+    auto node = dynamic_cast<PatternTreeParser::PatternNode *>(nodeP.get());
+    if (node == nullptr)
+-      nodeP->error("Expected a pattern");
++      return nodeP->error("Expected a pattern");
+ 
+    if (node->matches("?architecture", 1, 1))
+       return std::make_unique<APT::CacheFilter::PackageArchitectureMatchesSpecification>(aWord(node->arguments[0]));
+@@ -552,7 +556,7 @@ std::string PatternParser::aWord(std::unique_ptr<PatternTreeParser::Node> &nodeP
+    assert(nodeP != nullptr);
+    auto node = dynamic_cast<PatternTreeParser::WordNode *>(nodeP.get());
+    if (node == nullptr)
+-      nodeP->error("Expected a word");
++      return nodeP->error("Expected a word"), std::string{};
+    return std::string{node->word};
+ }
+ 
+@@ -595,20 +599,16 @@ std::unique_ptr<APT::CacheFilter::Matcher> APT::CacheFilter::ParsePattern(std::s
+    if (file != nullptr && !file->BuildDepCache())
+       return nullptr;
+ 
+-   try
+-   {
+-      auto top = APT::Internal::PatternTreeParser(pattern).parseTop();
+-      APT::Internal::PatternParser parser{file};
+-      return parser.aPattern(top);
+-   }
+-   catch (APT::Internal::PatternTreeParser::Error &e)
++   APT::Internal::PatternTreeParser tree(pattern);
++   auto top = tree.parseTop();
++   if (auto const *e = tree.error())
+    {
+       std::stringstream ss;
+-      ss << "input:" << e.location.start << "-" << e.location.end << ": error: " << e.message << "\n";
++      ss << "input:" << e->location.start << "-" << e->location.end << ": error: " << e->message << "\n";
+       ss << pattern << "\n";
+-      for (size_t i = 0; i < e.location.start; i++)
++      for (size_t i = 0; i < e->location.start; i++)
+ 	 ss << " ";
+-      for (size_t i = e.location.start; i < e.location.end; i++)
++      for (size_t i = e->location.start; i < e->location.end; i++)
+ 	 ss << "^";
+ 
+       ss << "\n";
+@@ -616,6 +616,10 @@ std::unique_ptr<APT::CacheFilter::Matcher> APT::CacheFilter::ParsePattern(std::s
+       _error->Error("%s", ss.str().c_str());
+       return nullptr;
+    }
++   if (top == nullptr)
++      return nullptr;
++   APT::Internal::PatternParser parser{file};
++   return parser.aPattern(top);
+ }
+ 
+ } // namespace APT
+diff --git a/apt-pkg/cachefilter-patterns.h b/apt-pkg/cachefilter-patterns.h
+index 8d8a62a9f..4921b1bac 100644
+--- a/apt-pkg/cachefilter-patterns.h
++++ b/apt-pkg/cachefilter-patterns.h
+@@ -80,6 +80,8 @@ struct APT_PUBLIC PatternTreeParser
+       size_t offset = 0;
+    };
+ 
++   std::optional<Error> errorState;
++
+    /// \brief Zero-terminated wrapper for std::string_view
+    ///
+    /// The code peeks a character ahead and assumes the input is zero-terminated, but it may not be,
+@@ -113,8 +115,10 @@ struct APT_PUBLIC PatternTreeParser
+    /// whitespace.
+    std::unique_ptr<Node> parseTop();
+    std::unique_ptr<Node> parse(); // public for test cases only
++   Error const *error() const { return errorState ? &*errorState : nullptr; }
+ 
+    private:
++   APT_HIDDEN std::unique_ptr<Node> fail(Node location, std::string message);
+    APT_HIDDEN std::unique_ptr<Node> parseOr();
+    APT_HIDDEN std::unique_ptr<Node> parseAnd();
+    APT_HIDDEN std::unique_ptr<Node> parseUnary();
+diff --git a/apt-pkg/contrib/configuration.cc b/apt-pkg/contrib/configuration.cc
+index 17cdb72c6..ad25e1f99 100644
+--- a/apt-pkg/contrib/configuration.cc
++++ b/apt-pkg/contrib/configuration.cc
+@@ -37,6 +37,7 @@
+ #include <array>
+ #include <fstream>
+ #include <iterator>
++#include <memory>
+ #include <numeric>
+ #include <sstream>
+ #include <stack>
+@@ -1143,23 +1144,14 @@ bool ReadConfigFile(Configuration &Conf,const string &FName,bool const &AsSectio
+       // using strstrip now to ensure backwards compatibility.
+       //   -- dburrows 2008-04-01
+       {
+-	char *Buffer = new char[End - Start + 1];
+-	try
+-	  {
+-	    std::copy(Start, End, Buffer);
+-	    Buffer[End - Start] = '\0';
+-
+-	    const char *Stripd = _strstrip(Buffer);
+-	    if (*Stripd != 0 && LineBuffer.empty() == false)
+-	      LineBuffer += " ";
+-	    LineBuffer += Stripd;
+-	  }
+-	catch(...)
+-	  {
+-	    delete[] Buffer;
+-	    throw;
+-	  }
+-	delete[] Buffer;
++	auto Buffer = std::make_unique<char[]>(End - Start + 1);
++	std::copy(Start, End, Buffer.get());
++	Buffer[End - Start] = '\0';
++
++	const char *Stripd = _strstrip(Buffer.get());
++	if (*Stripd != 0 && LineBuffer.empty() == false)
++	  LineBuffer += " ";
++	LineBuffer += Stripd;
+       }
+    }
+ 
+diff --git a/apt-pkg/contrib/gpgv.cc b/apt-pkg/contrib/gpgv.cc
+index 0341521ac..84b7c8507 100644
+--- a/apt-pkg/contrib/gpgv.cc
++++ b/apt-pkg/contrib/gpgv.cc
+@@ -732,8 +732,13 @@ bool IsAssertedPubKeyAlgo(std::string const &pkstr, std::string const &option) /
+ 	 if (not std::all_of(ass.begin() + 5, ass.end(), isdigit))
+ 	    return _error->Error("Unrecognized public key specification '%s' in option %s: expect only digits after >=rsa", ass.c_str(), option.c_str());
+ 
+-	 int assBits = std::stoi(ass.substr(5));
+-	 int pkBits = std::stoi(pkstr.substr(3));
++	 char *assEnd = nullptr;
++	 char *pkEnd = nullptr;
++	 errno = 0;
++	 auto const assBits = std::strtol(ass.c_str() + 5, &assEnd, 10);
++	 auto const pkBits = std::strtol(pkstr.c_str() + 3, &pkEnd, 10);
++	 if (errno != 0 || assEnd == nullptr || *assEnd != '\0' || pkEnd == nullptr || *pkEnd != '\0')
++	    return _error->Error("Unrecognized public key specification '%s' in option %s", ass.c_str(), option.c_str());
+ 
+ 	 if (pkBits >= assBits)
+ 	    return true;
+diff --git a/apt-pkg/contrib/strutl.cc b/apt-pkg/contrib/strutl.cc
+index bfd4967f5..66c59a098 100644
+--- a/apt-pkg/contrib/strutl.cc
++++ b/apt-pkg/contrib/strutl.cc
+@@ -1114,18 +1114,18 @@ bool RFC1123StrToTime(std::string const &str,time_t &time)
+       auto const expldate = VectorizeString(datespec, '-');
+       if (expldate.size() != 3)
+ 	 return false;
+-      try {
+-	 size_t pos;
+-	 day = std::stoi(expldate[0], &pos);
+-	 if (pos != expldate[0].length())
+-	    return false;
+-	 year = 1900 + std::stoi(expldate[2], &pos);
+-	 if (pos != expldate[2].length())
+-	    return false;
+-	 strprintf(datespec, "%.4d-%.2d-%.2d", year, MonthConv(expldate[1].c_str()) + 1, day);
+-      } catch (...) {
++      char *end = nullptr;
++      errno = 0;
++      auto parsedDay = std::strtol(expldate[0].c_str(), &end, 10);
++      if (errno != 0 || end == nullptr || *end != '\0' || parsedDay < 0 || parsedDay > std::numeric_limits<int>::max())
+          return false;
+-      }
++      day = static_cast<int>(parsedDay);
++      errno = 0;
++      auto parsedYear = std::strtol(expldate[2].c_str(), &end, 10);
++      if (errno != 0 || end == nullptr || *end != '\0' || parsedYear < 0 || parsedYear > std::numeric_limits<int>::max() - 1900)
++         return false;
++      year = 1900 + static_cast<int>(parsedYear);
++      strprintf(datespec, "%.4d-%.2d-%.2d", year, MonthConv(expldate[1].c_str()) + 1, day);
+       break;
+    }
+ 
+@@ -1135,14 +1135,11 @@ bool RFC1123StrToTime(std::string const &str,time_t &time)
+    if (zone != "GMT" && zone != "UTC" && zone != "Z") // RFC 822
+    {
+       // numeric timezones as a should of RFC 1123 and generally preferred
+-      try {
+-	 size_t pos;
+-	 auto const z = std::stoi(zone, &pos);
+-	 if (z != 0 || pos != zone.length())
+-	    return false;
+-      } catch (...) {
++      char *end = nullptr;
++      errno = 0;
++      auto const z = std::strtol(zone.c_str(), &end, 10);
++      if (errno != 0 || end == nullptr || *end != '\0' || z != 0)
+ 	 return false;
+-      }
+    }
+ 
+    if (datespec.empty())
+diff --git a/cmdline/apt-helper.cc b/cmdline/apt-helper.cc
+index 0700de0f6..79dded03e 100644
+--- a/cmdline/apt-helper.cc
++++ b/cmdline/apt-helper.cc
+@@ -293,19 +293,16 @@ static bool AnalyzePattern(CommandLine &CmdL)				/*{{{*/
+    if (CmdL.FileSize() != 2)
+       return _error->Error("Expect one argument, a pattern");
+ 
+-   try
+-   {
+-      auto top = APT::Internal::PatternTreeParser(CmdL.FileList[1]).parseTop();
+-      top->render(std::cout) << "\n";
+-   }
+-   catch (APT::Internal::PatternTreeParser::Error &e)
++   APT::Internal::PatternTreeParser tree(CmdL.FileList[1]);
++   auto top = tree.parseTop();
++   if (auto const *e = tree.error())
+    {
+       std::stringstream ss;
+-      ss << "input:" << e.location.start << "-" << e.location.end << ": error: " << e.message << "\n";
++      ss << "input:" << e->location.start << "-" << e->location.end << ": error: " << e->message << "\n";
+       ss << CmdL.FileList[1] << "\n";
+-      for (size_t i = 0; i < e.location.start; i++)
++      for (size_t i = 0; i < e->location.start; i++)
+ 	 ss << " ";
+-      for (size_t i = e.location.start; i < e.location.end; i++)
++      for (size_t i = e->location.start; i < e->location.end; i++)
+ 	 ss << "^";
+ 
+       ss << "\n";
+@@ -313,6 +310,9 @@ static bool AnalyzePattern(CommandLine &CmdL)				/*{{{*/
+       _error->Error("%s", ss.str().c_str());
+       return false;
+    }
++   if (top == nullptr)
++      return false;
++   top->render(std::cout) << "\n";
+ 
+    return true;
+ }
+diff --git a/apt-private/private-history.cc b/apt-private/private-history.cc
+index b2c8df19d..a0d4d9337 100644
+--- a/apt-private/private-history.cc
++++ b/apt-private/private-history.cc
+@@ -16,11 +16,13 @@
+ #include <apt-private/private-install.h>
+ #include <apt-private/private-output.h>
+ 
+ #include <cassert>
++#include <cerrno>
++#include <cstdlib>
+ #include <iomanip>
+ #include <iostream>
++#include <limits>
+ #include <span>
+-#include <stdexcept>
+ #include <string>
+ #include <unordered_map>
+ 
+@@ -394,14 +396,15 @@ static bool ParseId(const char *str, size_t &id, size_t max)
+ {
+    if (str == nullptr)
+       return _error->Error(_("Incorrect usage, no ID was given."));
+-   try
+-   {
+-      id = std::stoi(str);
+-   }
+-   catch (const std::invalid_argument &e)
+-   {
++   if (*str == '\0' || *str == '-')
+       return _error->Error(_("'%s' not a valid ID."), str);
+-   }
++   char *end = nullptr;
++   errno = 0;
++   auto const parsed = std::strtoull(str, &end, 10);
++   if (errno != 0 || end == nullptr || *end != '\0' ||
++       parsed > std::numeric_limits<size_t>::max())
++      return _error->Error(_("'%s' not a valid ID."), str);
++   id = static_cast<size_t>(parsed);
+    if (max < id)
+       return _error->Error(_("Transaction ID '%ld' out of bounds."), id);
+ 
+diff --git a/apt-private/private-main.cc b/apt-private/private-main.cc
+index e74697203..9362f9df8 100644
+--- a/apt-private/private-main.cc
++++ b/apt-private/private-main.cc
+@@ -8,7 +8,6 @@
+ #include <apt-private/private-output.h>
+ 
+ #include <iostream>
+-#include <locale>
+ 
+ #include <csignal>
+ #include <cstring>
+@@ -19,11 +18,7 @@
+ 
+ void InitLocale(APT_CMD const binary)				/*{{{*/
+ {
+-   try {
+-      std::locale::global(std::locale(""));
+-   } catch (...) {
+-      setlocale(LC_ALL, "");
+-   }
++   setlocale(LC_ALL, "");
+    switch(binary)
+    {
+       case APT_CMD::APT:
+diff --git a/methods/aptmethod.h b/methods/aptmethod.h
+index bb268acb8..85ef8f5a8 100644
+--- a/methods/aptmethod.h
++++ b/methods/aptmethod.h
+@@ -528,11 +528,7 @@ public:
+    aptMethod(std::string &&Binary, char const *const Ver, unsigned long const Flags) APT_NONNULL(3)
+        : pkgAcqMethod(Ver, Flags), aptConfigWrapperForMethods(Binary), Binary(std::move(Binary)), SeccompFlags(0)
+    {
+-      try {
+-	 std::locale::global(std::locale(""));
+-      } catch (...) {
+-	 setlocale(LC_ALL, "");
+-      }
++      setlocale(LC_ALL, "");
+    }
+ };
+ class aptAuthConfMethod : public aptMethod

@@ -4,7 +4,6 @@
 /rootfs.zip
 /rootfs/packages/
 /runtime-packages/
-/rootfs/usr/
 /backend/static/rootfs.zip
 /backend/static/index.html
 /backend/static/wasm-cli-worker.js
@@ -15,6 +14,13 @@
 /dist-*/
 /dist/
 /node_modules/
+/backend/static/*
+!/backend/static/.gitkeep
+/backend/templates/app_shell.html
+/frontend/src/generated/
+/MEMORY.md
+/out.txt
+/script.sh
 
 # Local scratch and backup files
 *.bak
@@ -206,3 +212,10 @@ cython_debug/
 .pypirc
 
 AGENTS.md
+ports/apt-wasix/.cache/
+
+# Root filesystem libraries are source, not Python build output.
+!/rootfs/usr/lib/
+!/rootfs/usr/lib/**
+/rootfs/usr/lib/**/__pycache__/
+/rootfs/usr/lib/**/*.pyc

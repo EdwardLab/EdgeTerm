@@ -1,0 +1,110 @@
+--- a/src/deb/extract.c
++++ b/src/deb/extract.c
+@@ -278,6 +278,99 @@
+     ohshit(_("'%.255s' is not a Debian format archive"), debar);
+   }
+ 
++#ifdef __wasi__
++  {
++    char compressed_path[] = "/tmp/dpkg-deb-compressed.XXXXXX";
++    char archive_path[] = "/tmp/dpkg-deb-archive.XXXXXX";
++    int compressed_fd;
++    int archive_fd = -1;
++
++    compressed_fd = mkstemp(compressed_path);
++    if (compressed_fd < 0)
++      ohshite(_("cannot create temporary compressed archive"));
++    if (fd_fd_copy(ar->fd, compressed_fd, memberlen, &err) < 0)
++      ohshit(_("cannot copy archive member from '%s': %s"), ar->name, err.str);
++    if (close(compressed_fd) != 0)
++      ohshite(_("cannot close temporary compressed archive"));
++    compressed_fd = open(compressed_path, O_RDONLY);
++    if (compressed_fd < 0)
++      ohshite(_("cannot reopen temporary compressed archive"));
++
++    if (taroption == DPKG_TAR_PASSTHROUGH) {
++      decompress_filter(&decompress_params, compressed_fd, STDOUT_FILENO,
++                        _("decompressing archive '%s' (size=%jd) member '%s'"),
++                        ar->name, (intmax_t)ar->size,
++                        admininfo ? ADMINMEMBER : DATAMEMBER);
++    } else {
++      char *arguments[10];
++      size_t argument_count = 0;
++      int spawn_error;
++
++      archive_fd = mkstemp(archive_path);
++      if (archive_fd < 0)
++        ohshite(_("cannot create temporary tar archive"));
++      decompress_filter(&decompress_params, compressed_fd, archive_fd,
++                        _("decompressing archive '%s' (size=%jd) member '%s'"),
++                        ar->name, (intmax_t)ar->size,
++                        admininfo ? ADMINMEMBER : DATAMEMBER);
++      archive_fd = open(archive_path, O_RDONLY);
++      if (archive_fd < 0)
++        ohshite(_("cannot reopen temporary tar archive"));
++
++      arguments[argument_count++] = "tar";
++      if ((taroption & DPKG_TAR_LIST) && (taroption & DPKG_TAR_EXTRACT))
++        arguments[argument_count++] = "-xv";
++      else if (taroption & DPKG_TAR_EXTRACT)
++        arguments[argument_count++] = "-x";
++      else if (taroption & DPKG_TAR_LIST)
++        arguments[argument_count++] = "-tv";
++      else
++        internerr("unknown or missing tar action '%d'", taroption);
++      if (taroption & DPKG_TAR_PERMS)
++        arguments[argument_count++] = "-p";
++      if (taroption & DPKG_TAR_NOMTIME)
++        arguments[argument_count++] = "-m";
++      if (dir) {
++        arguments[argument_count++] = "-C";
++        arguments[argument_count++] = (char *)dir;
++      }
++      arguments[argument_count++] = "-f";
++      arguments[argument_count++] = "-";
++      arguments[argument_count] = NULL;
++
++      unsetenv("TAR_OPTIONS");
++      if (dir) {
++        struct stat directory_stat;
++
++        if (stat(dir, &directory_stat) == 0) {
++          if (taroption & DPKG_TAR_CREATE_DIR)
++            ohshite(_("unexpected pre-existing pathname %s"), dir);
++        } else if (mkdir(dir, 0777) != 0) {
++          if (stat(dir, &directory_stat) != 0)
++            ohshite(_("failed to create directory"));
++        }
++      }
++
++      spawn_error = edgeterm_spawn(&c3, TAR, arguments,
++                                    archive_fd, -1, -1);
++      if (spawn_error != 0) {
++        errno = spawn_error;
++        ohshite(_("unable to execute %s"), TAR);
++      }
++      subproc_reap(c3, "tar", 0);
++    }
++
++    if (archive_fd >= 0 && close(archive_fd) != 0)
++      ohshite(_("cannot close temporary tar archive"));
++    if (close(compressed_fd) != 0)
++      ohshite(_("cannot close temporary compressed archive"));
++    if (archive_fd >= 0 && unlink(archive_path) != 0)
++      ohshite(_("cannot remove temporary tar archive"));
++    if (unlink(compressed_path) != 0)
++      ohshite(_("cannot remove temporary compressed archive"));
++    dpkg_ar_close(ar);
++  }
++#else
+   m_pipe(p1);
+   c1 = subproc_fork();
+   if (!c1) {
+@@ -366,6 +459,7 @@
+   subproc_reap(c2, _("<decompress>"), SUBPROC_NOPIPE);
+   if (c1 >= 0)
+     subproc_reap(c1, _("paste"), 0);
++#endif
+   if (version.major == 0 && admininfo) {
+     /* Handle the version as a float to preserve the behavior of old code,
+      * because even if the format is defined to be padded by 0's that might

@@ -2,14 +2,37 @@
   "name": "edgeterm-workspace",
   "private": true,
   "type": "module",
+  "engines": { "node": ">=22" },
   "scripts": {
+    "prepare:runtime": "node scripts/prepare-runtime.mjs",
+    "check:runtime": "node scripts/prepare-runtime.mjs --check",
+    "test": "node --test tests/external-shell/*.test.mjs tests/node-runtime/*.test.mjs tests/apt-upstream/*.test.mjs tests/backup/*.test.mjs tests/development/*.test.mjs && node scripts/test-bridge.mjs",
+    "test:backend": "python3 -m unittest discover -s tests/backend",
+    "test:browser": "node tests/browser/server.mjs",
     "build:offline": "node scripts/build.mjs offline",
-    "build:cloud": "node scripts/build.mjs cloud"
+    "build:cloud": "node scripts/build.mjs cloud",
+    "build:embed": "node scripts/build.mjs embed",
+    "prepare:node-runtime": "node scripts/fetch-node-runtime.mjs",
+    "serve:embed": "node scripts/serve-embed.mjs",
+    "test:bridge": "node scripts/test-bridge.mjs",
+    "test:node-runtime": "node --test tests/node-runtime/*.test.mjs",
+    "test:external-shell": "node --test tests/external-shell/*.test.mjs",
+    "test:apt-port": "node --test tests/apt-upstream/*.test.mjs",
+    "test:apt-runtime": "bash tests/apt-upstream/runtime-transaction.sh",
+    "test:backup": "node --test tests/backup/*.test.mjs",
+    "test:development": "node --test tests/development/*.test.mjs"
   },
   "dependencies": {
-    "jszip": "^3.10.1"
+    "@wasmer/sdk": "0.11.0",
+    "esbuild-wasm": "0.25.12",
+    "html2canvas": "^1.4.1",
+    "jszip": "^3.10.1",
+    "openpgp": "6.3.1",
+    "semver": "7.7.3",
+    "smol-toml": "^1.8.0"
   },
   "devDependencies": {
-    "esbuild": "^0.25.4"
+    "esbuild": "^0.25.4",
+    "fake-indexeddb": "^6.2.2"
   }
 }

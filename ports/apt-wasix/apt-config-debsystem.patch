@@ -1,0 +1,12 @@
+diff --git a/cmdline/CMakeLists.txt b/cmdline/CMakeLists.txt
+index 3c89bba0c..cf9a0b9ee 100644
+--- a/cmdline/CMakeLists.txt
++++ b/cmdline/CMakeLists.txt
+@@ -4,6 +4,7 @@ add_executable(apt-cache apt-cache.cc)
+ add_executable(apt-get apt-get.cc)
+ add_executable(apt-mark apt-mark.cc)
+ add_executable(apt-config apt-config.cc)
++target_sources(apt-config PRIVATE ../apt-pkg/deb/debsystem.cc)
+ add_executable(apt-cdrom apt-cdrom.cc)
+ add_executable(apt-helper apt-helper.cc)
+ add_executable(apt-sortpkgs apt-sortpkgs.cc)

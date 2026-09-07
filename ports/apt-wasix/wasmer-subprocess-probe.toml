@@ -1,0 +1,34 @@
+[package]
+name = "digitalplat/edgeterm-subprocess-probe"
+version = "0.0.1"
+description = "Local WASIX subprocess packaging probe"
+license = "GPL-2.0-only"
+entrypoint = "ash"
+
+[[module]]
+name = "busybox"
+source = ".cache/busybox-1.38.0-wasix.wasm"
+
+[[module]]
+name = "execv-probe"
+source = ".cache/execv-probe.wasm"
+
+[[command]]
+name = "busybox"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "ash"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "echo"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "execv-probe"
+module = "execv-probe"
+runner = "wasi"

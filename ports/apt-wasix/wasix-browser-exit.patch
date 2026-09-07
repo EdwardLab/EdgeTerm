@@ -1,0 +1,101 @@
+diff --git a/cmdline/apt.cc b/cmdline/apt.cc
+--- a/cmdline/apt.cc
++++ b/cmdline/apt.cc
+@@ -144,6 +144,6 @@ int main(int argc, const char *argv[])
+ 
+    CheckIfSimulateMode(CmdL);
+ 
+-   return DispatchCommandLine(CmdL, Cmds);
++   return edgeterm_exit(DispatchCommandLine(CmdL, Cmds));
+ }
+ 									/*}}}*/
+diff --git a/cmdline/apt-cache.cc b/cmdline/apt-cache.cc
+--- a/cmdline/apt-cache.cc
++++ b/cmdline/apt-cache.cc
+@@ -1132,6 +1132,6 @@ int main(int argc,const char *argv[])
+    if (_config->Exists("APT::Cache::Generate") == true)
+       _config->Set("pkgCacheFile::Generate", _config->FindB("APT::Cache::Generate", true));
+ 
+-   return DispatchCommandLine(CmdL, Cmds);
++   return edgeterm_exit(DispatchCommandLine(CmdL, Cmds));
+ }
+ 									/*}}}*/
+diff --git a/cmdline/apt-get.cc b/cmdline/apt-get.cc
+--- a/cmdline/apt-get.cc
++++ b/cmdline/apt-get.cc
+@@ -449,6 +449,6 @@ int main(int argc,const char *argv[])
+ 
+    CheckIfSimulateMode(CmdL);
+ 
+-   return DispatchCommandLine(CmdL, Cmds);
++   return edgeterm_exit(DispatchCommandLine(CmdL, Cmds));
+ }
+ 									/*}}}*/
+diff --git a/cmdline/apt-config.cc b/cmdline/apt-config.cc
+--- a/cmdline/apt-config.cc
++++ b/cmdline/apt-config.cc
+@@ -139,6 +139,6 @@ int main(int argc,const char *argv[])
+    for (std::vector<std::string>::const_iterator p = profiles.begin(); p != profiles.end(); ++p)
+       _config->Set("APT::Build-Profiles::", *p);
+ 
+-   return DispatchCommandLine(CmdL, Cmds);
++   return edgeterm_exit(DispatchCommandLine(CmdL, Cmds));
+ }
+ 									/*}}}*/
+diff --git a/cmdline/apt-mark.cc b/cmdline/apt-mark.cc
+--- a/cmdline/apt-mark.cc
++++ b/cmdline/apt-mark.cc
+@@ -437,6 +437,6 @@ int main(int argc,const char *argv[])
+ 
+    InitOutput();
+ 
+-   return DispatchCommandLine(CmdL, Cmds);
++   return edgeterm_exit(DispatchCommandLine(CmdL, Cmds));
+ }
+ 									/*}}}*/
+diff --git a/methods/file.cc b/methods/file.cc
+--- a/methods/file.cc
++++ b/methods/file.cc
+@@ -144,4 +144,4 @@ bool FileMethod::Fetch(FetchItem *Itm)
+ int main()
+ {
+-   return FileMethod().Run();
++   return edgeterm_exit(FileMethod().Run());
+ }
+diff --git a/methods/copy.cc b/methods/copy.cc
+--- a/methods/copy.cc
++++ b/methods/copy.cc
+@@ -106,4 +106,4 @@ bool CopyMethod::Fetch(FetchItem *Itm)
+ int main()
+ {
+-   return CopyMethod().Run();
++   return edgeterm_exit(CopyMethod().Run());
+ }
+diff --git a/methods/store.cc b/methods/store.cc
+--- a/methods/store.cc
++++ b/methods/store.cc
+@@ -144,4 +144,4 @@ bool StoreMethod::Fetch(FetchItem *Itm)
+ int main(int, char *argv[])
+ {
+-   return StoreMethod(std::string{flNotDir(argv[0])}).Run();
++   return edgeterm_exit(StoreMethod(std::string{flNotDir(argv[0])}).Run());
+ }
+diff --git a/methods/http.cc b/methods/http.cc
+--- a/methods/http.cc
++++ b/methods/http.cc
+@@ -1049,5 +1049,5 @@ int main(int, const char *argv[])
+    std::string Binary{flNotDir(argv[0])};
+    if (Binary.find('+') == std::string::npos && Binary != "https" && Binary != "http")
+       Binary.append("+http");
+-   return HttpMethod(std::move(Binary)).Loop();
++   return edgeterm_exit(HttpMethod(std::move(Binary)).Loop());
+ }
+diff --git a/methods/gpgv.cc b/methods/gpgv.cc
+--- a/methods/gpgv.cc
++++ b/methods/gpgv.cc
+@@ -619,4 +619,4 @@ bool GPGVMethod::URIAcquire(std::string const &Message, FetchItem *Itm)
+ int main()
+ {
+-   return GPGVMethod().Run();
++   return edgeterm_exit(GPGVMethod().Run());
+ }

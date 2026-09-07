@@ -215,6 +215,8 @@ def writeback_share(share_id):
     share = db["shares"].get(share_id)
     if not share or share.get("revoked"):
         return jsonify({"error": "share not found"}), 404
+    if share.get("expiresAt") and share["expiresAt"] <= utc_ms():
+        return jsonify({"error": "share expired"}), 410
     owner = db["users"].get(share["ownerId"])
     snapshot = db["snapshots"].get(share["snapshotId"])
     if not owner or not snapshot:
@@ -229,7 +231,12 @@ def writeback_share(share_id):
     if not guest_overwrite and not share.get("allowCloudWriteBack"):
         return jsonify({"error": "cloud write-back is not enabled for this share"}), 403
     strategy = (request.headers.get("X-EdgeTerm-Conflict-Strategy") or request.args.get("strategy", "overwrite")).strip().lower()
-    base_version = int(request.headers.get("X-EdgeTerm-Base-Version", "0") or "0")
+    try:
+        base_version = int(request.headers.get("X-EdgeTerm-Base-Version", "0") or "0")
+        if base_version < 0:
+            raise ValueError()
+    except ValueError:
+        return jsonify({"error": "base version must be a non-negative integer"}), 400
     raw = request.get_data(cache=False, as_text=False)
     if strategy not in {"overwrite", "fork"}:
         return jsonify({"error": "invalid conflict strategy"}), 400
@@ -237,6 +244,8 @@ def writeback_share(share_id):
         return jsonify({"error": "guest write-back only supports overwrite"}), 403
     owner_perms = merged_permissions(owner, db)
     if strategy == "fork":
+        if not share.get("allowFork", True):
+            return jsonify({"error": "forking is disabled for this share"}), 403
         if user is None:
             return jsonify({"error": "login required for fork"}), 401
         actor_perms = merged_permissions(user, db)
@@ -258,8 +267,13 @@ def writeback_share(share_id):
     temp_id = secrets.token_urlsafe(12)
     temp_path = store.blob_dir / f"{temp_id}.zip"
     temp_path.write_bytes(raw)
+    validation_quota = int(actor_perms["storageQuota"] if strategy == "fork" else owner_perms["storageQuota"])
     try:
-        validate_snapshot_zip(temp_path, max(int(owner_perms["storageQuota"]), len(raw)))
+        validate_snapshot_zip(temp_path, validation_quota)
+    except (ValueError, OSError):
+        temp_path.unlink(missing_ok=True)
+        return jsonify({"error": "invalid workspace ZIP"}), 400
+    try:
         if strategy == "fork":
             new_id = secrets.token_urlsafe(12)
             final_path = store.blob_dir / f"{new_id}.zip"

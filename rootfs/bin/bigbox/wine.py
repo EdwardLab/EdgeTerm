@@ -1,6 +1,7 @@
 """wine - launch Win32 programs through EdgeTerm's browser BoxedWine bridge."""
 
 import os
+import json
 import shlex
 
 import js
@@ -27,19 +28,24 @@ async def main(args):
         print(HELP.strip())
         return 0
     normalized_args = []
+    requested_threading = ""
     for arg in args:
         if arg == "--wine11":
             os.environ["EDGETERM_WINE_VERSION"] = "wine11"
         elif arg in {"--multi-thread", "--multithread", "--threaded"}:
             os.environ["EDGETERM_WINE_THREADING"] = "multi"
+            requested_threading = "multi"
         elif arg in {"--single-thread", "--singlethread"}:
             os.environ["EDGETERM_WINE_THREADING"] = "single"
+            requested_threading = "single"
         elif arg.startswith("--threading="):
             value = arg.split("=", 1)[1].strip().lower()
             if value in {"multi", "multithread", "multi-thread", "threaded"}:
                 os.environ["EDGETERM_WINE_THREADING"] = "multi"
+                requested_threading = "multi"
             elif value in {"single", "singlethread", "single-thread"}:
                 os.environ["EDGETERM_WINE_THREADING"] = "single"
+                requested_threading = "single"
             else:
                 print(f"wine: unsupported threading mode: {value}")
                 return 1
@@ -58,7 +64,9 @@ async def main(args):
     cwd = os.environ.get("PWD") or os.getcwd()
     env = {key: str(value) for key, value in os.environ.items()}
     try:
-        result = await bridge.runCommand("wine", args, cwd, env)
+        env_object = js.JSON.parse(json.dumps(env))
+        options_object = js.JSON.parse(json.dumps({"threading": requested_threading}))
+        result = await bridge.runCommand("wine", args, cwd, env_object, options_object)
     except Exception as exc:
         print(f"wine: browser Wine bridge failed: {exc}")
         return 1

@@ -1,0 +1,54 @@
+diff --git a/apt-private/private-download.cc b/apt-private/private-download.cc
+index 01989be8d..fcf9485da 100644
+--- a/apt-private/private-download.cc
++++ b/apt-private/private-download.cc
+@@ -27,13 +27,12 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ #ifdef HAVE_VFS_H
+ #include <sys/vfs.h>
+-#else
+-#ifdef HAVE_PARAMS_H
++#elif defined(HAVE_PARAMS_H)
+ #include <sys/params.h>
+-#endif
++#elif defined(HAVE_MOUNT_H)
+ #include <sys/mount.h>
+ #endif
+ #include <cerrno>
+ #include <sys/stat.h>
+ #include <sys/statvfs.h>
+@@ -146,17 +145,19 @@ bool CheckFreeSpaceBeforeDownload(std::string const &Dir, unsigned long long Fet
+    unsigned long long const FreeBlocks = _config->Find("APT::Sandbox::User").empty() ? Buf.f_bfree : Buf.f_bavail;
+    if (FreeBlocks >= (FetchBytes / Buf.f_bsize))
+       return true;
++#if defined(HAVE_VFS_H) || defined(HAVE_MOUNT_H)
+    struct statfs Stat;
+    if (statfs(Dir.c_str(), &Stat) != 0)
+       return _error->Error(_("Couldn't determine filesystem statistics of %s."), Dir.c_str());
+ 
+ #ifdef HAVE_STRUCT_STATFS_F_TYPE
+    if (Stat.f_type == RAMFS_MAGIC)
+       return true;
+    // do not run out of space on a tmpfs without a size limit (size is zero)
+    if (Stat.f_type == TMPFS_MAGIC && Buf.f_blocks == 0)
+       return true;
+ #endif
++#endif
+    return _error->Error(_("You don't have enough free space in %s."), Dir.c_str());
+ }
+ 									/*}}}*/
+diff --git a/apt-private/CMakeLists.txt b/apt-private/CMakeLists.txt
+index 9648a5bd0..17c838a4c 100644
+--- a/apt-private/CMakeLists.txt
++++ b/apt-private/CMakeLists.txt
+@@ -18,6 +18,9 @@ else()
+ endif()
+ 
+ # Link the library and set the SONAME
++target_include_directories(apt-private
++                           PRIVATE $<$<BOOL:${XXHASH_FOUND}>:${XXHASH_INCLUDE_DIRS}>
++)
+ target_link_libraries(apt-private PUBLIC apt-pkg)
+ set_target_properties(apt-private PROPERTIES CXX_VISIBILITY_PRESET hidden)
+ if (NOT WASIX_STATIC)

@@ -1,0 +1,9 @@
+--- a/lib/dpkg/Makefile.am
++++ b/lib/dpkg/Makefile.am
+@@ -49,6 +49,7 @@
+ libdpkg_la_SOURCES = \
+ 	dlist.h \
++	edgeterm-wasix-compat.c \
+ 	ar.c \
+ 	arch.c \
+ 	atomic-file.c \

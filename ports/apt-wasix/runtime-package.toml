@@ -1,0 +1,582 @@
+[package]
+name = "digitalplat/edgeterm-posix-apt"
+version = "0.1.0"
+description = "EdgeTerm browser runtime with upstream APT and dpkg"
+license = "GPL-2.0-only"
+entrypoint = "ash"
+
+[fs]
+"/bin" = "bin"
+"/usr/share/dpkg" = "dpkg-data"
+
+[[module]]
+name = "busybox"
+source = "busybox.wasm"
+
+[[module]]
+name = "apt"
+source = "apt.wasm"
+
+[[module]]
+name = "apt-cache"
+source = "apt-cache.wasm"
+
+[[module]]
+name = "apt-get"
+source = "apt-get.wasm"
+
+[[module]]
+name = "apt-config"
+source = "apt-config.wasm"
+
+[[module]]
+name = "apt-mark"
+source = "apt-mark.wasm"
+
+[[module]]
+name = "apt-method-file"
+source = "apt-method-file.wasm"
+
+[[module]]
+name = "apt-method-copy"
+source = "apt-method-copy.wasm"
+
+[[module]]
+name = "apt-method-store"
+source = "apt-method-store.wasm"
+
+[[module]]
+name = "apt-method-http"
+source = "apt-method-http.wasm"
+
+[[module]]
+name = "apt-method-gpgv"
+source = "apt-method-gpgv.wasm"
+
+[[module]]
+name = "dpkg"
+source = "dpkg.wasm"
+
+[[module]]
+name = "dpkg-deb"
+source = "dpkg-deb.wasm"
+
+[[module]]
+name = "dpkg-query"
+source = "dpkg-query.wasm"
+
+[[module]]
+name = "dpkg-divert"
+source = "dpkg-divert.wasm"
+
+[[module]]
+name = "dpkg-realpath"
+source = "dpkg-realpath.wasm"
+
+[[module]]
+name = "dpkg-split"
+source = "dpkg-split.wasm"
+
+[[module]]
+name = "dpkg-statoverride"
+source = "dpkg-statoverride.wasm"
+
+[[module]]
+name = "dpkg-trigger"
+source = "dpkg-trigger.wasm"
+
+[[command]]
+name = "busybox"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "ash"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "sh"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "tar"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "gzip"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "gunzip"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "xz"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "unxz"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "ar"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "awk"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "basename"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "base64"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "bunzip2"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "bzcat"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "bzip2"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "cat"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "chgrp"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "chmod"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "chown"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "cksum"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "cmp"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "comm"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "cp"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "cpio"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "cut"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "date"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "dd"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "diff"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "dirname"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "du"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "echo"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "env"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "expand"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "expr"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "false"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "find"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "fold"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "grep"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "head"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "id"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "install"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "ln"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "ls"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "mkdir"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "mktemp"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "mv"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "paste"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "patch"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "printf"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "ps"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "pwd"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "readlink"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "realpath"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "rm"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "rmdir"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "run-parts"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "sed"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "seq"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "sha256sum"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "sleep"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "sort"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "stat"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "tail"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "tee"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "test"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "touch"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "tr"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "true"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "truncate"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "tty"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "uname"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "uniq"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "unlink"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "unzip"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "wc"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "which"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "whoami"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "xargs"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "yes"
+module = "busybox"
+runner = "wasi"
+
+[[command]]
+name = "zcat"
+module = "busybox"
+runner = "wasi"
+
+
+[[command]]
+name = "apt"
+module = "apt"
+runner = "wasi"
+
+[[command]]
+name = "apt-cache"
+module = "apt-cache"
+runner = "wasi"
+
+[[command]]
+name = "apt-get"
+module = "apt-get"
+runner = "wasi"
+
+[[command]]
+name = "apt-config"
+module = "apt-config"
+runner = "wasi"
+
+[[command]]
+name = "apt-mark"
+module = "apt-mark"
+runner = "wasi"
+
+[[command]]
+name = "file"
+module = "apt-method-file"
+runner = "wasi"
+
+[[command]]
+name = "copy"
+module = "apt-method-copy"
+runner = "wasi"
+
+[[command]]
+name = "store"
+module = "apt-method-store"
+runner = "wasi"
+
+[[command]]
+name = "http"
+module = "apt-method-http"
+runner = "wasi"
+
+[[command]]
+name = "https"
+module = "apt-method-http"
+runner = "wasi"
+
+[[command]]
+name = "gpgv"
+module = "apt-method-gpgv"
+runner = "wasi"
+
+[[command]]
+name = "dpkg"
+module = "dpkg"
+runner = "wasi"
+
+[[command]]
+name = "dpkg-deb"
+module = "dpkg-deb"
+runner = "wasi"
+
+[[command]]
+name = "dpkg-query"
+module = "dpkg-query"
+runner = "wasi"
+
+[[command]]
+name = "dpkg-divert"
+module = "dpkg-divert"
+runner = "wasi"
+
+[[command]]
+name = "dpkg-realpath"
+module = "dpkg-realpath"
+runner = "wasi"
+
+[[command]]
+name = "dpkg-split"
+module = "dpkg-split"
+runner = "wasi"
+
+[[command]]
+name = "dpkg-statoverride"
+module = "dpkg-statoverride"
+runner = "wasi"
+
+[[command]]
+name = "dpkg-trigger"
+module = "dpkg-trigger"
+runner = "wasi"

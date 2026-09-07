@@ -1,0 +1,5 @@
+# Patch context preserves upstream whitespace exactly.
+*.patch -whitespace
+*.deb binary
+*.wasm binary
+*.webc binary

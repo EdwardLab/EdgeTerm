@@ -1,0 +1,207 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 3c9e81197..69662f565 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -87,10 +87,12 @@ add_optional_compile_options(Wsuggest-override)
+ add_optional_compile_options(Werror=suggest-override)
+ add_optional_compile_options(Werror=return-type)
+ add_optional_compile_options(Wp,-D_GLIBCXX_ASSERTIONS)
+-# apt-ftparchive dependencies
+-find_package(Berkeley REQUIRED)
+-if (BERKELEY_FOUND)
+-  set(HAVE_BDB 1)
++option(BUILD_APT_FTPARCHIVE "Build the repository-generation utility" ON)
++if (BUILD_APT_FTPARCHIVE)
++  find_package(Berkeley REQUIRED)
++  if (BERKELEY_FOUND)
++    set(HAVE_BDB 1)
++  endif()
+ endif()
+ 
+ find_package(OpenSSL REQUIRED)
+@@ -94,4 +96,10 @@ endif()
+ 
++if (WASIX_STATIC)
++  add_library(wasix-apt-compat STATIC ${WASIX_APT_COMPAT_SOURCE})
++  target_compile_definitions(wasix-apt-compat PRIVATE EDGETERM_APT_RESOLVER_COMPAT=1)
++  link_libraries(wasix-apt-compat)
++endif()
++
+ find_package(OpenSSL REQUIRED)
+ 
+ # (De)Compressor libraries
+@@ -142,14 +144,14 @@ endif()
+ find_package(XXHASH REQUIRED)
+ 
+ # Mount()ing and stat()ing and friends
++check_function_exists(statvfs HAVE_STATVFS)
+ check_symbol_exists(statfs sys/vfs.h HAVE_VFS_H)
+ check_include_files(sys/params.h HAVE_PARAMS_H)
+ check_symbol_exists(statfs sys/mount.h HAVE_MOUNT_H)
+-if (NOT HAVE_VFS_H AND NOT HAVE_MOUNT_H)
++if (NOT HAVE_STATVFS AND NOT HAVE_VFS_H AND NOT HAVE_MOUNT_H)
+   message(FATAL_ERROR "Can find neither statvfs() nor statfs()")
+ endif()
+ 
+-check_function_exists(statvfs HAVE_STATVFS)
+ if (NOT HAVE_STATVFS)
+   configure_file(CMake/statvfs.h.in ${PROJECT_BINARY_DIR}/include/sys/statvfs.h COPYONLY)
+ endif()
+@@ -253,9 +255,13 @@ add_subdirectory(cmdline)
+ add_subdirectory(completions)
+ add_subdirectory(doc)
+ add_subdirectory(dselect)
+-add_subdirectory(ftparchive)
++if (BUILD_APT_FTPARCHIVE)
++  add_subdirectory(ftparchive)
++endif()
+ add_subdirectory(methods)
+-add_subdirectory(test)
++if (WITH_TESTS)
++  add_subdirectory(test)
++endif()
+ 
+ if (USE_NLS)
+ add_subdirectory(po)
+diff --git a/apt-pkg/CMakeLists.txt b/apt-pkg/CMakeLists.txt
+index 7aaacd9d9..3bfbf42be 100644
+--- a/apt-pkg/CMakeLists.txt
++++ b/apt-pkg/CMakeLists.txt
+@@ -45,7 +45,11 @@ file(GLOB_RECURSE library "*.cc"  "${CMAKE_CURRENT_BINARY_DIR}/tagfile-keys.cc")
+ file(GLOB_RECURSE headers "*.h")
+ 
+ # Create a library using the C++ files
+-add_library(apt-pkg SHARED ${library})
++if (WASIX_STATIC)
++  add_library(apt-pkg STATIC ${library})
++else()
++  add_library(apt-pkg SHARED ${library})
++endif()
+ # Link the library and set the SONAME
+ target_include_directories(apt-pkg
+                            PRIVATE ${ZLIB_INCLUDE_DIRS}
+@@ -74,13 +78,17 @@ target_link_libraries(apt-pkg
+                              OpenSSL::Crypto
+                              $<$<BOOL:${XXHASH_FOUND}>:${XXHASH_LIBRARIES}>
+ )
+-set_target_properties(apt-pkg PROPERTIES VERSION ${MAJOR}.${MINOR})
+-set_target_properties(apt-pkg PROPERTIES SOVERSION ${MAJOR})
+ set_target_properties(apt-pkg PROPERTIES CXX_VISIBILITY_PRESET hidden)
+-target_link_libraries(apt-pkg PRIVATE -Wl,-version-script="${CMAKE_CURRENT_BINARY_DIR}/versionscript")
++if (NOT WASIX_STATIC)
++  set_target_properties(apt-pkg PROPERTIES VERSION ${MAJOR}.${MINOR})
++  set_target_properties(apt-pkg PROPERTIES SOVERSION ${MAJOR})
++  target_link_libraries(apt-pkg PRIVATE -Wl,-version-script="${CMAKE_CURRENT_BINARY_DIR}/versionscript")
++endif()
+ 
+ # Install the library and the header files
+-install(TARGETS apt-pkg LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
++install(TARGETS apt-pkg
++        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
++        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+ install(FILES ${headers} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/apt-pkg)
+ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/apt-pkg.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+ flatify(${PROJECT_BINARY_DIR}/include/apt-pkg/ "${headers}")
+diff --git a/apt-private/CMakeLists.txt b/apt-private/CMakeLists.txt
+index 88a8f97fe..6d86976cf 100644
+--- a/apt-private/CMakeLists.txt
++++ b/apt-private/CMakeLists.txt
+@@ -9,17 +9,24 @@ file(GLOB_RECURSE library "*.cc")
+ file(GLOB_RECURSE headers "*.h")
+ 
+ # Create a library using the C++ files
+-add_library(apt-private SHARED ${library})
++if (WASIX_STATIC)
++  add_library(apt-private STATIC ${library})
++else()
++  add_library(apt-private SHARED ${library})
++endif()
+ 
+ # Link the library and set the SONAME
+ target_link_libraries(apt-private PUBLIC apt-pkg)
+-set_target_properties(apt-private PROPERTIES VERSION ${MAJOR}.${MINOR})
+-set_target_properties(apt-private PROPERTIES SOVERSION ${MAJOR})
+ set_target_properties(apt-private PROPERTIES CXX_VISIBILITY_PRESET hidden)
+-add_version_script(apt-private)
++if (NOT WASIX_STATIC)
++  set_target_properties(apt-private PROPERTIES VERSION ${MAJOR}.${MINOR})
++  set_target_properties(apt-private PROPERTIES SOVERSION ${MAJOR})
++  add_version_script(apt-private)
++endif()
+ 
+ # Install the library and the headers
+ install(TARGETS apt-private
++        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+         NAMELINK_SKIP)
+ 
+diff --git a/po/CMakeLists.txt b/po/CMakeLists.txt
+index 50982e5e0..aa8cf6296 100644
+--- a/po/CMakeLists.txt
++++ b/po/CMakeLists.txt
+@@ -23,13 +23,19 @@ if (TARGET apt-private)
+ endif()
+ 
++set(apt_utils_translation_targets
++    apt-sortpkgs
++    apt-extracttemplates
++    apt-internal-solver
++    apt-dump-solver
++    apt-internal-planner
++)
++if (TARGET apt-ftparchive)
++    list(APPEND apt_utils_translation_targets apt-ftparchive)
++endif()
++
+ apt_add_translation_domain(
+     DOMAIN apt-utils
+-    TARGETS apt-sortpkgs
+-            apt-extracttemplates
+-            apt-internal-solver
+-            apt-dump-solver
+-            apt-internal-planner
+-            apt-ftparchive
++    TARGETS ${apt_utils_translation_targets}
+     EXCLUDE_LANGUAGES ${languages_excluded}
+ )
+ 
+diff --git a/apt-pkg/contrib/fileutl.cc b/apt-pkg/contrib/fileutl.cc
+index 76db69b38..bfca4d443 100644
+--- a/apt-pkg/contrib/fileutl.cc
++++ b/apt-pkg/contrib/fileutl.cc
+@@ -1869,11 +1869,11 @@ public:
+ 	 ZSTD_inBuffer in = {
+ 	    .src = zstd_buffer.get(),
+-	    .size = zstd_buffer.size(),
++	    .size = static_cast<size_t>(zstd_buffer.size()),
+ 	    .pos = 0,
+ 	 };
+ 	 ZSTD_outBuffer out = {
+ 	    .dst = To,
+-	    .size = Size,
++	    .size = static_cast<size_t>(Size),
+ 	    .pos = 0,
+      };
+ 
+@@ -1912,7 +1912,7 @@ public:
+       };
+       ZSTD_inBuffer in = {
+	 .src = From,
+-	 .size = Size,
++	 .size = static_cast<size_t>(Size),
+	 .pos = 0,
+       };
+ 
+diff --git a/apt-pkg/contrib/strutl.cc b/apt-pkg/contrib/strutl.cc
+index dfba0f388..44057cc1b 100644
+--- a/apt-pkg/contrib/strutl.cc
++++ b/apt-pkg/contrib/strutl.cc
+@@ -97,7 +97,7 @@ size_t DisplayLength(string_view str)
+    size_t len = 0;
+ 
+    const char *p = str.data();
+-   const char *const end = str.end();
++   const char *const end = str.data() + str.size();
+ 
+    mbstate_t state{};
+    while (p < end)

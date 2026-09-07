@@ -1,0 +1,28 @@
+--- a/src/main/archives.c
++++ b/src/main/archives.c
+@@ -1594,13 +1594,15 @@ archivefiles(const char *const *argv)
+   ensure_statoverrides(STATDB_PARSE_NORMAL);
+ 
+   for (i = 0; argp[i]; i++) {
++#ifndef __wasi__
+     if (setjmp(ejbuf)) {
+       pop_error_context(ehflag_bombout);
+       if (abort_processing)
+         break;
+       continue;
+     }
+     push_error_context_jump(&ejbuf, print_error_perarchive, argp[i]);
++#endif
+ 
+     dpkg_selabel_load();
+ 
+@@ -1611,7 +1613,9 @@ archivefiles(const char *const *argv)
+     m_output(stderr, _("<standard error>"));
+     onerr_abort--;
+ 
++#ifndef __wasi__
+     pop_error_context(ehflag_normaltidy);
++#endif
+   }
+ 
+   dpkg_selabel_close();

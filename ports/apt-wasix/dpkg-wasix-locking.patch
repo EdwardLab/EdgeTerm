@@ -1,0 +1,36 @@
+--- a/lib/dpkg/file.c
++++ b/lib/dpkg/file.c
+@@ -241,6 +241,10 @@ file_unlock(int lockfd, const char *lockfile, const char *lockdesc)
+ {
+ 	struct flock fl;
+ 
++#ifdef __wasi__
++	return;
++#endif
++
+ 	if (lockfd < 0)
+ 		internerr("%s (%s) fd is %d < 0", lockdesc, lockfile, lockfd);
+ 
+@@ -269,6 +273,10 @@ file_is_locked(int lockfd, const char *filename)
+ {
+ 	struct flock fl;
+ 
++#ifdef __wasi__
++	return false;
++#endif
++
+ 	file_lock_setup(&fl, F_WRLCK);
+ 
+ 	if (fcntl(lockfd, F_GETLK, &fl) < 0)
+@@ -300,6 +308,11 @@ file_lock(int *lockfd, enum file_lock_flags flags, const char *filename,
+ 
+ 	setcloexec(*lockfd, filename);
+ 
++#ifdef __wasi__
++	push_cleanup(file_unlock_cleanup, ~0, 3, lockfd, filename, desc);
++	return;
++#endif
++
+ 	file_lock_setup(&fl, F_WRLCK);
+ 
+ 	if (flags == FILE_LOCK_WAIT)

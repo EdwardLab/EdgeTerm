@@ -1,5 +1,7 @@
 # EdgeTerm `pkg` Package Manager
 
+> Compatibility notice: `pkg` remains available for one release for existing Emscripten packages. New `wasm32-wasix` software is distributed through the original APT and dpkg runtime. The two managers must not own the same executable path.
+
 `pkg` is EdgeTerm's browser-native package manager for prebuilt WASM and Emscripten command packages. It installs package payloads into `/packages/<name>/`, keeps package state under `/var/lib/pkg/`, stores downloaded archives in `/var/cache/pkg/`, and registers executable package commands through `/bin/<command>` symlinks that EdgeTerm's existing WASM command registry can discover.
 
 ## Commands
@@ -46,6 +48,11 @@ Useful global options:
 ## Source List
 
 `pkg update` reads `/etc/sources.list`. Blank lines and comments beginning with `#` are ignored.
+
+Optional native packages use the signed APT source in
+`/etc/apt/sources.list.d/edgeterm.sources`. The repository signing key is
+stored in `/usr/share/keyrings/edgeterm-packages.asc`; private signing material
+is never included in EdgeTerm.
 
 Direct repository index:
 
@@ -187,4 +194,3 @@ Downloaded package archives are cached under:
 ```
 
 On first run, `pkg` migrates existing `/packages/*/package.json` installations into `/var/lib/pkg/status.json` without changing their layout.
-

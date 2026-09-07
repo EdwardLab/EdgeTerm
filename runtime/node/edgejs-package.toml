@@ -1,0 +1,15 @@
+[package]
+name = "digitalplat/edgeterm-edgejs"
+version = "0.1.0"
+description = "Pinned Edge.js runtime for EdgeTerm"
+license = "MIT"
+
+[[module]]
+name = "edge"
+source = "../../runtime-packages/node/edgejs-quickjs-0.1.0-554eb9b.wasm"
+abi = "wasi"
+
+[[command]]
+name = "edge"
+module = "edge"
+runner = "https://webc.org/runner/wasi"

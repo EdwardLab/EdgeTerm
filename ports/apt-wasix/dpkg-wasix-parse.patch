@@ -1,0 +1,23 @@
+--- a/lib/dpkg/parse.c
++++ b/lib/dpkg/parse.c
+@@ -599,11 +599,18 @@ parsedb_load(struct parsedb_state *ps)
+     if (ps->dataptr == MAP_FAILED)
+       ohshite(_("can't mmap package info file '%.255s'"), ps->filename);
+ #else
++    ssize_t bytes_read;
++
+     ps->dataptr = m_malloc(st.st_size);
+ 
+-    if (fd_read(ps->fd, ps->dataptr, st.st_size) < 0)
++    bytes_read = fd_read(ps->fd, ps->dataptr, st.st_size);
++    if (bytes_read < 0)
+       ohshite(_("reading package info file '%.255s'"), ps->filename);
+ #endif
++#ifdef __wasi__
++    ps->endptr = ps->dataptr + bytes_read;
++#else
+     ps->endptr = ps->dataptr + st.st_size;
++#endif
+   } else {
+     ps->dataptr = ps->endptr = NULL;
+   }

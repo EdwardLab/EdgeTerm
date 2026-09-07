@@ -1,0 +1,9 @@
+{
+  "schema": "edgeterm.external-shell.config.v1",
+  "enabled": true,
+  "preferred": true,
+  "manifest_url": "https://github.com/DigitalPlatDev/EdgeTerm-BusyBox-WASIX/releases/download/busybox-1.38.0-edgeterm.1/runtime-manifest.json",
+  "expected_runtime": "busybox-wasix",
+  "expected_license": "GPL-2.0-only",
+  "fallback": "python-edgeterm-shell"
+}

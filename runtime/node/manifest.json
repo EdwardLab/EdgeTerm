@@ -1,0 +1,14 @@
+{
+  "schema": "edgeterm.node-runtime.v1",
+  "runtime": "Edge.js QuickJS WASIX",
+  "version": "0.1.0",
+  "experimental": true,
+  "edgejs_commit": "554eb9b697ae7378290bd5f2dee1cea49a747cd7",
+  "source_repository": "https://github.com/wasmerio/edgejs.git",
+  "artifact": {
+    "format": "webc",
+    "file": "edgejs-quickjs-0.1.0-554eb9b-browser.webc",
+    "bytes": 63018581,
+    "sha256": "f380eecca458a164dbc65d8fc8a35bb9b53f7e5aee7e058b225fad3ddd44a4ee"
+  }
+}

@@ -1,0 +1,26 @@
+--- a/src/main/archives.c
++++ b/src/main/archives.c
+@@ -1076,7 +1076,22 @@ tarobject(struct tar_archive *tar, struct tar_entry *ti, void *ctx)
+     debug(dbg_eachfiledetail, "tarobject done and installation deferred");
+   } else {
+-    if (rename(fnamenewvb.buf, fnamevb.buf))
++    if (rename(fnamenewvb.buf, fnamevb.buf)) {
++#ifdef __wasi__
++      if ((errno == ENOTSUP || errno == EOPNOTSUPP) &&
++          ti->type == TAR_FILETYPE_DIR) {
++        if (mkdir(fnamevb.buf, nodestat.mode & 07777) && errno != EEXIST)
++          ohshite(_("unable to create new directory '%.255s'"), ti->name);
++
++        tarobject_set_perms(ti, fnamevb.buf, &nodestat);
++        tarobject_set_mtime(ti, fnamevb.buf);
++
++        if (rmdir(fnamenewvb.buf) && errno != ENOENT)
++          ohshite(_("unable to remove temporary directory for '%.255s'"),
++                  ti->name);
++      } else
++#endif
+       ohshite(_("unable to install new version of '%.255s'"), ti->name);
++    }
+ 
+     /*
+      * CLEANUP: Now the new file is in the destination file, and the

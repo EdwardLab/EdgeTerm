@@ -1,0 +1,25 @@
+--- a/src/deb/main.c
++++ b/src/deb/main.c
+@@ -32,6 +32,10 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ 
++#ifdef __wasi__
++#include <wasi/libc.h>
++#endif
++
+ #include <dpkg/macros.h>
+ #include <dpkg/i18n.h>
+ #include <dpkg/dpkg.h>
+@@ -323,5 +327,11 @@ int main(int argc, const char *const *argv) {
+   dpkg_program_done();
+   dpkg_locales_done();
+ 
++#ifdef __wasi__
++  fflush(NULL);
++  __wasilibc_set_stack_pointer((void *)EDGETERM_WASIX_STACK_UPPER);
++  _Exit(ret);
++#else
+   return ret;
++#endif
+ }

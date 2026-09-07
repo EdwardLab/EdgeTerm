@@ -1,12 +1,54 @@
+import { buildAppModeClientScript } from "../preview/client-script.js";
+import { serializeSiteDataMap, deserializeSiteDataMap } from "../preview/site-data.js";
 import JSZip from "jszip";
+import html2canvas from "html2canvas";
 import { ASSET_BASE, CLOUD_ENABLED, PAGE_KIND, assetUrl } from "../cloud/config.js";
 import { BOOTFS_CRITICAL_FILES, clearBootfsCriticalFiles } from "../generated/bootfs-critical.js";
+import {
+  createEdgeTermBridgeServer,
+  EDGETERM_BRIDGE_PROTOCOL,
+  EDGETERM_BRIDGE_VERSION,
+} from "../bridge/server.js";
+import { normalizeAppTarget } from "../bridge/runtime-target.js";
+import { createBridgeResult } from "../bridge/result.js";
+import {
+  createEdgeTermNodeRuntime,
+  isNodeCommand,
+} from "../node/runtime-controller.js";
+import {
+  createEdgeTermExternalShellRuntime,
+  expandShellLastStatus,
+  isExternalShellCommand,
+  splitTopLevelCommandSequence,
+} from "../external-shell/runtime-controller.js";
+import { BackupUiController } from "../backup/ui-controller.js";
+import { TerminalLineStream } from "../terminal/line-stream.js";
+import { EdgeTermProcessHost, processCapabilities } from "../development/process-host.js";
+import { EdgeTermComponentHost } from "../development/component-host.js";
+import {
+  detectProjectConfiguration,
+  inspectProjectEnvironment,
+  parseProjectConfiguration,
+  serializeProjectConfiguration,
+} from "../development/project-environment.js";
+import { CheckpointStore, SecretVault } from "../development/storage.js";
+import { EdgeTermTestController, discoverTestSuites } from "../development/test-runner.js";
+import { EdgeTermLanguageClient } from "../development/language-client.js";
+import { EdgeTermDebugController } from "../development/debug-controller.js";
+import { PythonDebugAdapter } from "../development/python-debug-adapter.js";
 
 export function bootstrapEdgeTerm() {
 
-      const EDGETERM_BOOT_BUNDLE_VERSION = "refresh-worker-unload-v119";
-      const WORKER_SHELL_ENABLED = !new URLSearchParams(location.search).has("mainPyodide");
+      const EDGETERM_BOOT_BUNDLE_VERSION = "startup-main-v384-release-readiness";
+      const runtimeOptions = new URLSearchParams(location.search);
+      const EMBED_ENABLED = Boolean(window.EDGETERM_EMBED_ENABLED);
+      const WORKER_SHELL_ENABLED =
+        (runtimeOptions.get("workerShell") === "1" || EMBED_ENABLED) &&
+        !runtimeOptions.has("mainPyodide");
       const PYODIDE_BOOT_LOCK_NAME = "edgeterm-pyodide-boot";
+      const PYODIDE_BOOT_LOCK_MAX_WAIT_MS = 12000;
+      const PYODIDE_MODULE_TIMEOUT_MS = 15000;
+      const PYODIDE_RUNTIME_TIMEOUT_MS = 60000;
       const WORKSPACE_KEY = "edgeterm.workspaces.v1";
       const ACTIVE_KEY = "edgeterm.activeWorkspace.v1";
       const CLOUD_TOKEN_KEY = "edgeterm.cloud.token.v1";
@@ -25,7 +67,7 @@ export function bootstrapEdgeTerm() {
       const APPMODE_SITE_DATA_STORE_KEY = "edgeterm.appmode.siteData.v1";
       const ROOTFS_IDB_PRUNE_KEY = "edgeterm.rootfsIdbPruned.v1";
       const PACKAGE_METADATA_STORE_KEY = "edgeterm.packageMetadata.v1";
-      const DEFAULT_ROOTFS_VERSION = "EdgeTerm refresh-worker-unload-v119";
+      const DEFAULT_ROOTFS_VERSION = "EdgeTerm startup-main-v142-agentic-write";
       const SYSTEM_ROOTFS_PATH = "/edgeterm-system-rootfs";
       const DEFAULT_APP_MODE_CONFIG = {
         enabled: false,
@@ -58,6 +100,7 @@ export function bootstrapEdgeTerm() {
         static: {
           indexFile: "index.html",
           allowInlineScripts: true,
+          spaFallback: false,
         },
         wine: {
           prefix: "/home/user/.wine",
@@ -87,6 +130,21 @@ export function bootstrapEdgeTerm() {
         "var",
         "workspace-store",
       ]);
+      const WORKSPACE_PACKAGE_OVERLAY_ENTRIES = new Set([
+        "etc",
+        "opt",
+        "usr",
+        "var",
+      ]);
+      const WORKSPACE_PACKAGE_PERSIST_PATHS = [
+        "/etc/apt",
+        "/opt",
+        "/usr/local",
+        "/var/cache/apt",
+        "/var/lib/apt",
+        "/var/lib/dpkg",
+        "/var/log/apt",
+      ];
       const WORKSPACE_JOURNAL_DB = "edgeterm.workspaceJournal.v1";
       const WORKSPACE_JOURNAL_STORE = "entries";
       const LOCAL_WORKSPACE_HANDLE_DB = "edgeterm.localWorkspaceHandles.v1";
@@ -96,6 +154,9 @@ export function bootstrapEdgeTerm() {
 
         let pyodide;
         let term;
+        let primaryTerm = null;
+        let editorTerm = null;
+        let terminalResizeObserver = null;
         let editor;
         let splitEditor = null;
         let monacoSetupPromise = null;
@@ -103,16 +164,54 @@ export function bootstrapEdgeTerm() {
         let runtimeHeartbeatTimer = null;
         let workerShell = null;
         let workerShellReady = false;
+        let workerShellCommandRunning = false;
+        let workerShellRestartPromise = null;
         let workerShellSequence = 0;
         let workerShellRequests = new Map();
+        let nodeRuntime = null;
+        let externalShellRuntime = null;
+        let processHost = null;
+        let componentHost = null;
+        let checkpointStore = null;
+        let secretVault = null;
+        let testController = null;
+        let languageClient = null;
+        let debugController = null;
+        let developmentDebugSessionId = "";
+        const projectTaskRuns = new Map();
+        const testSuiteCache = new Map();
+        const languageDiagnostics = new Map();
+        const languageDocumentVersions = new Map();
+        let languageWorkspaceIndexPromise = null;
+        let languageWorkspaceIndexGeneration = "";
+        let languageProvidersRegistered = false;
+        let externalShellFallbackActive = false;
+        let externalShellForegroundActive = false;
+        let externalShellInputBuffer = "";
+        let externalShellForegroundInputRequested = false;
+        let externalShellOutputQueue = [];
+        let externalShellOutputTimer = null;
+        let externalShellOutputDrainResolvers = [];
+        const EXTERNAL_SHELL_OUTPUT_INTERVAL_MS = 28;
+        const externalShellLineStream = new TerminalLineStream();
+        const externalShellProgressLines = new Map();
         let workspaces = [];
         let activeWorkspaceId = "";
+        let workspaceMutationGeneration = 0;
         let currentPath = "/home/user";
+        let terminalCurrentPath = "/home/user";
         let appTheme = localStorage.getItem(APP_THEME_KEY) || "light";
         let editorTheme = appTheme === "dark" ? "vs-dark" : "vs";
         let editorMenuItems = new Map();
         let editorCommands = [];
         let editorSaveShortcutInFlight = null;
+        const editorOpenTabs = new Map();
+        let editorActiveTabPath = "";
+        let editorWorkspaceRootPath = "/home/user";
+        let editorExplorerRefreshGeneration = 0;
+        let suppressEditorDirty = false;
+        let editorDiagnosticTimer = null;
+        let editorOutputLines = [];
         let snapshotPage = 1;
         let snapshotPageSize = Math.min(200, Math.max(15, Number(localStorage.getItem(SNAPSHOT_PAGE_SIZE_KEY) || 15)));
         let adminUsersPage = 1;
@@ -173,6 +272,7 @@ export function bootstrapEdgeTerm() {
       let adminPlatformSnapshots = [];
       let workspaceShareOrigins = new Map();
       let autoSyncTimer = null;
+      let backupUiController = null;
       let sidebarWidth = Number(localStorage.getItem("edgeterm.sidebar.width") || 260);
       let sidebarResizeState = null;
       let selectedPaths = new Set();
@@ -224,6 +324,42 @@ export function bootstrapEdgeTerm() {
         browserTabs: new Map(),
         activeBrowserTabId: "",
         webSockets: new Map(),
+      };
+      let projectWizardBusy = false;
+      const projectRunRegistry = new Map();
+      let databaseState = {
+        engine: "sqlite",
+        path: "",
+        databases: [],
+        schema: [],
+        activeTable: "",
+        mysqlConnected: false,
+        mysqlDatabases: [],
+        pageOffset: 0,
+        pageLimit: 100,
+        pageTotal: 0,
+        history: JSON.parse(localStorage.getItem("edgeterm.database.history") || "[]"),
+        busy: false,
+      };
+      let developerState = {
+        activePanel: "git",
+        dependencyItems: [],
+        wordpressSites: [],
+        busy: false,
+      };
+      let edgeTermBridgeServer = null;
+      let activeBridgeExecution = null;
+      const bridgeExecutionHistory = new Map();
+      const bridgeIdempotencyResults = new Map();
+      const bridgeArtifactStore = new Map();
+
+      const PROJECT_TEMPLATES = {
+        flask: { label: "Flask web app", defaultName: "flask-app", icon: "flask-conical", mode: "flask", target: "app:app" },
+        django: { label: "Django web app", defaultName: "django-app", icon: "layers-3", mode: "django", target: "config.wsgi:application" },
+        fastapi: { label: "FastAPI web app", defaultName: "fastapi-app", icon: "zap", mode: "asgi", target: "app:app" },
+        wordpress: { label: "WordPress site", defaultName: "wordpress-site", icon: "globe-2", mode: "php", target: "." },
+        static: { label: "Static website", defaultName: "static-site", icon: "layout-template", mode: "static", target: "." },
+        pygame: { label: "pygame canvas app", defaultName: "pygame-app", icon: "gamepad-2", mode: "pygame", target: "main.py" },
       };
 
       const DEFAULT_TOS_HTML = `
@@ -787,12 +923,17 @@ export function bootstrapEdgeTerm() {
       }
 
       function showBootStatus(message, isError = false) {
-        setLoadingMessage(String(message || "").split("\n")[0] || "Loading EdgeTerm runtime...");
-        if (term) {
-          const writer = isError ? term.error.bind(term) : term.echo.bind(term);
-          writer(message);
-          return;
+        const summary = String(message || "").split("\n")[0] || "Loading EdgeTerm runtime...";
+        setLoadingMessage(summary);
+        if (!isError && !$id("loading")?.classList.contains("hidden")) {
+          showLoadingIndeterminate(summary, "Preparing the local command environment...");
         }
+        setRuntimeStatus(
+          isError ? "Runtime unavailable" : summary,
+          isError ? "error" : "loading",
+        );
+        if (term && isError) return term.error(message);
+        if (term) return;
         const terminalNode = $id("terminal");
         if (!terminalNode) return;
         terminalNode.textContent = message;
@@ -800,6 +941,13 @@ export function bootstrapEdgeTerm() {
         terminalNode.style.whiteSpace = "pre-wrap";
         terminalNode.style.color = isError ? "#ff7b72" : "#8b949e";
         terminalNode.style.font = '14px/1.5 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace';
+      }
+
+      function setRuntimeStatus(label, kind = "ready") {
+        const state = $id("runtimeState");
+        const text = $id("runtimeStateText");
+        if (state) state.dataset.kind = kind;
+        if (text) text.textContent = String(label || "Runtime ready");
       }
 
       function applySidebarWidth(width = sidebarWidth) {
@@ -862,6 +1010,73 @@ export function bootstrapEdgeTerm() {
         );
       }
 
+      function isTerminalInterruptKey(event) {
+        const key = String(event?.key || event?.code || "").toLowerCase();
+        return (
+          Boolean(event?.ctrlKey) &&
+          !event?.metaKey &&
+          (key === "c" || key === "keyc" || Number(event?.which || 0) === 67)
+        );
+      }
+
+      function terminalKeyboardTarget(event) {
+        const target = event?.target;
+        const editorFocused =
+          $id("editorTerminal")?.contains(document.activeElement) ||
+          $id("editorTerminal")?.contains(target);
+        const primaryFocused =
+          $id("terminal")?.contains(document.activeElement) ||
+          $id("terminal")?.contains(target) ||
+          target?.classList?.contains("cmd-clipboard");
+        return {
+          focused: Boolean(editorFocused || primaryFocused),
+          terminal: editorFocused ? editorTerm : (primaryTerm || term),
+        };
+      }
+
+      function handleExternalForegroundInput(event) {
+        const runtime = externalShellRuntime;
+        const status = runtime?.status?.();
+        if (
+          !externalShellForegroundInputRequested
+          || !status?.foreground
+          || (!status?.interactive && !status?.interactiveDormant)
+        ) return false;
+        const target = terminalKeyboardTarget(event);
+        if (!target.focused || isTerminalInterruptKey(event)) return false;
+        const key = String(event.key || "");
+        const printable = key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey;
+        if (!printable && !["Enter", "Backspace", "Escape"].includes(key)) return false;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        if (printable) {
+          externalShellInputBuffer += key;
+          target.terminal?.echo?.(key, { newline: false });
+          return true;
+        }
+        if (key === "Backspace") {
+          if (externalShellInputBuffer) {
+            externalShellInputBuffer = externalShellInputBuffer.slice(0, -1);
+            target.terminal?.echo?.("\b \b", { newline: false });
+          }
+          return true;
+        }
+        if (key === "Escape") {
+          externalShellInputBuffer = "";
+          target.terminal?.echo?.("^\u001b");
+          return true;
+        }
+        const input = `${externalShellInputBuffer}\n`;
+        externalShellInputBuffer = "";
+        externalShellForegroundInputRequested = false;
+        setTerminalInputReady(false);
+        target.terminal?.echo?.("");
+        void runtime.writeInput(input).catch((error) => {
+          target.terminal?.error?.(formatError(error));
+        });
+        return true;
+      }
+
       function installTerminalKeyFallback() {
         if (terminalKeyFallbackInstalled) return;
         terminalKeyFallbackInstalled = true;
@@ -872,6 +1087,43 @@ export function bootstrapEdgeTerm() {
               event.preventDefault();
               event.stopImmediatePropagation();
               return;
+            }
+            if (handleExternalForegroundInput(event)) return;
+            if (isTerminalInterruptKey(event)) {
+              const eventTarget = event.target;
+              const terminalFocused =
+                $id("terminal")?.contains(document.activeElement) ||
+                $id("editorTerminal")?.contains(document.activeElement) ||
+                eventTarget?.classList?.contains("cmd-clipboard");
+              const runtime = nodeRuntime?.status?.();
+              const externalRuntime = externalShellRuntime?.status?.();
+              if (
+                (terminalFocused || workerShellCommandRunning) &&
+                (
+                  runtime?.running
+                  || runtime?.watching
+                  || runtime?.preview
+                  || externalRuntime?.running
+                  || externalRuntime?.foreground
+                  || workerShellCommandRunning
+                )
+              ) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                if (runtime?.running || runtime?.watching) nodeRuntime.cancel();
+                else if (
+                  externalRuntime?.interactive
+                  || externalRuntime?.interactiveDormant
+                  || externalRuntime?.foreground
+                ) void externalShellRuntime.interrupt();
+                else if (externalRuntime?.running) externalShellRuntime.cancel();
+                else if (workerShellCommandRunning) void interruptWorkerShellCommand();
+                else nodeRuntime?.cancel?.();
+                (editorTerm && $id("editorTerminal")?.contains(document.activeElement)
+                  ? editorTerm
+                  : term)?.echo?.("^C");
+                return;
+              }
             }
             if (typeof event.key === "string") return;
             const fallbackKey = event.code || (event.which ? String.fromCharCode(event.which) : "");
@@ -889,18 +1141,42 @@ export function bootstrapEdgeTerm() {
         $id("terminal").textContent = "";
         term = $("#terminal").terminal(
           async (command) => {
-            if (workerShell) {
-              if (!workerShellReady) {
-                term.error("EdgeTerm worker shell is still loading. Please try again in a moment.");
+            setTerminalInputReady(false);
+            $id("stopTerminalCommand")?.classList.remove("hidden");
+            try {
+              if (workerShell) {
+                if (!workerShellReady) {
+                  term.error("EdgeTerm worker shell is still loading. Please try again in a moment.");
+                  return;
+                }
+                await runWorkerCommand(command);
+                return undefined;
+              }
+              if (!pyodide || !edgeTermShell) {
+                term.error("EdgeTerm runtime is still loading. Please try again in a moment.");
                 return;
               }
-              return await runWorkerCommand(command);
+              await runCommand(command);
+              return undefined;
+            } finally {
+              const externalStatus = externalShellRuntime?.status?.();
+              const nodeStatus = nodeRuntime?.status?.();
+              const foreground = externalStatus?.foreground;
+              if (
+                !foreground
+                && !externalStatus?.running
+                && !nodeStatus?.running
+                && !nodeStatus?.watching
+                && !workerShellCommandRunning
+              ) {
+                $id("stopTerminalCommand")?.classList.add("hidden");
+              }
+              if (!pageIsUnloading && !foreground && (workerShellReady || !WORKER_SHELL_ENABLED)) {
+                setTerminalInputReady(true);
+                term?.resume?.();
+                term?.focus?.();
+              }
             }
-            if (!pyodide || !edgeTermShell) {
-              term.error("EdgeTerm runtime is still loading. Please try again in a moment.");
-              return;
-            }
-            return await runCommand(command);
           },
           {
             name: "edgeterm-workspace",
@@ -914,10 +1190,46 @@ export function bootstrapEdgeTerm() {
                   Object.defineProperty(event, "key", { configurable: true, value: event.code || "" });
                 } catch {}
               }
+              if (isTerminalInterruptKey(event)) {
+                const runtime = nodeRuntime?.status?.();
+                const externalRuntime = externalShellRuntime?.status?.();
+                if (
+                  runtime?.running
+                  || runtime?.watching
+                  || runtime?.preview
+                  || externalRuntime?.running
+                  || externalRuntime?.foreground
+                  || workerShellCommandRunning
+                ) {
+                  if (runtime?.running || runtime?.watching) nodeRuntime.cancel();
+                  else if (
+                    externalRuntime?.interactive
+                    || externalRuntime?.interactiveDormant
+                    || externalRuntime?.foreground
+                  ) void externalShellRuntime.interrupt();
+                  else if (externalRuntime?.running) externalShellRuntime.cancel();
+                  else if (workerShellCommandRunning) void interruptWorkerShellCommand();
+                  else nodeRuntime?.cancel?.();
+                  term?.echo?.("^C");
+                  return false;
+                }
+              }
               return undefined;
             },
           }
         );
+        primaryTerm = term;
+        $id("stopTerminalCommand")?.addEventListener("click", () => {
+          void interruptActiveTerminalCommand();
+        });
+        if (typeof ResizeObserver === "function" && $id("terminalView")) {
+          terminalResizeObserver?.disconnect();
+          terminalResizeObserver = new ResizeObserver(() => {
+            requestAnimationFrame(() => term?.resize());
+          });
+          terminalResizeObserver.observe($id("terminalView"));
+        }
+        installBridgeTerminalCapture(term);
         installTerminalCopySanitizer();
 
         // Bridge for synchronous stdin from Python/Pyodide.
@@ -935,6 +1247,112 @@ export function bootstrapEdgeTerm() {
         });
       }
 
+      function setTerminalInputReady(ready) {
+        const input = $id("terminal")?.querySelector("textarea");
+        if (input) {
+          input.disabled = !ready;
+          input.setAttribute("aria-disabled", ready ? "false" : "true");
+        }
+        if (ready) term?.enable?.();
+        else term?.disable?.();
+      }
+
+      async function syncAllTerminalPrompts() {
+        let cwd = `/home/${activeUser()}`;
+        if (workerShell) cwd = terminalCurrentPath || cwd;
+        else if (pyodide) {
+          try { cwd = await getShellPromptPath(); } catch {}
+        }
+        primaryTerm?.set_prompt?.(`${cwd} $ `);
+        editorTerm?.set_prompt?.(`${cwd} $ `);
+      }
+
+      async function executeEditorTerminalCommand(command) {
+        const previousTerm = term;
+        term = editorTerm;
+        window.term = editorTerm;
+        try {
+          if (workerShell) {
+            if (!workerShellReady) {
+              editorTerm.error("EdgeTerm worker shell is still loading. Please try again in a moment.");
+              return;
+            }
+            await runWorkerCommand(command);
+          } else {
+            if (!pyodide || !edgeTermShell) {
+              editorTerm.error("EdgeTerm runtime is still loading. Please try again in a moment.");
+              return;
+            }
+            await runCommand(command);
+          }
+        } finally {
+          term = primaryTerm || previousTerm;
+          window.term = term;
+          await syncAllTerminalPrompts();
+          const externalStatus = externalShellRuntime?.status?.();
+          const nodeStatus = nodeRuntime?.status?.();
+          if (
+            !pageIsUnloading
+            && !externalStatus?.foreground
+            && !externalStatus?.running
+            && !nodeStatus?.running
+            && !nodeStatus?.watching
+            && !workerShellCommandRunning
+            && (workerShellReady || !WORKER_SHELL_ENABLED)
+          ) {
+            setTerminalInputReady(true);
+          }
+          editorTerm?.focus?.();
+        }
+      }
+
+      function initializeEditorTerminal() {
+        if (editorTerm || !$id("editorTerminal") || !window.jQuery?.fn?.terminal) return editorTerm;
+        $id("editorTerminal").textContent = "";
+        editorTerm = $("#editorTerminal").terminal(
+          async (command) => await executeEditorTerminalCommand(command),
+          {
+            name: "edgeterm-editor-terminal",
+            history: true,
+            greetings: "EdgeTerm integrated terminal",
+            prompt: "loading... ",
+            keydown: (event) => {
+              if ((event.ctrlKey || event.metaKey) && String(event.key || "").toLowerCase() === "l") {
+                editorTerm.clear();
+                return false;
+              }
+              if (isTerminalInterruptKey(event)) {
+                const runtime = nodeRuntime?.status?.();
+                const externalRuntime = externalShellRuntime?.status?.();
+                if (
+                  runtime?.running
+                  || runtime?.watching
+                  || runtime?.preview
+                  || externalRuntime?.running
+                  || externalRuntime?.foreground
+                  || workerShellCommandRunning
+                ) {
+                  if (runtime?.running || runtime?.watching) nodeRuntime.cancel();
+                  else if (
+                    externalRuntime?.interactive
+                    || externalRuntime?.interactiveDormant
+                    || externalRuntime?.foreground
+                  ) void externalShellRuntime.interrupt();
+                  else if (externalRuntime?.running) externalShellRuntime.cancel();
+                  else if (workerShellCommandRunning) void interruptWorkerShellCommand();
+                  else nodeRuntime?.cancel?.();
+                  editorTerm?.echo?.("^C");
+                  return false;
+                }
+              }
+              return undefined;
+            },
+          }
+        );
+        void syncAllTerminalPrompts();
+        return editorTerm;
+      }
+
       async function withBusy(message, work) {
         setBusy(true, message);
         try {
@@ -946,6 +1364,42 @@ export function bootstrapEdgeTerm() {
 
       function sleep(ms) {
         return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function withTimeout(promise, timeoutMs, message) {
+        let timeoutId = null;
+        const timeout = new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+        });
+        return Promise.race([promise, timeout]).finally(() => {
+          if (timeoutId !== null) clearTimeout(timeoutId);
+        });
+      }
+
+      async function importPyodideLoader() {
+        const sources = [
+          "https://cdn.jsdelivr.net/pyodide/v0.27.5/full/",
+          "https://unpkg.com/pyodide@0.27.5/",
+        ];
+        const failures = [];
+        for (const indexURL of sources) {
+          try {
+            showBootStatus(`Loading Python runtime from ${new URL(indexURL).hostname}...`);
+            const module = await withTimeout(
+              import(`${indexURL}pyodide.mjs`),
+              PYODIDE_MODULE_TIMEOUT_MS,
+              `Timed out while loading the Python runtime module from ${new URL(indexURL).hostname}.`,
+            );
+            if (typeof module?.loadPyodide !== "function") {
+              throw new Error("The Python runtime module did not export loadPyodide().");
+            }
+            return { loadPyodide: module.loadPyodide, indexURL };
+          } catch (error) {
+            failures.push(`${new URL(indexURL).hostname}: ${formatError(error)}`);
+            console.warn("[BOOT] Pyodide module source failed:", indexURL, error);
+          }
+        }
+        throw new Error(`Unable to load the Python runtime module. ${failures.join(" ")}`);
       }
 
       async function withPyodideBootLock(work, bootStartedAt) {
@@ -962,6 +1416,14 @@ export function bootstrapEdgeTerm() {
             }
           );
           if (result?.acquired) return result.value;
+          const waitedMs = performance.now() - waitStartedAt;
+          if (waitedMs >= PYODIDE_BOOT_LOCK_MAX_WAIT_MS) {
+            console.warn(
+              `[BOOT] Pyodide startup lock remained busy for ${Math.round(waitedMs)}ms; continuing independently.`,
+            );
+            showBootStatus("Another EdgeTerm tab is taking longer than expected. Starting this tab independently...");
+            return await work();
+          }
           const waitedSeconds = Math.max(1, Math.round((performance.now() - waitStartedAt) / 1000));
           showBootStatus(
             `Waiting for another EdgeTerm tab to finish starting Python runtime... ${waitedSeconds}s`,
@@ -1059,10 +1521,14 @@ export function bootstrapEdgeTerm() {
         if (runtimeHeartbeatTimer) return;
         installTimerPhaseDiagnostics();
         let lastBeat = performance.now();
+        document.addEventListener("visibilitychange", () => {
+          lastBeat = performance.now();
+        });
         runtimeHeartbeatTimer = setInterval(() => {
           const now = performance.now();
           const gap = now - lastBeat;
           lastBeat = now;
+          if (document.hidden) return;
           if (gap > 10000) {
             console.warn(`[HANG] main thread blocked ${Math.round(gap)}ms during ${runtimeDiagnosticPhase}`);
           }
@@ -1139,6 +1605,80 @@ export function bootstrapEdgeTerm() {
         });
         const instanceId = stableShortHash(basis);
         return { instanceId, routePrefix: `/${routeMode}-${instanceId}` };
+      }
+
+      function activeEdgeServeWorkspaceId() {
+        return String(activeWorkspaceId || activeWorkspace()?.id || "");
+      }
+
+      function edgeServeInstanceIsInActiveWorkspace(instance) {
+        const workspaceId = String(instance?.workspaceId || "");
+        return !workspaceId || workspaceId === activeEdgeServeWorkspaceId();
+      }
+
+      function edgeServeConfigForInstance(instance) {
+        if (!instance) return null;
+        if (instance.serveConfig) return normalizeAppModeConfig(instance.serveConfig);
+        const mode = normalizeEdgeServeRouteMode(instance.requestedMode || instance.mode);
+        const cwd = normalizePath(instance.workingDirectory || `/home/${activeUser()}`);
+        const routePrefix = normalizePath(instance.routePrefix || "/");
+        if (mode === "static") {
+          const staticRoot = normalizePath(instance.target || cwd);
+          return normalizeAppModeConfig({
+            enabled: true,
+            runtime: "static",
+            entrypoint: resolveWorkspacePath(staticRoot, "index.html"),
+            staticRoot,
+            workingDirectory: cwd,
+            fullscreen: false,
+            autoStart: false,
+            preserveStateOnExit: false,
+            showLoadingOverlay: false,
+            static: {
+              indexFile: "index.html",
+              allowInlineScripts: true,
+              spaFallback: Boolean(instance.spaFallback),
+            },
+            python: {
+              framework: "edgeserve",
+              appSpec: instance.label || instance.target || ".",
+              instanceId: instance.id,
+              routePrefix,
+              serveMode: "static",
+            },
+            ui: { hideWorkspaceChrome: false, allowDebugTerminal: true, showAddressBar: true },
+          });
+        }
+        const runtime = mode === "php" ? "php" : "python";
+        return normalizeAppModeConfig({
+          enabled: true,
+          runtime,
+          entrypoint: mode === "php" ? String(instance.entryScript || "") : "",
+          workingDirectory: cwd,
+          staticRoot: mode === "php" ? normalizePath(instance.target || cwd) : cwd,
+          fullscreen: false,
+          autoStart: false,
+          preserveStateOnExit: false,
+          showLoadingOverlay: false,
+          python: {
+            framework: "edgeserve",
+            appSpec: instance.label || instance.target || "",
+            instanceId: instance.id,
+            routePrefix,
+            serveMode: mode,
+          },
+          ui: { hideWorkspaceChrome: false, allowDebugTerminal: true },
+        });
+      }
+
+      function registerEdgeServeInstance(instance, config = null) {
+        if (!instance) return instance;
+        instance.workspaceId = activeEdgeServeWorkspaceId();
+        if (config) instance.serveConfig = normalizeAppModeConfig(config);
+        window.EdgeTermServe ||= { instances: new Map() };
+        window.EdgeTermServe.instances ||= new Map();
+        window.EdgeTermServe.instances.set(instance.id, instance);
+        return instance;
       }
 
       function workspacePath(id, child = "") {
@@ -1606,6 +2146,7 @@ export function bootstrapEdgeTerm() {
       }
 
       async function ensureActiveWorkspaceMounted(reason = "Loading workspace files...") {
+        if (WORKER_SHELL_ENABLED) return true;
         if (!activeWorkspaceId) return true;
         if (!isWorkspaceStorageMounted(activeWorkspaceId)) await mountWorkspaceStorage(activeWorkspaceId, { load: false });
         if (!isWorkspaceStorageLoaded(activeWorkspaceId)) await loadMountedWorkspaceStorage(activeWorkspaceId, reason);
@@ -2131,6 +2672,7 @@ else:
         } else {
           schedulePersistActiveWorkspace(750);
         }
+        markWorkspaceMutation();
         refreshFilesIfVisible(currentPath);
         return bytes;
       }
@@ -2161,6 +2703,34 @@ else:
 
       function packageRootPath(packageName) {
         return `/packages/${packageName}`;
+      }
+
+      function persistedPackageRootPath(packageName) {
+        return workspacePath(activeWorkspaceId, `/packages/${normalizePackageName(packageName)}`);
+      }
+
+      function installedRuntimePackageRootPath(packageName) {
+        return `/usr/local/share/edgeterm/runtime-packages/${normalizePackageName(packageName)}`;
+      }
+
+      function installedRuntimePackageManifestPath(packageName) {
+        return `${installedRuntimePackageRootPath(packageName)}/package.json`;
+      }
+
+      function persistRuntimePackagesToWorkspace() {
+        if (!activeWorkspaceId || activeWorkspace()?.transient || !pyodide?.FS?.analyzePath("/packages").exists) return false;
+        const target = workspacePath(activeWorkspaceId, "/packages");
+        ensureDir(target.split("/").slice(0, -1).join("/") || "/workspace-store");
+        syncTree("/packages", target);
+        return true;
+      }
+
+      function restorePersistedRuntimePackage(packageName) {
+        const name = normalizePackageName(packageName);
+        const source = persistedPackageRootPath(name);
+        if (!pyodide?.FS?.analyzePath(source).exists) return false;
+        syncTree(source, packageRootPath(name));
+        return true;
       }
 
       function installedPackageManifest(packageName) {
@@ -2283,6 +2853,11 @@ else:
         return workspaces.find((workspace) => workspace.id === activeWorkspaceId);
       }
 
+      function markWorkspaceMutation() {
+        workspaceMutationGeneration += 1;
+        return `${activeWorkspaceId}:${workspaceMutationGeneration}`;
+      }
+
       function activeUser() {
         return activeWorkspace()?.userName || "user";
       }
@@ -2354,9 +2929,15 @@ else:
           "bin/bigbox/clear.py",
           "bin/bigbox/cp.py",
           "bin/bigbox/curl.py",
+          "bin/bigbox/date.py",
+          "bin/bigbox/django-admin.py",
           "bin/bigbox/edgepkg.py",
           "bin/bigbox/edgeserve.py",
           "bin/bigbox/echo.py",
+          "bin/bigbox/env.py",
+          "bin/bigbox/find.py",
+          "bin/bigbox/grep.py",
+          "bin/bigbox/head.py",
           "bin/bigbox/help.py",
           "bin/bigbox/ls.py",
           "bin/bigbox/mkdir.py",
@@ -2369,6 +2950,8 @@ else:
           "bin/bigbox/python3.py",
           "bin/bigbox/rm.py",
           "bin/bigbox/touch.py",
+          "bin/bigbox/test.py",
+          "bin/bigbox/unzip.py",
           "bin/bigbox/wget.py",
           "bin/bigbox/which.py",
           "bin/bigbox/wine.py",
@@ -2382,6 +2965,7 @@ else:
           criticalCommands.has(path) ||
           path === "etc/motd" ||
           path === "etc/profile" ||
+          path === "etc/sources.list" ||
           path === "etc/appmode/config.json" ||
           path.startsWith("usr/lib/")
         );
@@ -2641,14 +3225,15 @@ else:
 
       async function openPreview(path) {
         const target = normalizePath(path);
-        if (!pyodide.FS.analyzePath(target).exists || !isPreviewablePath(target)) {
+        const exists = WORKER_SHELL_ENABLED ? await workerFsIsFile(target) : pyodide.FS.analyzePath(target).exists;
+        if (!exists || !isPreviewablePath(target)) {
           showNotice("Preview is available for image and HTML files");
           return;
         }
         closePreview();
         previewPath = target;
         $id("previewPath").value = target;
-        const bytes = pyodide.FS.readFile(target);
+        const bytes = WORKER_SHELL_ENABLED ? base64ToBytes(await workerReadBase64(target)) : pyodide.FS.readFile(target);
         const mime = isHtmlPath(target)
           ? "text/html"
           : target.toLowerCase().endsWith(".svg")
@@ -2680,21 +3265,6 @@ else:
           }
         }
         for (const key of keys) localStorage.removeItem(key);
-      }
-
-      function serializeSiteDataMap(map) {
-        return [...(map || new Map()).entries()]
-          .filter(([key]) => !!key)
-          .map(([key, value]) => [String(key), String(value)])
-          .sort(([left], [right]) => left.localeCompare(right));
-      }
-
-      function deserializeSiteDataMap(entries) {
-        return new Map(
-          (Array.isArray(entries) ? entries : [])
-            .filter((entry) => Array.isArray(entry) && entry.length >= 2 && entry[0])
-            .map(([key, value]) => [String(key), String(value)])
-        );
       }
 
       function readLegacyAppModeCookieStore() {
@@ -3513,6 +4083,13 @@ else:
             target: `${workspacePath(activeWorkspaceId, "/overlay/upper")}/${entry}`,
           });
         }
+        for (const source of WORKSPACE_PACKAGE_PERSIST_PATHS) {
+          if (!pyodide.FS.analyzePath(source).exists) continue;
+          sources.push({
+            source,
+            target: `${workspacePath(activeWorkspaceId, "/overlay/upper")}${source}`,
+          });
+        }
         for (const user of workspace.users) {
           const source = `/home/${user}`;
           if (!pyodide.FS.analyzePath(source).exists) continue;
@@ -3598,7 +4175,7 @@ else:
         ensureDir(upperPath);
 
         for (const entry of pyodide.FS.readdir(upperPath)) {
-          if (!isRootOverlayEntry(entry)) continue;
+          if (!isRootOverlayEntry(entry) && !WORKSPACE_PACKAGE_OVERLAY_ENTRIES.has(entry)) continue;
           copyTree(`${upperPath}/${entry}`, `/${entry}`);
         }
       }
@@ -3651,7 +4228,8 @@ else:
             return workspacePath(activeWorkspaceId, normalized);
           }
         }
-        if (isRootOverlayEntry(normalized.split("/").filter(Boolean)[0] || "")) {
+        const rootEntry = normalized.split("/").filter(Boolean)[0] || "";
+        if (isRootOverlayEntry(rootEntry) || WORKSPACE_PACKAGE_OVERLAY_ENTRIES.has(rootEntry)) {
           return workspacePath(activeWorkspaceId, `/overlay/upper${normalized}`);
         }
         return "";
@@ -3700,6 +4278,7 @@ else:
       }
 
       async function persistActiveWorkspace() {
+        if (WORKER_SHELL_ENABLED) return;
         if (activeWorkspace()?.transient) return;
         if (activeWorkspaceId && isWorkspaceStorageMounted(activeWorkspaceId) && !isWorkspaceStorageLoaded(activeWorkspaceId)) {
           await flushQueuedWorkspaceJournalEntries();
@@ -3961,7 +4540,7 @@ else:
 
       function resolveWorkspaceDirectory(baseDir, target) {
         const input = String(target || "").trim();
-        const stack = normalizePath(baseDir || "/").split("/").filter(Boolean);
+        const stack = (input.startsWith("/") ? "/" : normalizePath(baseDir || "/")).split("/").filter(Boolean);
         for (const part of input.split("/")) {
           if (!part || part === ".") continue;
           if (part === "..") stack.pop();
@@ -4123,953 +4702,11 @@ else:
         return resolveWorkspacePath(documentFsPath, rawUrl);
       }
 
-      function buildAppModeClientScript({ currentPath, exitHotkey, debugHotkey, allowDebugTerminal, siteData, edgeServeDebug }) {
-        return `
-(() => {
-  const currentPath = ${JSON.stringify(currentPath || "/")};
-  const exitHotkey = ${JSON.stringify(exitHotkey || "Escape")};
-  const debugHotkey = ${JSON.stringify(debugHotkey || "Ctrl+`")};
-  const allowDebugTerminal = ${allowDebugTerminal ? "true" : "false"};
-  const edgeServeDebug = ${JSON.stringify(edgeServeDebug || null)};
-  const initialSiteData = ${JSON.stringify({
-    cookies: serializeSiteDataMap(siteData?.cookies),
-    localStorage: serializeSiteDataMap(siteData?.localStorage),
-    sessionStorage: serializeSiteDataMap(siteData?.sessionStorage),
-  })};
-  const cookieStore = new Map(initialSiteData.cookies || []);
-  const localStore = new Map(initialSiteData.localStorage || []);
-  const sessionStore = new Map(initialSiteData.sessionStorage || []);
-  const serializeStorageData = () => ({
-    localStorage: [...localStore.entries()],
-    sessionStorage: [...sessionStore.entries()],
-  });
-  const syncSiteData = (extra = {}) => {
-    parent.EdgeTermAppModeBridge.syncSiteData({ ...serializeStorageData(), ...extra });
-  };
-  const edgeServeLog = (event, details = {}) => {
-    const payload = { event, time: new Date().toISOString(), ...details };
-    try {
-      console.info("[EdgeServe]", payload);
-    } catch {}
-    try {
-      parent.EdgeTermAppModeBridge.edgeServeLog(payload);
-    } catch {}
-    return payload;
-  };
-  const createStorageProxy = (backingStore) => new Proxy({
-    get length() {
-      return backingStore.size;
-    },
-    key(index) {
-      return [...backingStore.keys()][Number(index)] ?? null;
-    },
-    getItem(key) {
-      return backingStore.has(String(key)) ? backingStore.get(String(key)) : null;
-    },
-    setItem(key, value) {
-      backingStore.set(String(key), String(value));
-      syncSiteData();
-    },
-    removeItem(key) {
-      backingStore.delete(String(key));
-      syncSiteData();
-    },
-    clear() {
-      backingStore.clear();
-      syncSiteData();
-    },
-  }, {
-    get(target, prop) {
-      if (prop in target) return target[prop];
-      return backingStore.get(String(prop));
-    },
-    set(target, prop, value) {
-      if (prop in target) {
-        target[prop] = value;
-      } else {
-        backingStore.set(String(prop), String(value));
-        syncSiteData();
-      }
-      return true;
-    },
-    deleteProperty(target, prop) {
-      if (prop in target) return delete target[prop];
-      const deleted = backingStore.delete(String(prop));
-      if (deleted) syncSiteData();
-      return true;
-    },
-    ownKeys(target) {
-      return Reflect.ownKeys(target).concat([...backingStore.keys()]);
-    },
-    getOwnPropertyDescriptor(target, prop) {
-      if (prop in target) return Object.getOwnPropertyDescriptor(target, prop);
-      if (!backingStore.has(String(prop))) return undefined;
-      return { configurable: true, enumerable: true, writable: true, value: backingStore.get(String(prop)) };
-    },
-  });
-  const localStorageProxy = createStorageProxy(localStore);
-  const sessionStorageProxy = createStorageProxy(sessionStore);
-  const cookieString = () => [...cookieStore.entries()].map(([key, value]) => \`\${key}=\${value}\`).join("; ");
-  const setCookie = (rawValue) => {
-    const source = String(rawValue || "");
-    const pair = source.split(";", 1)[0] || "";
-    const index = pair.indexOf("=");
-    if (index <= 0) return;
-    const name = pair.slice(0, index).trim();
-    const value = pair.slice(index + 1);
-    if (!name) return;
-    if (/;\\s*max-age=0\\b/i.test(source) || /;\\s*expires=thu,\\s*01 jan 1970/i.test(source)) {
-      cookieStore.delete(name);
-    } else {
-      cookieStore.set(name, value);
-    }
-    syncSiteData({ cookieMutation: source });
-  };
-  try {
-    Object.defineProperty(window, "localStorage", { configurable: true, value: localStorageProxy });
-    Object.defineProperty(window, "sessionStorage", { configurable: true, value: sessionStorageProxy });
-    Object.defineProperty(globalThis, "localStorage", { configurable: true, value: localStorageProxy });
-    Object.defineProperty(globalThis, "sessionStorage", { configurable: true, value: sessionStorageProxy });
-    Object.defineProperty(Object.getPrototypeOf(document), "cookie", {
-      configurable: true,
-      get() {
-        return cookieString();
-      },
-      set(value) {
-        setCookie(value);
-      },
-    });
-  } catch {}
-  const shouldIntercept = (url) => {
-    if (!url) return false;
-    if (url.startsWith("#") || url.startsWith("data:") || url.startsWith("blob:") || url.startsWith("javascript:") || url.startsWith("mailto:")) return false;
-    if (/^\\/\\//.test(url)) {
-      try {
-        const parsed = new URL("https:" + url);
-        return parsed.hostname === "edgeterm.local" || parsed.hostname === window.location.hostname;
-      } catch {
-        return false;
-      }
-    }
-    if (/^https?:\\/\\//i.test(url)) {
-      try {
-        const parsed = new URL(url);
-        return parsed.hostname === "edgeterm.local" || parsed.hostname === window.location.hostname;
-      } catch {
-        return false;
-      }
-    }
-    return true;
-  };
-  const shouldInterceptWebSocket = (url) => {
-    if (!url) return false;
-    if (/^(data|blob|javascript|mailto):/i.test(url)) return false;
-    if (/^wss?:\\/\\/\\//i.test(url)) return true;
-    if (/^wss?:\\/\\//i.test(url)) {
-      try {
-        const parsed = new URL(url);
-        return ["edgeterm.local", "localhost", "127.0.0.1", "::1", "ws", window.location.hostname].includes(parsed.hostname);
-      } catch {
-        return false;
-      }
-    }
-    if (/^https?:\\/\\//i.test(url)) return shouldIntercept(url);
-    return true;
-  };
-  let virtualUrl = new URL(currentPath || "/", "https://edgeterm.local");
-  const virtualPath = () => \`\${virtualUrl.pathname || "/"}\${virtualUrl.search || ""}\`;
-  const virtualLocation = {};
-  Object.defineProperties(virtualLocation, {
-    href: { configurable: true, get: () => virtualUrl.href },
-    protocol: { configurable: true, get: () => virtualUrl.protocol },
-    host: { configurable: true, get: () => virtualUrl.host },
-    hostname: { configurable: true, get: () => virtualUrl.hostname },
-    port: { configurable: true, get: () => virtualUrl.port },
-    pathname: { configurable: true, get: () => virtualUrl.pathname },
-    search: { configurable: true, get: () => virtualUrl.search },
-    hash: { configurable: true, get: () => virtualUrl.hash },
-    origin: { configurable: true, get: () => virtualUrl.origin },
-  });
-  virtualLocation.assign = (url) => parent.EdgeTermAppModeBridge.navigate(normalizeBridgeRequestUrl(String(url || "/")));
-  virtualLocation.replace = virtualLocation.assign;
-  virtualLocation.reload = () => parent.EdgeTermAppModeBridge.navigate(virtualPath());
-  const updateVirtualUrl = (url) => {
-    if (url == null || url === "") return;
-    try {
-      virtualUrl = new URL(normalizeBridgeRequestUrl(String(url)), virtualUrl.href);
-    } catch {}
-  };
-  const patchBackboneHistory = () => {
-    const backbone = window.Backbone;
-    if (!backbone?.history || backbone.history.__edgetermVirtualLocation) return;
-    backbone.history.location = virtualLocation;
-    backbone.history.history = history;
-    backbone.history.__edgetermVirtualLocation = true;
-    edgeServeLog("virtual-history", { url: virtualUrl.href });
-  };
-  let backboneHistoryPatchAttempts = 0;
-  const backboneHistoryTimer = setInterval(() => {
-    patchBackboneHistory();
-    backboneHistoryPatchAttempts += 1;
-    if (window.Backbone?.history?.__edgetermVirtualLocation || backboneHistoryPatchAttempts > 400) clearInterval(backboneHistoryTimer);
-  }, 25);
-  const originalFetch = window.fetch.bind(window);
-  const normalizeBridgeRequestUrl = (url) => {
-    const value = String(url || "");
-    const lowerValue = value.toLowerCase();
-    if (/^\\/\\//.test(value)) {
-      try {
-        const parsed = new URL("https:" + value);
-        if (parsed.hostname === "edgeterm.local" || parsed.hostname === window.location.hostname) {
-          return (parsed.pathname || "/") + (parsed.search || "") + (parsed.hash || "");
-        }
-      } catch {}
-    }
-    if (/^https?:\\/\\//i.test(value)) {
-      try {
-        const parsed = new URL(value);
-        if (parsed.hostname === "edgeterm.local" || parsed.hostname === window.location.hostname) {
-          return (parsed.pathname || "/") + (parsed.search || "") + (parsed.hash || "");
-        }
-      } catch {}
-    }
-    if (lowerValue.startsWith("about://undefined/") || lowerValue.startsWith("about://undefined:")) {
-      try {
-        const parsed = new URL(value);
-        return (parsed.pathname || "/") + (parsed.search || "") + (parsed.hash || "");
-      } catch {
-        const marker = value.indexOf("/", "about://undefined".length);
-        return marker >= 0 ? value.slice(marker) : "/";
-      }
-    }
-    return value;
-  };
-  const bridgeFetch = async (url, init = {}) => {
-    const requestUrl = normalizeBridgeRequestUrl(url);
-    const headers = { ...(init.headers || {}) };
-    const cookieKey = Object.keys(headers).find((key) => key.toLowerCase() === "cookie");
-    const cookieHeader = cookieString();
-    if (cookieHeader && (!cookieKey || !String(headers[cookieKey] || "").trim())) {
-      if (cookieKey) headers[cookieKey] = cookieHeader;
-      else headers.cookie = cookieHeader;
-    }
-    if (cookieStore.size && !Object.keys(headers).some((key) => key.toLowerCase() === "cookie")) {
-      headers.cookie = cookieString();
-    }
-    headers.host ||= "edgeterm.local";
-    headers.origin ||= "https://edgeterm.local";
-    headers.referer ||= virtualUrl.href;
-    headers["x-requested-with"] ||= "XMLHttpRequest";
-    const result = await parent.EdgeTermAppModeBridge.fetch({
-      url: requestUrl,
-      method: (init.method || "GET").toUpperCase(),
-      headers,
-      body: init.body ?? null,
-      currentPath: virtualPath(),
-    });
-    const debugKind = result?.headers?.["x-edgeterm-debug-kind"] || result?.headers?.["X-EdgeTerm-Debug-Kind"] || "";
-    if (debugKind) {
-      edgeServeLog("fetch", {
-        method: (init.method || "GET").toUpperCase(),
-        url: requestUrl,
-        status: result.status,
-        kind: debugKind,
-        path: result.headers["x-edgeterm-request-path"] || result.headers["X-EdgeTerm-Request-Path"] || "",
-        script: result.headers["x-edgeterm-php-script"] || result.headers["X-EdgeTerm-Php-Script"] || "",
-        durationMs: result.headers["x-edgeterm-duration-ms"] || result.headers["X-EdgeTerm-Duration-Ms"] || result.headers["x-edgeterm-php-duration-ms"] || result.headers["X-EdgeTerm-Php-Duration-Ms"] || "",
-        location: result.headers.location || result.headers.Location || "",
-      });
-    }
-    const payload = result.bodyBase64
-      ? Uint8Array.from(atob(result.bodyBase64), (char) => char.charCodeAt(0))
-      : result.body;
-    return new Response(payload, { status: result.status, headers: result.headers });
-  };
-  const originalPushState = history.pushState.bind(history);
-  const originalReplaceState = history.replaceState.bind(history);
-  const safeHistoryState = (mode, state, title, url) => {
-    const original = mode === "replace" ? originalReplaceState : originalPushState;
-    updateVirtualUrl(url);
-    patchBackboneHistory();
-    try {
-      original(state, title, url);
-    } catch (err) {
-      if (err?.name !== "SecurityError") throw err;
-      edgeServeLog("history-security-suppressed", { mode, url: String(url || "") });
-    }
-  };
-  history.pushState = (state, title, url) => safeHistoryState("push", state, title, url);
-  history.replaceState = (state, title, url) => safeHistoryState("replace", state, title, url);
-  window.open = (url = "", target = "", features = "") => {
-    const destination = normalizeBridgeRequestUrl(String(url || "about:blank"));
-    parent.EdgeTermAppModeBridge.openTab(destination, { target: String(target || ""), features: String(features || "") });
-    return null;
-  };
-  const cssUrlBase = (url) => {
-    try {
-      return new URL(String(url || ""), \`https://edgeterm.local\${currentPath || "/"}\`).href;
-    } catch {
-      return \`https://edgeterm.local\${currentPath || "/"}\`;
-    }
-  };
-  const rewriteCssUrls = async (cssText, stylesheetUrl) => {
-    const text = String(cssText || "");
-    const replacements = new Map();
-    const tasks = [];
-    const pattern = /url\\(\\s*(['"]?)([^'")]+)\\1\\s*\\)/gi;
-    for (const match of text.matchAll(pattern)) {
-      const rawUrl = String(match[2] || "").trim();
-      if (!rawUrl || /^(data|blob|javascript|mailto):/i.test(rawUrl) || rawUrl.startsWith("#")) continue;
-      let resolved = rawUrl;
-      try {
-        resolved = new URL(rawUrl, cssUrlBase(stylesheetUrl)).href;
-      } catch {}
-      if (!shouldIntercept(resolved)) continue;
-      tasks.push(
-        bridgeFetch(resolved)
-          .then((response) => response.ok ? response.blob() : null)
-          .then((blob) => {
-            if (blob) replacements.set(match[0], \`url("\${URL.createObjectURL(blob)}")\`);
-          })
-          .catch(() => {})
-      );
-    }
-    await Promise.all(tasks);
-    let rewritten = text;
-    for (const [source, target] of replacements) rewritten = rewritten.split(source).join(target);
-    return rewritten;
-  };
-  const srcsetFirstUrl = (value) => {
-    const first = String(value || "").split(",")[0]?.trim() || "";
-    return first.split(/\\s+/)[0] || "";
-  };
-  const assetSelector = "[data-edgeterm-asset-url], img[src], img[srcset], script[src], link[rel~='stylesheet'][href], source[src], source[srcset], video[src], audio[src], video[poster]";
-  const assetAttrForNode = (node, attrName = "") => {
-    if (!(node instanceof Element)) return "";
-    const attr = String(attrName || "").toLowerCase();
-    const tag = node.tagName;
-    if (tag === "SCRIPT" && attr === "src") return "src";
-    if (tag === "IMG" && (attr === "src" || attr === "srcset")) return attr;
-    if (tag === "SOURCE" && (attr === "src" || attr === "srcset")) return attr;
-    if ((tag === "VIDEO" || tag === "AUDIO") && attr === "src") return "src";
-    if (tag === "VIDEO" && attr === "poster") return "poster";
-    if (tag === "LINK" && attr === "href" && /(?:^|\\s)stylesheet(?:\\s|$)/i.test(node.getAttribute("rel") || "")) return "href";
-    return "";
-  };
-  const prepareBridgeAssetNode = (node, attr, rawUrl) => {
-    const targetAttr = assetAttrForNode(node, attr);
-    if (!targetAttr || !shouldIntercept(String(rawUrl || ""))) return false;
-    node.dataset.edgetermAssetUrl = normalizeBridgeRequestUrl(String(rawUrl || ""));
-    node.dataset.edgetermAssetAttr = targetAttr;
-    try {
-      originalRemoveAttribute.call(node, targetAttr);
-      if (targetAttr !== "srcset" && node.hasAttribute("srcset")) originalRemoveAttribute.call(node, "srcset");
-    } catch {}
-    scheduleHydrateAssets();
-    return true;
-  };
-  const hydrateInlineStyleUrl = (node) => {
-    if (!(node instanceof Element)) return;
-    const styleText = node.getAttribute("style") || "";
-    if (!/url\\(/i.test(styleText) || node.dataset.edgetermStyleHydrating === "true") return;
-    node.dataset.edgetermStyleHydrating = "true";
-    rewriteCssUrls(styleText, currentPath)
-      .then((rewritten) => {
-        if (rewritten && rewritten !== styleText) node.setAttribute("style", rewritten);
-      })
-      .finally(() => {
-        node.removeAttribute("data-edgeterm-style-hydrating");
-      });
-  };
-  const hydrateAssetNode = (node) => {
-    if (!(node instanceof Element)) return;
-    hydrateInlineStyleUrl(node);
-    if (!node.matches?.(assetSelector)) return;
-    if (node.dataset.edgetermHydrating === "true") return;
-    const attr = node.getAttribute("data-edgeterm-asset-attr")
-      || (node.hasAttribute("href")
-        ? "href"
-        : node.hasAttribute("poster")
-          ? "poster"
-          : node.tagName === "SOURCE" && node.hasAttribute("srcset") && !node.hasAttribute("src")
-            ? "srcset"
-            : "src");
-    const url = node.getAttribute("data-edgeterm-asset-url") || node.getAttribute(attr) || srcsetFirstUrl(node.getAttribute("srcset"));
-    if (!shouldIntercept(url)) return;
-    node.dataset.edgetermHydrating = "true";
-    if (node.matches?.("link[rel~='stylesheet']")) {
-      bridgeFetch(url)
-        .then((response) => response.ok ? response.text() : "")
-        .then((cssText) => cssText ? rewriteCssUrls(cssText, url) : "")
-        .then((cssText) => {
-          if (!cssText) return;
-          const blobUrl = URL.createObjectURL(new Blob([cssText], { type: "text/css; charset=utf-8" }));
-          node.setAttribute("href", blobUrl);
-          node.removeAttribute("data-edgeterm-asset-url");
-          node.removeAttribute("data-edgeterm-asset-attr");
-        })
-        .finally(() => {
-          node.removeAttribute("data-edgeterm-hydrating");
-        });
-      return;
-    }
-    bridgeFetch(url)
-      .then((response) => response.ok ? response.blob() : null)
-      .then((blob) => {
-        if (!blob) return;
-        node.setAttribute(attr, URL.createObjectURL(blob));
-        if (attr !== "srcset" && node.hasAttribute("srcset")) node.removeAttribute("srcset");
-        node.removeAttribute("data-edgeterm-asset-url");
-        node.removeAttribute("data-edgeterm-asset-attr");
-      })
-      .finally(() => {
-        node.removeAttribute("data-edgeterm-hydrating");
-      });
-  };
-  const hydrateAssets = () => {
-    document.querySelectorAll(assetSelector + ", [style*='url('], [style*='URL(']").forEach(hydrateAssetNode);
-  };
-  let hydrateAssetsTimer = 0;
-  const scheduleHydrateAssets = () => {
-    clearTimeout(hydrateAssetsTimer);
-    hydrateAssetsTimer = setTimeout(hydrateAssets, 25);
-  };
-  const originalSetAttribute = Element.prototype.setAttribute;
-  const originalRemoveAttribute = Element.prototype.removeAttribute;
-  const navigationSelector = "a[href], area[href], form[action]";
-  const prepareBridgeNavigationNode = (node, attrName = "", rawUrl = null) => {
-    if (!(node instanceof Element)) return false;
-    const tag = node.tagName;
-    const attr = String(attrName || "").toLowerCase();
-    const isLink = (tag === "A" || tag === "AREA") && attr === "href";
-    const isForm = tag === "FORM" && attr === "action";
-    if (!isLink && !isForm) return false;
-    const source = rawUrl == null ? node.getAttribute(attr) : rawUrl;
-    const destination = normalizeBridgeRequestUrl(String(source || ""));
-    if (!shouldIntercept(destination)) return false;
-    originalSetAttribute.call(node, "data-edgeterm-nav-url", destination);
-    originalSetAttribute.call(node, attr, isLink ? "#" : "");
-    return true;
-  };
-  const hydrateNavigationNode = (node) => {
-    if (!(node instanceof Element)) return;
-    if (node.matches?.(navigationSelector)) {
-      prepareBridgeNavigationNode(node, node.hasAttribute("href") ? "href" : "action");
-    }
-    for (const child of Array.from(node.querySelectorAll?.(navigationSelector) || [])) {
-      prepareBridgeNavigationNode(child, child.hasAttribute("href") ? "href" : "action");
-    }
-  };
-  const patchNavigationUrlProperty = (proto, property, attr) => {
-    if (!proto) return;
-    const descriptor = Object.getOwnPropertyDescriptor(proto, property);
-    if (!descriptor?.set || !descriptor?.get) return;
-    Object.defineProperty(proto, property, {
-      configurable: true,
-      enumerable: descriptor.enumerable,
-      get: descriptor.get,
-      set(value) {
-        if (prepareBridgeNavigationNode(this, attr, value)) return;
-        descriptor.set.call(this, value);
-      },
-    });
-  };
-  Element.prototype.setAttribute = function(name, value) {
-    const attr = String(name || "");
-    if (!/^data-edgeterm-/i.test(attr) && prepareBridgeNavigationNode(this, attr, value)) return;
-    if (!/^data-edgeterm-/i.test(attr) && prepareBridgeAssetNode(this, attr, value)) return;
-    return originalSetAttribute.call(this, name, value);
-  };
-  const patchUrlProperty = (proto, property, attr) => {
-    if (!proto) return;
-    const descriptor = Object.getOwnPropertyDescriptor(proto, property);
-    if (!descriptor?.set || !descriptor?.get) return;
-    Object.defineProperty(proto, property, {
-      configurable: true,
-      enumerable: descriptor.enumerable,
-      get: descriptor.get,
-      set(value) {
-        if (prepareBridgeAssetNode(this, attr, value)) return;
-        descriptor.set.call(this, value);
-      },
-    });
-  };
-  patchUrlProperty(window.HTMLScriptElement?.prototype, "src", "src");
-  patchUrlProperty(window.HTMLImageElement?.prototype, "src", "src");
-  patchUrlProperty(window.HTMLImageElement?.prototype, "srcset", "srcset");
-  patchUrlProperty(window.HTMLSourceElement?.prototype, "src", "src");
-  patchUrlProperty(window.HTMLSourceElement?.prototype, "srcset", "srcset");
-  patchUrlProperty(window.HTMLLinkElement?.prototype, "href", "href");
-  patchUrlProperty(window.HTMLVideoElement?.prototype, "src", "src");
-  patchUrlProperty(window.HTMLVideoElement?.prototype, "poster", "poster");
-  patchUrlProperty(window.HTMLAudioElement?.prototype, "src", "src");
-  patchNavigationUrlProperty(window.HTMLAnchorElement?.prototype, "href", "href");
-  patchNavigationUrlProperty(window.HTMLAreaElement?.prototype, "href", "href");
-  patchNavigationUrlProperty(window.HTMLFormElement?.prototype, "action", "action");
-  window.fetch = async (input, init = {}) => {
-    const url = normalizeBridgeRequestUrl(typeof input === "string" ? input : input?.url || "");
-    if (!shouldIntercept(url)) return originalFetch(input, init);
-    const headers = Object.fromEntries(new Headers(init.headers || (typeof input === "string" ? {} : input.headers || {})).entries());
-    const method = (init.method || (typeof input === "string" ? "GET" : input.method) || "GET").toUpperCase();
-    let body = init.body ?? null;
-    if (body instanceof URLSearchParams) {
-      headers["content-type"] ||= "application/x-www-form-urlencoded;charset=UTF-8";
-      body = body.toString();
-    } else if (body && typeof body !== "string") {
-      if (!(body instanceof FormData) && !(body instanceof Blob) && !(body instanceof ArrayBuffer) && !ArrayBuffer.isView(body)) {
-        body = String(body);
-      }
-    }
-    return bridgeFetch(url, { method, headers, body });
-  };
-  const OriginalXMLHttpRequest = window.XMLHttpRequest;
-  class EdgeTermUploadTarget extends EventTarget {
-    constructor() {
-      super();
-      this.onloadstart = null;
-      this.onprogress = null;
-      this.onload = null;
-      this.onerror = null;
-      this.onloadend = null;
-      this.onabort = null;
-    }
-    emit(type, init = {}) {
-      const loaded = Number(init.loaded || 0);
-      const total = Number(init.total || 0);
-      const event = new ProgressEvent(type, {
-        lengthComputable: !!init.lengthComputable,
-        loaded,
-        total,
-      });
-      this.dispatchEvent(event);
-      const handler = this["on" + type];
-      if (typeof handler === "function") handler.call(this, event);
-    }
-  }
-  class EdgeTermXMLHttpRequest extends EventTarget {
-    static UNSENT = 0;
-    static OPENED = 1;
-    static HEADERS_RECEIVED = 2;
-    static LOADING = 3;
-    static DONE = 4;
-    constructor() {
-      super();
-      this.readyState = EdgeTermXMLHttpRequest.UNSENT;
-      this.response = "";
-      this.responseText = "";
-      this.responseType = "";
-      this.responseURL = "";
-      this.responseXML = null;
-      this.status = 0;
-      this.statusText = "";
-      this.timeout = 0;
-      this.withCredentials = false;
-      this.onreadystatechange = null;
-      this.onload = null;
-      this.onerror = null;
-      this.onloadend = null;
-      this.onloadstart = null;
-      this.onabort = null;
-      this.ontimeout = null;
-      this.onprogress = null;
-      this.upload = new EdgeTermUploadTarget();
-      this._method = "GET";
-      this._url = "";
-      this._async = true;
-      this._headers = {};
-      this._responseHeaders = {};
-      this._responseHeaderLines = "";
-      this._aborted = false;
-      this._native = null;
-    }
-    open(method, url, async = true) {
-      this._method = String(method || "GET").toUpperCase();
-      this._url = normalizeBridgeRequestUrl(url);
-      this._async = async !== false;
-      this._headers = {};
-      this._setReadyState(EdgeTermXMLHttpRequest.OPENED);
-    }
-    setRequestHeader(name, value) {
-      this._headers[String(name)] = String(value);
-    }
-    overrideMimeType() {}
-    abort() {
-      this._aborted = true;
-      try {
-        this._native?.abort?.();
-      } catch {}
-      this.status = 0;
-      this.statusText = "";
-      this._setReadyState(EdgeTermXMLHttpRequest.DONE);
-      this.upload.emit("abort");
-      this.upload.emit("loadend");
-      this._emit("abort");
-      this._emit("loadend");
-    }
-    getAllResponseHeaders() {
-      return this.readyState < EdgeTermXMLHttpRequest.HEADERS_RECEIVED ? "" : this._responseHeaderLines;
-    }
-    getResponseHeader(name) {
-      if (this.readyState < EdgeTermXMLHttpRequest.HEADERS_RECEIVED) return null;
-      return this._responseHeaders[String(name || "").toLowerCase()] || null;
-    }
-    async send(body = null) {
-      if (!this._async) throw new DOMException("Synchronous XMLHttpRequest is not supported in EdgeServe preview.", "NotSupportedError");
-      if (!shouldIntercept(this._url) && OriginalXMLHttpRequest) {
-        const native = new OriginalXMLHttpRequest();
-        this._native = native;
-        native.open(this._method, this._url, true);
-        native.responseType = this.responseType || "";
-        native.withCredentials = this.withCredentials;
-        native.timeout = this.timeout;
-        for (const [name, value] of Object.entries(this._headers)) native.setRequestHeader(name, value);
-        for (const type of ["loadstart", "progress", "load", "error", "abort", "timeout", "loadend"]) {
-          native.upload?.addEventListener?.(type, (event) => this.upload.emit(type, event));
-        }
-        native.onreadystatechange = () => {
-          this.readyState = native.readyState;
-          this._emit("readystatechange");
-        };
-        native.onload = () => {
-          this.status = native.status;
-          this.statusText = native.statusText;
-          this.response = native.response;
-          try {
-            this.responseText = native.responseText;
-          } catch {
-            this.responseText = "";
-          }
-          this.responseURL = native.responseURL;
-          this._responseHeaderLines = native.getAllResponseHeaders();
-          this._setReadyState(EdgeTermXMLHttpRequest.DONE);
-          this._emit("load");
-          this._emit("loadend");
-        };
-        native.onerror = () => {
-          this.status = native.status || 0;
-          this._setReadyState(EdgeTermXMLHttpRequest.DONE);
-          this._emit("error");
-          this._emit("loadend");
-        };
-        native.send(body);
-        return;
-      }
-      this._aborted = false;
-      this._emit("loadstart");
-      let uploadTotal = 0;
-      try {
-        if (body instanceof Blob) uploadTotal = Number(body.size || 0);
-        else if (body instanceof ArrayBuffer) uploadTotal = body.byteLength;
-        else if (ArrayBuffer.isView(body)) uploadTotal = body.byteLength;
-        else uploadTotal = String(body || "").length;
-      } catch {}
-      this.upload.emit("loadstart", { loaded: 0, total: uploadTotal, lengthComputable: uploadTotal > 0 });
-      try {
-        const response = await bridgeFetch(this._url, { method: this._method, headers: this._headers, body });
-        if (this._aborted) return;
-        this.upload.emit("progress", { loaded: uploadTotal, total: uploadTotal, lengthComputable: uploadTotal > 0 });
-        this.upload.emit("load", { loaded: uploadTotal, total: uploadTotal, lengthComputable: uploadTotal > 0 });
-        this.upload.emit("loadend", { loaded: uploadTotal, total: uploadTotal, lengthComputable: uploadTotal > 0 });
-        this.status = response.status;
-        this.statusText = response.statusText || "";
-        this.responseURL = new URL(this._url, virtualUrl.href).href;
-        this._responseHeaders = {};
-        this._responseHeaderLines = "";
-        response.headers.forEach((value, name) => {
-          this._responseHeaders[String(name).toLowerCase()] = value;
-          this._responseHeaderLines += \`\${name}: \${value}\\r\\n\`;
-        });
-        this._setReadyState(EdgeTermXMLHttpRequest.HEADERS_RECEIVED);
-        this._setReadyState(EdgeTermXMLHttpRequest.LOADING);
-        if (this.responseType === "blob") {
-          this.response = await response.blob();
-          this.responseText = "";
-        } else if (this.responseType === "arraybuffer") {
-          this.response = await response.arrayBuffer();
-          this.responseText = "";
-        } else if (this.responseType === "json") {
-          this.responseText = await response.text();
-          try {
-            this.response = this.responseText ? JSON.parse(this.responseText) : null;
-          } catch {
-            this.response = null;
-          }
-        } else {
-          this.responseText = await response.text();
-          this.response = this.responseText;
-        }
-        this._setReadyState(EdgeTermXMLHttpRequest.DONE);
-        this._emit("load");
-        this._emit("loadend");
-      } catch (err) {
-        if (this._aborted) return;
-        this.upload.emit("error", { loaded: 0, total: uploadTotal, lengthComputable: uploadTotal > 0 });
-        this.upload.emit("loadend", { loaded: 0, total: uploadTotal, lengthComputable: uploadTotal > 0 });
-        this.status = 0;
-        this.statusText = "";
-        this._setReadyState(EdgeTermXMLHttpRequest.DONE);
-        this._emit("error");
-        this._emit("loadend");
-      }
-    }
-    _setReadyState(state) {
-      this.readyState = state;
-      this._emit("readystatechange");
-    }
-    _emit(type) {
-      const event = new Event(type);
-      this.dispatchEvent(event);
-      const handler = this["on" + type];
-      if (typeof handler === "function") {
-        try {
-          handler.call(this, event);
-        } catch (err) {
-          setTimeout(() => { throw err; }, 0);
-        }
-      }
-    }
-  }
-  EdgeTermXMLHttpRequest.prototype.UNSENT = EdgeTermXMLHttpRequest.UNSENT;
-  EdgeTermXMLHttpRequest.prototype.OPENED = EdgeTermXMLHttpRequest.OPENED;
-  EdgeTermXMLHttpRequest.prototype.HEADERS_RECEIVED = EdgeTermXMLHttpRequest.HEADERS_RECEIVED;
-  EdgeTermXMLHttpRequest.prototype.LOADING = EdgeTermXMLHttpRequest.LOADING;
-  EdgeTermXMLHttpRequest.prototype.DONE = EdgeTermXMLHttpRequest.DONE;
-  window.XMLHttpRequest = EdgeTermXMLHttpRequest;
-  const OriginalWebSocket = window.WebSocket;
-  const toBase64 = async (value) => {
-    let bytes;
-    if (value instanceof Blob) {
-      bytes = new Uint8Array(await value.arrayBuffer());
-    } else if (value instanceof ArrayBuffer) {
-      bytes = new Uint8Array(value);
-    } else if (ArrayBuffer.isView(value)) {
-      bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-    } else {
-      return { kind: "text", data: String(value ?? "") };
-    }
-    let text = "";
-    for (let index = 0; index < bytes.length; index += 32768) {
-      text += String.fromCharCode(...bytes.subarray(index, index + 32768));
-    }
-    return { kind: "bytes", dataBase64: btoa(text) };
-  };
-  const fromBase64 = (value, binaryType) => {
-    const bytes = Uint8Array.from(atob(value || ""), (char) => char.charCodeAt(0));
-    if (binaryType === "arraybuffer") return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-    return new Blob([bytes]);
-  };
-  const bridgedWebSockets = new Set();
-  class EdgeTermWebSocket extends EventTarget {
-    static CONNECTING = 0;
-    static OPEN = 1;
-    static CLOSING = 2;
-    static CLOSED = 3;
-    constructor(url, protocols = []) {
-      super();
-      if (!shouldInterceptWebSocket(String(url || "")) && OriginalWebSocket) {
-        return new OriginalWebSocket(url, protocols);
-      }
-      this.url = String(url || "");
-      this.protocol = "";
-      this.extensions = "";
-      this.binaryType = "blob";
-      this.bufferedAmount = 0;
-      this.readyState = EdgeTermWebSocket.CONNECTING;
-      this._id = \`ws-\${Date.now().toString(36)}-\${Math.random().toString(36).slice(2)}\`;
-      this._closed = false;
-      this._pollTimer = 0;
-      this._protocols = Array.isArray(protocols) ? protocols : protocols ? [protocols] : [];
-      bridgedWebSockets.add(this);
-      this._open();
-    }
-    async _open() {
-      try {
-        const result = await parent.EdgeTermAppModeBridge.websocketOpen({
-          id: this._id,
-          url: this.url,
-          protocols: this._protocols,
-          currentPath: virtualPath(),
-        });
-        if (!result?.ok) {
-          this._finishClose(result?.status || 1006, result?.reason || "WebSocket connection failed");
-          return;
-        }
-        this.protocol = result.subprotocol || "";
-        this.readyState = EdgeTermWebSocket.OPEN;
-        this.dispatchEvent(new Event("open"));
-        this._poll();
-      } catch (err) {
-        this.dispatchEvent(new Event("error"));
-        this._finishClose(1006, err?.message || "WebSocket connection failed");
-      }
-    }
-    async _poll() {
-      if (this._closed || this.readyState === EdgeTermWebSocket.CLOSED) return;
-      try {
-        const result = await parent.EdgeTermAppModeBridge.websocketPoll({ id: this._id });
-        for (const event of result?.events || []) {
-          if (event.type === "message") {
-            const data = event.kind === "bytes" ? fromBase64(event.dataBase64 || "", this.binaryType) : String(event.data || "");
-            this.dispatchEvent(new MessageEvent("message", { data, origin: "edgeterm.local" }));
-          } else if (event.type === "close") {
-            this._finishClose(event.code || 1000, event.reason || "");
-            return;
-          }
-        }
-      } catch (err) {
-        this.dispatchEvent(new Event("error"));
-        this._finishClose(1006, err?.message || "WebSocket polling failed");
-        return;
-      }
-      this._pollTimer = setTimeout(() => this._poll(), 0);
-    }
-    async send(data) {
-      if (this.readyState !== EdgeTermWebSocket.OPEN) throw new DOMException("WebSocket is not open", "InvalidStateError");
-      const payload = await toBase64(data);
-      await parent.EdgeTermAppModeBridge.websocketSend({ id: this._id, ...payload });
-    }
-    close(code = 1000, reason = "") {
-      if (this.readyState === EdgeTermWebSocket.CLOSING || this.readyState === EdgeTermWebSocket.CLOSED) return;
-      this.readyState = EdgeTermWebSocket.CLOSING;
-      parent.EdgeTermAppModeBridge.websocketClose({ id: this._id, code, reason }).catch(() => {});
-      this._finishClose(code, reason);
-    }
-    _finishClose(code = 1000, reason = "") {
-      if (this._closed) return;
-      this._closed = true;
-      bridgedWebSockets.delete(this);
-      clearTimeout(this._pollTimer);
-      this.readyState = EdgeTermWebSocket.CLOSED;
-      this.dispatchEvent(new CloseEvent("close", { code: Number(code) || 1000, reason: String(reason || ""), wasClean: Number(code) === 1000 }));
-    }
-    set onopen(handler) { this._setHandler("open", handler); }
-    get onopen() { return this._onopen || null; }
-    set onmessage(handler) { this._setHandler("message", handler); }
-    get onmessage() { return this._onmessage || null; }
-    set onerror(handler) { this._setHandler("error", handler); }
-    get onerror() { return this._onerror || null; }
-    set onclose(handler) { this._setHandler("close", handler); }
-    get onclose() { return this._onclose || null; }
-    _setHandler(type, handler) {
-      const key = \`_on\${type}\`;
-      if (this[key]) this.removeEventListener(type, this[key]);
-      this[key] = typeof handler === "function" ? handler : null;
-      if (this[key]) this.addEventListener(type, this[key]);
-    }
-  }
-  EdgeTermWebSocket.prototype.CONNECTING = EdgeTermWebSocket.CONNECTING;
-  EdgeTermWebSocket.prototype.OPEN = EdgeTermWebSocket.OPEN;
-  EdgeTermWebSocket.prototype.CLOSING = EdgeTermWebSocket.CLOSING;
-  EdgeTermWebSocket.prototype.CLOSED = EdgeTermWebSocket.CLOSED;
-  window.WebSocket = EdgeTermWebSocket;
-  if (edgeServeDebug?.enabled) {
-    edgeServeLog("document", edgeServeDebug);
-  }
-  const hydrateBridgeDocument = () => {
-    hydrateAssets();
-    hydrateNavigationNode(document.documentElement);
-  };
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", hydrateBridgeDocument, { once: true });
-  else hydrateBridgeDocument();
-  try {
-    const observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.type === "attributes") {
-          hydrateNavigationNode(mutation.target);
-          hydrateAssetNode(mutation.target);
-          continue;
-        }
-        for (const node of mutation.addedNodes || []) {
-          if (!(node instanceof Element)) continue;
-          hydrateNavigationNode(node);
-          hydrateAssetNode(node);
-          if (node.querySelector?.(assetSelector + ", [style*='url('], [style*='URL(']")) {
-            scheduleHydrateAssets();
-          }
-        }
-      }
-    });
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["src", "srcset", "href", "action", "poster", "style", "data-edgeterm-asset-url"],
-    });
-  } catch {}
-  const handleInternalLinkClick = (event) => {
-    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-    const link = target?.closest?.("a[href], area[href]");
-    if (!link) return;
-    const href = link.getAttribute("data-edgeterm-nav-url") || link.getAttribute("href");
-    if (event.defaultPrevented) return;
-    if (!shouldIntercept(href)) return;
-    const destination = normalizeBridgeRequestUrl(href);
-    if (link.target === "_blank" || event.button === 1 || event.metaKey || event.ctrlKey) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      parent.EdgeTermAppModeBridge.openTab(destination);
-      return;
-    }
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    parent.EdgeTermAppModeBridge.navigate(destination);
-  };
-  document.addEventListener("click", handleInternalLinkClick, true);
-  document.addEventListener("auxclick", handleInternalLinkClick, true);
-  document.addEventListener("submit", async (event) => {
-    const form = event.target;
-    if (!(form instanceof HTMLFormElement)) return;
-    event.preventDefault();
-    const action = normalizeBridgeRequestUrl(form.getAttribute("data-edgeterm-nav-url") || form.getAttribute("action") || virtualPath());
-    const method = (form.getAttribute("method") || "GET").toUpperCase();
-    const formData = new URLSearchParams(new FormData(form)).toString();
-    if (method === "GET") {
-      const next = formData ? \`\${action}\${action.includes("?") ? "&" : "?"}\${formData}\` : action;
-      await parent.EdgeTermAppModeBridge.navigate(next);
-      return;
-    }
-    const enctype = String(form.enctype || form.getAttribute("enctype") || "").toLowerCase();
-    if (enctype.includes("multipart/form-data")) {
-      await parent.EdgeTermAppModeBridge.navigate(action, {
-        method,
-        headers: {},
-        body: new FormData(form),
-      });
-      return;
-    }
-    await parent.EdgeTermAppModeBridge.navigate(action, {
-      method,
-      headers: { "content-type": "application/x-www-form-urlencoded; charset=utf-8" },
-      body: formData,
-    });
-  });
-  window.addEventListener("keydown", (event) => {
-    parent.EdgeTermAppModeBridge.keydown({
-      key: event.key,
-      ctrlKey: !!event.ctrlKey,
-      altKey: !!event.altKey,
-      shiftKey: !!event.shiftKey,
-      metaKey: !!event.metaKey,
-      exitHotkey,
-      debugHotkey,
-      allowDebugTerminal,
-    });
-  }, true);
-  window.addEventListener("beforeunload", () => {
-    syncSiteData();
-    for (const socket of bridgedWebSockets) {
-      parent.EdgeTermAppModeBridge.websocketClose({ id: socket._id, code: 1001, reason: "Frame unloaded" }).catch(() => {});
-    }
-  });
-})();
-`;
-      }
-
-      async function dispatchPythonAppRequest(url, options, config) {
+      async function dispatchPythonAppRequest(url, options, config, preferredInstance = null) {
         const { path, query } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
         let dispatchPath = path || "/";
         const requestMethod = (options.method || "GET").toUpperCase();
-        const matchedInstance = findEdgeServeInstanceForPath(dispatchPath);
+        const matchedInstance = preferredInstance || findEdgeServeInstanceForPath(dispatchPath);
         const activeTab = appModeState.renderTarget === "display" ? activeDisplayBrowserTab() : null;
         const activeInstanceId = matchedInstance?.id || activeTab?.instanceId || config.python?.instanceId || "";
         const routePrefix = normalizePath(matchedInstance?.routePrefix || activeTab?.routePrefix || config.python?.routePrefix || "/");
@@ -5094,7 +4731,7 @@ else:
         if (WORKER_SHELL_ENABLED) {
           const result = await workerFs("pythonAppDispatch", payload);
           if (result.status === 404 && dispatchPath.length > 1 && dispatchPath.endsWith("/")) {
-            const retried = await dispatchPythonAppRequest(dispatchPath.slice(0, -1) + (query ? `?${query}` : ""), options, config);
+            const retried = await dispatchPythonAppRequest(dispatchPath.slice(0, -1) + (query ? `?${query}` : ""), options, config, preferredInstance);
             if (retried.status !== 404) return retried;
           }
           if (result.status === 404 && config.staticRoot) {
@@ -5126,6 +4763,25 @@ instance_id = request_data.get("instanceId") or ""
 if instance_id:
     import edgeterm_wsgi
 
+    try:
+        from django.conf import settings as django_settings
+
+        instance = edgeterm_wsgi.get_instance(instance_id)
+        if getattr(django_settings, "FORCE_SCRIPT_NAME", None) == instance.route_prefix:
+            django_settings.FORCE_SCRIPT_NAME = None
+    except Exception:
+        pass
+
+    try:
+        import anyio.to_thread as anyio_to_thread
+
+        async def edgeterm_run_sync(function, *args, **kwargs):
+            return function(*args)
+
+        anyio_to_thread.run_sync = edgeterm_run_sync
+    except Exception:
+        pass
+
     result = await edgeterm_wsgi.dispatch_instance(
         instance_id,
         path=request_data.get("path", "/"),
@@ -5149,7 +4805,7 @@ json.dumps(result)
           await persistActiveWorkspace();
         }
         if (result.status === 404 && dispatchPath.length > 1 && dispatchPath.endsWith("/")) {
-          const retried = await dispatchPythonAppRequest(dispatchPath.slice(0, -1) + (query ? `?${query}` : ""), options, config);
+          const retried = await dispatchPythonAppRequest(dispatchPath.slice(0, -1) + (query ? `?${query}` : ""), options, config, preferredInstance);
           if (retried.status !== 404) return retried;
         }
         if (result.status === 404 && config.staticRoot) {
@@ -5165,6 +4821,7 @@ json.dumps(result)
         const routePath = normalizePath(path || "/");
         let best = null;
         for (const instance of instances.values()) {
+          if (!edgeServeInstanceIsInActiveWorkspace(instance)) continue;
           const prefix = normalizePath(instance.routePrefix || "/");
           if (prefix === "/") continue;
           if (routePath === prefix || routePath.startsWith(`${prefix}/`)) {
@@ -6488,6 +6145,18 @@ try {
           if (path.length > 1 && path.endsWith("/")) {
             return await dispatchStaticRequest(path.slice(0, -1), options, config, extra);
           }
+          const finalSegment = path.split("/").filter(Boolean).pop() || "";
+          if (config.static?.spaFallback && !finalSegment.includes(".")) {
+            const fallbackPath = resolveWorkspacePath(
+              root,
+              config.static.indexFile || "index.html",
+            );
+            if (pyodide.FS.analyzePath(fallbackPath).exists) {
+              fsPath = fallbackPath;
+            }
+          }
+        }
+        if (!pyodide.FS.analyzePath(fsPath).exists) {
           return extra.silentNotFound
             ? { status: 404, headers: { "content-type": "text/plain; charset=utf-8" }, body: "Not found" }
             : {
@@ -6505,10 +6174,15 @@ try {
         };
       }
 
-      async function dispatchAppModeRequest(url, options = {}) {
-        const config = appModeState.config || (WORKER_SHELL_ENABLED ? defaultAppModeConfig() : readAppModeConfig());
-        const { path } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
-        const matchedInstance = findEdgeServeInstanceForPath(path);
+      async function dispatchAppModeRequest(url, options = {}, preferredInstance = null) {
+        const fallbackConfig = appModeState.config || (WORKER_SHELL_ENABLED ? defaultAppModeConfig() : readAppModeConfig());
+        const { path, query } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
+        const activeTab = appModeState.renderTarget === "display" ? activeDisplayBrowserTab() : null;
+        const tabInstance = activeTab?.instanceId
+          ? window.EdgeTermServe?.instances?.get?.(activeTab.instanceId)
+          : null;
+        const matchedInstance = preferredInstance || findEdgeServeInstanceForPath(path) || tabInstance;
+        const config = edgeServeConfigForInstance(matchedInstance) || fallbackConfig;
         const serveMode = matchedInstance?.mode || config.python?.serveMode || "";
         const method = String(options.method || "GET").toUpperCase();
         const routePrefix = normalizePath(matchedInstance?.routePrefix || config.python?.routePrefix || "/");
@@ -6521,10 +6195,15 @@ try {
           response = await dispatchPhpAppRequest(url, options, config, matchedInstance);
         } else if (config.runtime === "python") {
           kind = "python";
-          response = await dispatchPythonAppRequest(url, options, config);
+          response = await dispatchPythonAppRequest(url, options, config, matchedInstance);
         } else {
           kind = "static";
-          response = await dispatchStaticRequest(url, options, config);
+          let staticUrl = url;
+          if (routePrefix !== "/" && (path === routePrefix || path.startsWith(`${routePrefix}/`))) {
+            const relativePath = path.slice(routePrefix.length) || "/";
+            staticUrl = `${relativePath.startsWith("/") ? relativePath : `/${relativePath}`}${query ? `?${query}` : ""}`;
+          }
+          response = await dispatchStaticRequest(staticUrl, options, config);
         }
         const durationMs = Math.round(performance.now() - startedAt);
         return attachEdgeServeDebug(response, {
@@ -6654,6 +6333,7 @@ try {
         };
         pyodide.globals.set("__edgeterm_ws_request_json", JSON.stringify(payload));
         const raw = await pyodide.runPythonAsync(`
+import difflib
 import json
 import os
 import sys
@@ -7205,7 +6885,7 @@ json.dumps(result)
         const routePrefix = normalizePath(instance?.routePrefix || "/");
         const site = describeAppModeSite(appModeState.config, instance);
         const existingCount = [...appModeState.browserTabs.values()].filter((tab) => tab.instanceId === instanceId).length;
-        const title = `${instance?.mode || "app"} ${instanceId.slice(-5)}${options.newTab || existingCount ? `:${existingCount + 1}` : ""}`;
+        const title = existing?.title || `${instance?.mode || "app"} ${instanceId.slice(-5)}${options.newTab || existingCount ? `:${existingCount + 1}` : ""}`;
         const tab =
           existing ||
           {
@@ -7264,6 +6944,11 @@ json.dumps(result)
         }
         const tab = appModeState.browserTabs.get(tabId);
         if (!tab) return;
+        const instance = tab.instanceId
+          ? window.EdgeTermServe?.instances?.get?.(tab.instanceId)
+          : null;
+        const instanceConfig = edgeServeConfigForInstance(instance);
+        if (instanceConfig) appModeState.config = instanceConfig;
         appModeState.activeBrowserTabId = tab.id;
         loadDisplayBrowserTabState(tab);
         ensureDisplayAppModeFrame();
@@ -7308,7 +6993,8 @@ json.dumps(result)
       }
 
       async function openDisplayBrowserTabChooser() {
-        const instances = [...(window.EdgeTermServe?.instances?.values?.() || [])];
+        const instances = [...(window.EdgeTermServe?.instances?.values?.() || [])]
+          .filter(edgeServeInstanceIsInActiveWorkspace);
         if (!instances.length) {
           showNotice("No running EdgeServe instances");
           return;
@@ -8670,10 +8356,12 @@ def data():
 
       function editorContext() {
         const path = normalizePath($id("editorPath")?.value || "/home/user/notes.txt");
+        const isPython = path.endsWith(".py");
         return {
           path,
           splitPath: normalizePath($id("editorSplitPath")?.value || splitEditorPath || path),
-          isPython: path.endsWith(".py"),
+          isPython,
+          isRunnable: isPython || /\.(?:lua|php|html?|js|mjs|cjs)$/i.test(path),
           hasSelection: !!editor?.getSelection() && !editor.getSelection().isEmpty(),
           split: editorSplitEnabled,
           theme: editorTheme,
@@ -8737,15 +8425,689 @@ def data():
       }
 
       function createEditorModel(path, content) {
-        return monaco.editor.createModel(content, editorLanguageForPath(path));
+        const normalized = normalizePath(path);
+        const uri = monaco.Uri.parse(`file://${normalized}`);
+        return monaco.editor.getModel(uri) || monaco.editor.createModel(content, editorLanguageForPath(normalized), uri);
       }
 
       function replaceEditorModel(target, model) {
         const instance = editorInstanceForTarget(target);
         if (!instance) return;
-        const oldModel = instance.getModel();
         instance.setModel(model);
-        if (oldModel && oldModel !== model) oldModel.dispose();
+      }
+
+      function editorFileName(path) {
+        return String(path || "").split("/").filter(Boolean).pop() || "untitled";
+      }
+
+      function renderEditorTabs() {
+        const host = $id("editorTabs");
+        if (!host) return;
+        host.innerHTML = "";
+        if (!editorOpenTabs.size) {
+          host.innerHTML = '<div class="editor-tab-welcome">No open editors</div>';
+          return;
+        }
+        for (const [path, tab] of editorOpenTabs) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "editor-tab";
+          button.classList.toggle("active", path === editorActiveTabPath);
+          button.dataset.editorTabPath = path;
+          button.title = path;
+          button.innerHTML = `<i data-lucide="${path.endsWith(".py") ? "file-code-2" : "file"}"></i><span></span><span class="editor-tab-dirty">${tab.dirty ? "●" : ""}</span><i class="editor-tab-close" data-editor-close-tab="${encodeURIComponent(path)}" data-lucide="x"></i>`;
+          button.querySelector("span").textContent = editorFileName(path);
+          host.appendChild(button);
+        }
+        window.lucide?.createIcons();
+      }
+
+      function updateEditorBreadcrumbs(path = editorActiveTabPath) {
+        if ($id("editorBreadcrumbs")) $id("editorBreadcrumbs").textContent = normalizePath(path || editorWorkspaceRootPath).split("/").filter(Boolean).join("  ›  ");
+      }
+
+      function editorPathInside(path, root) {
+        const normalizedPath = normalizePath(path);
+        const normalizedRoot = normalizePath(root);
+        return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
+      }
+
+      function remappedEditorPath(path, source, target) {
+        const normalizedPath = normalizePath(path);
+        const normalizedSource = normalizePath(source);
+        const normalizedTarget = normalizePath(target);
+        return editorPathInside(normalizedPath, normalizedSource)
+          ? `${normalizedTarget}${normalizedPath.slice(normalizedSource.length)}`
+          : normalizedPath;
+      }
+
+      function remapEditorWorkspacePath(source, target) {
+        if (!window.monaco?.editor) return;
+        const activeBefore = editorActiveTabPath;
+        for (const [path, tab] of [...editorOpenTabs.entries()]) {
+          if (!editorPathInside(path, source)) continue;
+          const nextPath = remappedEditorPath(path, source, target);
+          const content = tab.model?.getValue?.() || "";
+          const nextModel = createEditorModel(nextPath, content);
+          if (nextModel.getValue() !== content) nextModel.setValue(content);
+          monaco.editor.setModelLanguage(nextModel, editorLanguageForPath(nextPath));
+          editorOpenTabs.delete(path);
+          editorOpenTabs.set(nextPath, { ...tab, model: nextModel });
+          if (path === activeBefore) {
+            editorActiveTabPath = nextPath;
+            editor?.setModel?.(nextModel);
+            if ($id("editorPath")) $id("editorPath").value = nextPath;
+            updateEditorBreadcrumbs(nextPath);
+          }
+          if (tab.model !== nextModel) tab.model?.dispose?.();
+        }
+        if (splitEditorPath && editorPathInside(splitEditorPath, source)) {
+          const nextSplitPath = remappedEditorPath(splitEditorPath, source, target);
+          const previousModel = splitEditor?.getModel?.();
+          const content = previousModel?.getValue?.() || "";
+          const nextModel = createEditorModel(nextSplitPath, content);
+          if (nextModel.getValue() !== content) nextModel.setValue(content);
+          monaco.editor.setModelLanguage(nextModel, editorLanguageForPath(nextSplitPath));
+          splitEditorPath = nextSplitPath;
+          if ($id("editorSplitPath")) $id("editorSplitPath").value = nextSplitPath;
+          splitEditor?.setModel?.(nextModel);
+          if (previousModel !== nextModel) previousModel?.dispose?.();
+        }
+        renderEditorTabs();
+        updateEditorStatusBar();
+      }
+
+      function removeEditorWorkspacePaths(paths) {
+        if (!Array.isArray(paths) || paths.length === 0) return;
+        const removesPath = (path) => paths.some((root) => editorPathInside(path, root));
+        const activeRemoved = editorActiveTabPath && removesPath(editorActiveTabPath);
+        for (const [path, tab] of [...editorOpenTabs.entries()]) {
+          if (!removesPath(path)) continue;
+          editorOpenTabs.delete(path);
+          tab.model?.dispose?.();
+        }
+        if (activeRemoved) {
+          editorActiveTabPath = "";
+          const nextPath = editorOpenTabs.keys().next().value || "";
+          if (nextPath) activateEditorTab(nextPath, { focus: false });
+          else {
+            editor?.setModel?.(null);
+            if ($id("editorPath")) $id("editorPath").value = defaultEditorPath();
+            updateEditorBreadcrumbs(editorWorkspaceRootPath);
+          }
+        }
+        if (splitEditorPath && removesPath(splitEditorPath)) {
+          splitEditor?.getModel?.()?.dispose?.();
+          splitEditor?.setModel?.(null);
+          splitEditorPath = "";
+          if ($id("editorSplitPath")) $id("editorSplitPath").value = defaultEditorPath();
+          setSplitEditorStatus("Split ready");
+        }
+        renderEditorTabs();
+        updateEditorStatusBar();
+      }
+
+      function activateEditorTab(path, options = {}) {
+        const normalized = normalizePath(path);
+        const tab = editorOpenTabs.get(normalized);
+        if (!tab || !editor) return false;
+        suppressEditorDirty = true;
+        editorActiveTabPath = normalized;
+        $id("editorPath").value = normalized;
+        editor.setModel(tab.model);
+        suppressEditorDirty = false;
+        renderEditorTabs();
+        updateEditorBreadcrumbs(normalized);
+        updateEditorStatusBar();
+        if (options.focus !== false) editor.focus();
+        return true;
+      }
+
+      async function closeEditorPath(path) {
+        const normalized = normalizePath(path);
+        const tab = editorOpenTabs.get(normalized);
+        if (!tab) return;
+        if (tab.dirty && !(await askConfirm("Close Editor", `Discard unsaved changes in ${editorFileName(normalized)}?`, { confirmLabel: "Discard", danger: true }))) return;
+        const paths = [...editorOpenTabs.keys()];
+        const index = paths.indexOf(normalized);
+        editorOpenTabs.delete(normalized);
+        if (editorActiveTabPath === normalized) {
+          const next = paths[index + 1] || paths[index - 1] || "";
+          editorActiveTabPath = "";
+          if (next && editorOpenTabs.has(next)) activateEditorTab(next);
+          else {
+            suppressEditorDirty = true;
+            editor.setModel(null);
+            suppressEditorDirty = false;
+            $id("editorPath").value = defaultEditorPath();
+            updateEditorBreadcrumbs(editorWorkspaceRootPath);
+          }
+        }
+        tab.model?.dispose?.();
+        renderEditorTabs();
+      }
+
+      function updateEditorStatusBar() {
+        const position = editor?.getPosition?.() || { lineNumber: 1, column: 1 };
+        const model = editor?.getModel?.();
+        const language = model?.getLanguageId?.() || "plaintext";
+        if ($id("editorStatusCursor")) $id("editorStatusCursor").textContent = `Ln ${position.lineNumber}, Col ${position.column}`;
+        if ($id("editorStatusLanguage")) $id("editorStatusLanguage").textContent = language === "plaintext" ? "Plain Text" : language;
+      }
+
+      function appendEditorOutput(message) {
+        editorOutputLines.push(`[${new Date().toLocaleTimeString()}] ${String(message || "")}`);
+        editorOutputLines = editorOutputLines.slice(-200);
+        if ($id("editorOutputPanel")) $id("editorOutputPanel").textContent = editorOutputLines.join("\n");
+      }
+
+      function selectEditorActivity(name) {
+        document.querySelectorAll("[data-editor-activity]").forEach((button) => button.classList.toggle("active", button.dataset.editorActivity === name));
+        document.querySelectorAll("[data-editor-side-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.editorSidePanel === name));
+      }
+
+      function selectEditorBottomPanel(name) {
+        $id("editorBottomPanel")?.classList.remove("collapsed");
+        document.querySelectorAll("[data-editor-bottom-tab]").forEach((button) => button.classList.toggle("active", button.dataset.editorBottomTab === name));
+        document.querySelectorAll("[data-editor-bottom-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.editorBottomPanel === name));
+        $id("editorClearTerminal")?.classList.toggle("hidden", name !== "terminal");
+        if (name === "terminal") {
+          initializeEditorTerminal();
+          requestAnimationFrame(() => {
+            editorTerm?.resize?.();
+            editorTerm?.focus?.();
+          });
+        }
+      }
+
+      function setupEditorBottomPanelEvents() {
+        document.querySelectorAll("[data-editor-bottom-tab]").forEach((button) => {
+          if (button.dataset.editorBottomEventBound === "true") return;
+          button.addEventListener("click", () => {
+            selectEditorBottomPanel(button.dataset.editorBottomTab);
+            if (button.dataset.editorBottomTab === "problems") {
+              void updateEditorDiagnostics().catch((error) => console.warn("[EDITOR] diagnostics failed", error));
+            }
+          });
+          button.dataset.editorBottomEventBound = "true";
+        });
+      }
+
+      function setupEditorWorkspaceEvents() {
+        const bind = (element, eventName, listener) => {
+          if (!element) return;
+          const marker = `editor${eventName[0].toUpperCase()}${eventName.slice(1)}Bound`;
+          if (element.dataset[marker] === "true") return;
+          element.addEventListener(eventName, listener);
+          element.dataset[marker] = "true";
+        };
+        document.querySelectorAll("[data-editor-activity]").forEach((button) => {
+          bind(button, "click", () => selectEditorActivity(button.dataset.editorActivity));
+        });
+        bind($id("editorPath"), "keydown", (event) => {
+          if (event.key === "Enter") void openEditorInTarget($id("editorPath").value, { target: "main" });
+        });
+        bind($id("editorSplitPath"), "keydown", (event) => {
+          if (event.key === "Enter") void openEditorInTarget($id("editorSplitPath").value, { target: "split" });
+        });
+        bind($id("editorTabs"), "click", (event) => {
+          const close = event.target.closest("[data-editor-close-tab]");
+          if (close) {
+            event.stopPropagation();
+            void closeEditorPath(decodeURIComponent(close.dataset.editorCloseTab));
+            return;
+          }
+          const tab = event.target.closest("[data-editor-tab-path]");
+          if (tab) activateEditorTab(tab.dataset.editorTabPath);
+        });
+        bind($id("editorTabs"), "dblclick", (event) => {
+          if (!event.target.closest("[data-editor-close-tab]")) toggleEditorFullscreen();
+        });
+        bind($id("editorExplorerTree"), "click", (event) => {
+          const row = event.target.closest("[data-editor-tree-path]");
+          if (row) void toggleEditorTreeDirectory(row).catch((error) => showNotice(error?.message || String(error)));
+        });
+        bind($id("editorWorkspaceRoot"), "keydown", (event) => {
+          if (event.key === "Enter") void refreshEditorExplorer();
+        });
+        bind($id("editorRefreshExplorer"), "click", () => void refreshEditorExplorer());
+        bind($id("editorNewFile"), "click", () => void createEditorWorkspaceItem("file"));
+        bind($id("editorNewFolder"), "click", () => void createEditorWorkspaceItem("folder"));
+        bind($id("editorRunSearch"), "click", () => void searchEditorWorkspace());
+        bind($id("editorGlobalSearch"), "keydown", (event) => {
+          if (event.key === "Enter") void searchEditorWorkspace();
+        });
+        bind($id("editorSearchResults"), "click", (event) => {
+          const row = event.target.closest("[data-editor-search-path]");
+          if (row) void openEditorSearchResult(row.dataset.editorSearchPath, row.dataset.editorSearchLine);
+        });
+        bind($id("editorProblemsPanel"), "click", (event) => {
+          const row = event.target.closest("[data-editor-problem-path]");
+          if (row) void openEditorSearchResult(row.dataset.editorProblemPath, row.dataset.editorProblemLine);
+        });
+        bind($id("editorToggleBottomPanel"), "click", () => $id("editorBottomPanel")?.classList.toggle("collapsed"));
+        bind($id("editorClearTerminal"), "click", () => {
+          initializeEditorTerminal();
+          editorTerm?.clear?.();
+          editorTerm?.focus?.();
+        });
+        bind($id("editorMaximizeButton"), "click", toggleEditorFullscreen);
+        bind($id("editorOpenGit"), "click", () => {
+          setView("developerView");
+          selectDeveloperPanel("git");
+        });
+        bind($id("editorRunCurrent"), "click", () => void runCurrentFile().catch((error) => showNotice(error?.message || String(error))));
+        bind($id("editorOpenTerminal"), "click", () => setView("terminalView"));
+        bind($id("editorStatusBranch"), "click", () => {
+          setView("developerView");
+          selectDeveloperPanel("git");
+        });
+        bind($id("openSplitEditorButton"), "click", openSplitEditorPrompt);
+        bind($id("saveSplitEditorButton"), "click", saveSplitEditor);
+        bind($id("useSplitAsPrimaryButton"), "click", promoteSplitEditorToPrimary);
+        bind($id("commandPaletteInput"), "input", () => {
+          editorPaletteSelection = 0;
+          renderCommandPalette();
+        });
+        bind($id("commandPaletteInput"), "keydown", (event) => {
+          const items = Array.from($id("commandPaletteList").querySelectorAll(".palette-item"));
+          if (event.key === "Escape") {
+            event.preventDefault();
+            closeCommandPalette();
+          } else if (event.key === "ArrowDown") {
+            event.preventDefault();
+            editorPaletteSelection = Math.min(editorPaletteSelection + 1, Math.max(items.length - 1, 0));
+            renderCommandPalette();
+          } else if (event.key === "ArrowUp") {
+            event.preventDefault();
+            editorPaletteSelection = Math.max(editorPaletteSelection - 1, 0);
+            renderCommandPalette();
+          } else if (event.key === "Enter") {
+            event.preventDefault();
+            items[editorPaletteSelection]?.click();
+          }
+        });
+        setupEditorBottomPanelEvents();
+      }
+
+      function editorDirectoryEntries(path) {
+        if (!pyodide?.FS || !fsPathExists(path) || !fsIsDir(path)) return [];
+        return pyodide.FS.readdir(path)
+          .filter((name) => name !== "." && name !== "..")
+          .map((name) => {
+            const child = normalizePath(`${path}/${name}`);
+            return { name, path: child, directory: fsIsDir(child) };
+          })
+          .filter((entry) => ![".git", "node_modules", "__pycache__", ".cache"].includes(entry.name))
+          .sort((left, right) => Number(right.directory) - Number(left.directory) || left.name.localeCompare(right.name));
+      }
+
+      async function editorDirectoryEntriesForRuntime(path) {
+        if (!WORKER_SHELL_ENABLED) return editorDirectoryEntries(path);
+        const listing = await workerFs("list", { path: normalizePath(path) });
+        if (!listing?.exists || !listing?.isDir) return [];
+        return (listing.entries || [])
+          .map((entry) => ({
+            name: entry.name,
+            path: normalizePath(entry.path || `${path}/${entry.name}`),
+            directory: !!entry.isDir,
+          }))
+          .filter((entry) => ![".git", "node_modules", "__pycache__", ".cache"].includes(entry.name))
+          .sort((left, right) => Number(right.directory) - Number(left.directory) || left.name.localeCompare(right.name));
+      }
+
+      async function buildEditorTree(path, depth = 0) {
+        const fragment = document.createDocumentFragment();
+        for (const entry of await editorDirectoryEntriesForRuntime(path)) {
+          const row = document.createElement("button");
+          row.type = "button";
+          row.className = "editor-tree-row";
+          row.style.paddingLeft = `${8 + depth * 13}px`;
+          row.dataset.editorTreePath = entry.path;
+          row.dataset.editorTreeDirectory = entry.directory ? "1" : "0";
+          row.innerHTML = `<i data-lucide="${entry.directory ? "chevron-right" : (entry.name.endsWith(".py") ? "file-code-2" : "file")}"></i><span></span>`;
+          row.querySelector("span").textContent = entry.name;
+          fragment.appendChild(row);
+        }
+        return fragment;
+      }
+
+      async function refreshEditorExplorer() {
+        if (!WORKER_SHELL_ENABLED && !pyodide?.FS) return;
+        const refreshGeneration = ++editorExplorerRefreshGeneration;
+        const root = normalizePath($id("editorWorkspaceRoot")?.value || `/home/${activeUser()}`);
+        editorWorkspaceRootPath = root;
+        const host = $id("editorExplorerTree");
+        if (!host) return;
+        const rootExists = WORKER_SHELL_ENABLED ? await workerFsIsDir(root) : fsPathExists(root) && fsIsDir(root);
+        if (!rootExists) {
+          if (refreshGeneration !== editorExplorerRefreshGeneration) return;
+          host.innerHTML = '<div class="editor-panel-empty">Workspace folder does not exist.</div>';
+          return;
+        }
+        const tree = await buildEditorTree(root);
+        if (refreshGeneration !== editorExplorerRefreshGeneration) return;
+        host.replaceChildren(tree);
+        window.lucide?.createIcons();
+      }
+
+      async function toggleEditorTreeDirectory(row) {
+        const path = row.dataset.editorTreePath;
+        if (row.dataset.editorTreeDirectory !== "1") return await openEditor(path);
+        const open = row.dataset.expanded === "1";
+        row.dataset.expanded = open ? "0" : "1";
+        const icon = row.querySelector("svg");
+        icon?.setAttribute("data-lucide", open ? "chevron-right" : "chevron-down");
+        if (open) {
+          let sibling = row.nextElementSibling;
+          while (sibling?.dataset?.editorTreeParent === path) {
+            const next = sibling.nextElementSibling;
+            sibling.remove();
+            sibling = next;
+          }
+        } else {
+          const children = await buildEditorTree(path, Number(row.style.paddingLeft.replace("px", "") || 8) / 13 + 1);
+          const nodes = [...children.childNodes];
+          for (const node of nodes) node.dataset.editorTreeParent = path;
+          row.after(children);
+        }
+        window.lucide?.createIcons();
+      }
+
+      async function walkEditorFiles(root = editorWorkspaceRootPath, limit = 1500) {
+        const files = [];
+        const stack = [normalizePath(root)];
+        while (stack.length && files.length < limit) {
+          const path = stack.pop();
+          for (const entry of await editorDirectoryEntriesForRuntime(path)) {
+            if (entry.directory) stack.push(entry.path);
+            else files.push(entry.path);
+          }
+        }
+        return files;
+      }
+
+      async function searchEditorWorkspace() {
+        const query = String($id("editorGlobalSearch")?.value || "");
+        if (!query) return;
+        const host = $id("editorSearchResults");
+        host.innerHTML = '<div class="editor-panel-empty">Searching...</div>';
+        const results = [];
+        for (const path of await walkEditorFiles()) {
+          if (results.length >= 200) break;
+          let content = "";
+          try {
+            const bytes = WORKER_SHELL_ENABLED
+              ? base64ToBytes(await workerReadBase64(path))
+              : pyodide.FS.readFile(path);
+            if (bytes.length > 1024 * 1024 || bytes.includes(0)) continue;
+            content = new TextDecoder().decode(bytes);
+          } catch { continue; }
+          const lines = content.split("\n");
+          lines.forEach((line, index) => {
+            if (results.length < 200 && line.toLowerCase().includes(query.toLowerCase())) results.push({ path, line: index + 1, text: line.trim() });
+          });
+        }
+        host.innerHTML = "";
+        if (!results.length) host.innerHTML = '<div class="editor-panel-empty">No matches found.</div>';
+        for (const result of results) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "editor-search-result";
+          button.dataset.editorSearchPath = result.path;
+          button.dataset.editorSearchLine = String(result.line);
+          button.innerHTML = "<strong></strong><small></small>";
+          button.querySelector("strong").textContent = `${editorFileName(result.path)}:${result.line}`;
+          button.querySelector("small").textContent = result.text || result.path;
+          host.appendChild(button);
+        }
+        appendEditorOutput(`Search completed: ${results.length} matches for "${query}"`);
+      }
+
+      async function openEditorSearchResult(path, line) {
+        await openEditor(path);
+        editor.setPosition({ lineNumber: Number(line) || 1, column: 1 });
+        editor.revealLineInCenter(Number(line) || 1);
+      }
+
+      async function createEditorWorkspaceItem(kind) {
+        const defaultName = kind === "folder" ? "new-folder" : "untitled.py";
+        const value = await askText(kind === "folder" ? "New Folder" : "New File", "Path", `${editorWorkspaceRootPath}/${defaultName}`, { confirmLabel: "Create" });
+        if (!value) return;
+        const path = normalizePath(value);
+        if (kind === "folder") {
+          if (WORKER_SHELL_ENABLED) await workerFs("mkdir", { path });
+          else ensureDir(path);
+        }
+        else await writeRuntimeFileAndMirror(path, "");
+        await refreshEditorExplorer();
+        if (kind === "file") await openEditor(path);
+        schedulePersistActiveWorkspace(250);
+      }
+
+      function languageUriForPath(path) {
+        return `file://${normalizePath(path)}`;
+      }
+
+      function monacoRangeFromLanguage(range = {}) {
+        return {
+          startLineNumber: Number(range.start?.line || 0) + 1,
+          startColumn: Number(range.start?.character || 0) + 1,
+          endLineNumber: Number(range.end?.line || 0) + 1,
+          endColumn: Number(range.end?.character || 0) + 1,
+        };
+      }
+
+      async function indexLanguageWorkspace() {
+        const generation = `${activeWorkspaceId}:${workspaceMutationGeneration}`;
+        if (languageWorkspaceIndexGeneration === generation) return;
+        if (languageWorkspaceIndexPromise) return await languageWorkspaceIndexPromise;
+        languageWorkspaceIndexPromise = (async () => {
+          const root = editorWorkspaceRootPath || `/home/${activeUser()}`;
+          const manifest = await bridgeFileManifest({ path: root });
+          const supported = new Set(["python", "javascript", "javascriptreact", "typescript", "typescriptreact", "html", "css", "json", "sql"]);
+          let indexedBytes = 0;
+          let indexedFiles = 0;
+          for (const file of manifest.files) {
+            const path = `${root}/${file.path}`;
+            if (path === editorActiveTabPath || path === splitEditorPath) continue;
+            const languageId = editorLanguageForPath(path);
+            if (!supported.has(languageId) || Number(file.size || 0) > 262_144) continue;
+            if (indexedFiles >= 500 || indexedBytes + Number(file.size || 0) > 8 * 1024 * 1024) break;
+            const source = await bridgeReadText(path, 262_144);
+            const uri = languageUriForPath(path);
+            const version = languageDocumentVersions.get(uri) || 1;
+            await getLanguageClient().open({ uri, languageId, text: source.content, version });
+            languageDocumentVersions.set(uri, version);
+            indexedFiles += 1;
+            indexedBytes += source.size;
+          }
+          languageWorkspaceIndexGeneration = generation;
+          edgeTermBridgeServer?.emit("language.indexed", { root, indexed_files: indexedFiles, indexed_bytes: indexedBytes });
+        })().finally(() => {
+          languageWorkspaceIndexPromise = null;
+        });
+        return await languageWorkspaceIndexPromise;
+      }
+
+      async function syncLanguageDocument(model = editor?.getModel?.(), path = editorActiveTabPath) {
+        if (!model || !path) return null;
+        const uri = languageUriForPath(path);
+        const previousVersion = languageDocumentVersions.get(uri);
+        const version = Number(previousVersion || 0) + 1;
+        if (previousVersion) await getLanguageClient().change({ uri, text: model.getValue(), version });
+        else await getLanguageClient().open({ uri, languageId: model.getLanguageId(), text: model.getValue(), version });
+        languageDocumentVersions.set(uri, version);
+        void indexLanguageWorkspace().catch((error) => console.warn("[LANGUAGE] workspace index unavailable", error));
+        return { uri, version };
+      }
+
+      async function requestLanguageFeature(method, model, position, extra = {}) {
+        const synced = await syncLanguageDocument(model, editorActiveTabPath);
+        if (!synced) return null;
+        return await getLanguageClient().request(method, {
+          textDocument: { uri: synced.uri },
+          position: position ? { line: position.lineNumber - 1, character: position.column - 1 } : undefined,
+          ...extra,
+        });
+      }
+
+      function registerEdgeTermLanguageProviders() {
+        if (languageProvidersRegistered || !monaco?.languages) return;
+        languageProvidersRegistered = true;
+        const languages = ["python", "javascript", "javascriptreact", "typescript", "typescriptreact", "html", "css", "json", "sql"];
+        for (const languageId of languages) {
+          monaco.languages.registerCompletionItemProvider(languageId, {
+            triggerCharacters: [".", "\"", "'"],
+            provideCompletionItems: async (model, position) => {
+              const result = await requestLanguageFeature("textDocument/completion", model, position);
+              return {
+                suggestions: (result?.items || []).map((item) => ({
+                  label: item.label,
+                  insertText: item.insertText || item.label,
+                  kind: monaco.languages.CompletionItemKind.Text,
+                  range: undefined,
+                })),
+              };
+            },
+          });
+          monaco.languages.registerHoverProvider(languageId, {
+            provideHover: async (model, position) => {
+              const result = await requestLanguageFeature("textDocument/hover", model, position);
+              return result ? { contents: [{ value: result.contents?.value || "" }], range: monacoRangeFromLanguage(result.range) } : null;
+            },
+          });
+          monaco.languages.registerDefinitionProvider(languageId, {
+            provideDefinition: async (model, position) => {
+              const result = await requestLanguageFeature("textDocument/definition", model, position);
+              return result ? { uri: monaco.Uri.parse(result.uri), range: monacoRangeFromLanguage(result.range) } : null;
+            },
+          });
+          monaco.languages.registerReferenceProvider(languageId, {
+            provideReferences: async (model, position) => {
+              const result = await requestLanguageFeature("textDocument/references", model, position, { context: { includeDeclaration: true } });
+              return (result || []).map((entry) => ({ uri: monaco.Uri.parse(entry.uri), range: monacoRangeFromLanguage(entry.range) }));
+            },
+          });
+          monaco.languages.registerRenameProvider(languageId, {
+            provideRenameEdits: async (model, position, newName) => {
+              const result = await requestLanguageFeature("textDocument/rename", model, position, { newName });
+              const edits = [];
+              for (const [uri, changes] of Object.entries(result?.changes || {})) {
+                for (const change of changes) edits.push({ resource: monaco.Uri.parse(uri), textEdit: { range: monacoRangeFromLanguage(change.range), text: change.newText } });
+              }
+              return { edits };
+            },
+            resolveRenameLocation: async (model, position) => ({ range: model.getWordAtPosition(position) ? new monaco.Range(position.lineNumber, model.getWordAtPosition(position).startColumn, position.lineNumber, model.getWordAtPosition(position).endColumn) : new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column), text: model.getWordAtPosition(position)?.word || "" }),
+          });
+          monaco.languages.registerDocumentFormattingEditProvider(languageId, {
+            provideDocumentFormattingEdits: async (model, options) => {
+              const result = await requestLanguageFeature("textDocument/formatting", model, null, { options });
+              return (result || []).map((entry) => ({ range: monacoRangeFromLanguage(entry.range), text: entry.newText }));
+            },
+          });
+        }
+      }
+
+      async function updateEditorDiagnostics() {
+        if (!editor?.getModel?.()) return;
+        const model = editor.getModel();
+        const path = editorActiveTabPath;
+        const markers = [];
+        window.__edgeTermRuntimeDiagnostics = {
+          ...(window.__edgeTermRuntimeDiagnostics || {}),
+          language: {
+            path,
+            language: model.getLanguageId(),
+            source_length: model.getValue().length,
+            phase: "checking",
+            observedAt: new Date().toISOString(),
+          },
+        };
+        if (path.endsWith(".json")) {
+          try { JSON.parse(model.getValue()); }
+          catch (err) {
+            const match = /position (\d+)/i.exec(err.message || "");
+            const position = model.getPositionAt(Number(match?.[1] || 0));
+            markers.push({ severity: monaco.MarkerSeverity.Error, message: err.message, startLineNumber: position.lineNumber, startColumn: position.column, endLineNumber: position.lineNumber, endColumn: position.column + 1 });
+          }
+        } else if (path.endsWith(".py")) {
+          let result;
+          if (WORKER_SHELL_ENABLED) {
+            result = await workerFs("pythonDiagnostics", { source: model.getValue() });
+          } else if (pyodide) {
+            pyodide.globals.set("__edgeterm_diagnostic_source", model.getValue());
+            result = JSON.parse(String(await pyodide.runPythonAsync(`
+import ast, json
+try:
+    ast.parse(__edgeterm_diagnostic_source)
+    diagnostic_result = {"ok": True}
+except SyntaxError as exc:
+    diagnostic_result = {"ok": False, "message": exc.msg, "line": exc.lineno or 1, "column": exc.offset or 1}
+json.dumps(diagnostic_result)
+`)));
+          }
+          if (result && !result.ok) markers.push({ severity: monaco.MarkerSeverity.Error, message: result.message, startLineNumber: result.line, startColumn: result.column, endLineNumber: result.line, endColumn: result.column + 1 });
+        }
+        const supported = new Set(["python", "javascript", "javascriptreact", "typescript", "typescriptreact", "html", "css", "json", "sql"]);
+        if (path && supported.has(model.getLanguageId())) {
+          try {
+            const synced = await syncLanguageDocument(model, path);
+            const report = synced ? await getLanguageClient().diagnostics(synced.uri) : { items: [] };
+            for (const item of report.items || []) {
+              markers.push({
+                severity: item.severity === 1 ? monaco.MarkerSeverity.Error : item.severity === 2 ? monaco.MarkerSeverity.Warning : monaco.MarkerSeverity.Info,
+                message: item.message,
+                source: item.source || "EdgeTerm Language Services",
+                code: item.code,
+                ...monacoRangeFromLanguage(item.range),
+              });
+            }
+          } catch (error) {
+            console.warn("[LANGUAGE] diagnostics unavailable", error);
+          }
+        }
+        monaco.editor.setModelMarkers(model, "edgeterm", markers);
+        renderEditorProblems();
+        window.__edgeTermRuntimeDiagnostics.language = {
+          ...window.__edgeTermRuntimeDiagnostics.language,
+          phase: "complete",
+          marker_count: markers.length,
+          observedAt: new Date().toISOString(),
+        };
+      }
+
+      function renderEditorProblems() {
+        const markers = monaco?.editor?.getModelMarkers?.({}) || [];
+        const host = $id("editorProblemsPanel");
+        if (!host) return;
+        const currentModelUri = editor?.getModel?.()?.uri?.toString?.() || "";
+        const splitModelUri = splitEditor?.getModel?.()?.uri?.toString?.() || "";
+        const relevant = markers.filter((marker) => {
+          const uri = marker.resource?.toString?.() || "";
+          return uri === currentModelUri || uri === splitModelUri || String(marker.resource?.path || "").startsWith(editorWorkspaceRootPath);
+        });
+        $id("editorProblemCount").textContent = String(relevant.length);
+        $id("editorStatusProblems").innerHTML = `<i data-lucide="circle-x"></i>${relevant.length}`;
+        host.innerHTML = relevant.length ? "" : '<div class="editor-panel-empty">No problems detected.</div>';
+        for (const marker of relevant) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "editor-search-result";
+          const markerUri = marker.resource?.toString?.() || "";
+          const markerPath = markerUri === currentModelUri
+            ? editorActiveTabPath
+            : markerUri === splitModelUri
+              ? splitEditorPath
+              : marker.resource.path;
+          button.dataset.editorProblemPath = markerPath;
+          button.dataset.editorProblemLine = marker.startLineNumber;
+          button.innerHTML = "<strong></strong><small></small>";
+          button.querySelector("strong").textContent = marker.message;
+          button.querySelector("small").textContent = `${markerPath}:${marker.startLineNumber}`;
+          host.appendChild(button);
+        }
+        window.lucide?.createIcons();
       }
 
       function loadEditorFile(path) {
@@ -8803,16 +9165,15 @@ def data():
         const query = $id("commandPaletteInput").value;
         const items =
           editorPaletteMode === "files"
-            ? (pyodide.FS.analyzePath(currentPath).exists ? pyodide.FS.readdir(currentPath) : [])
-                .filter((entry) => entry !== "." && entry !== "..")
-                .map((name) => ({
-                  id: `file:${name}`,
-                  label: name,
+            ? walkEditorFiles(editorWorkspaceRootPath, 2000)
+                .map((path) => ({
+                  id: `file:${path}`,
+                  label: editorFileName(path),
                   icon: "file-code-2",
-                  execute: () => openEditor(`${currentPath === "/" ? "" : currentPath}/${name}`),
-                  shortcut: currentPath,
+                  execute: () => openEditor(path),
+                  shortcut: path.replace(`${editorWorkspaceRootPath}/`, ""),
                 }))
-                .filter((item) => item.label.toLowerCase().includes(query.trim().toLowerCase()))
+                .filter((item) => `${item.label} ${item.shortcut}`.toLowerCase().includes(query.trim().toLowerCase()))
             : getEditorCommandsForPalette(query);
         editorPaletteSelection = Math.min(editorPaletteSelection, Math.max(items.length - 1, 0));
         list.innerHTML = "";
@@ -8901,9 +9262,11 @@ def data():
         const requested = path || await askText("Save File As", "Path", $id("editorPath").value, { confirmLabel: "Save" });
         const target = normalizePath(requested || "");
         if (!target) return;
-        $id("editorPath").value = target;
-        await saveEditor();
+        const content = editor?.getValue?.() || "";
+        await writeRuntimeFileAndMirror(target, content);
+        await openEditorInTarget(target);
         setEditorStatus(`Saved as ${target}`);
+        await refreshEditorExplorer();
       }
 
       async function renameEditorFile() {
@@ -8914,9 +9277,8 @@ def data():
           const nextName = await askText("Rename File", "New file name", currentName, { confirmLabel: "Rename" });
           if (!nextName) return;
           const target = normalizePath(`${path.split("/").slice(0, -1).join("/")}/${nextName}`);
-          await workerFs("writeFile", { path: target, data: await workerReadBase64(path), encoding: "base64" });
-          await workerFs("unlink", { path });
-          $id("editorPath").value = target;
+          await workerFs("rename", { path, target });
+          remapEditorWorkspacePath(path, target);
           if (filesViewIsActive()) await refreshWorkerFiles(currentPath);
           setEditorStatus(`Renamed to ${nextName}`);
           showNotice(`Renamed to ${nextName}`);
@@ -8931,9 +9293,10 @@ def data():
         if (!nextName) return;
         const target = `${path.split("/").slice(0, -1).join("/")}/${nextName}`;
         pyodide.FS.rename(path, target);
-        $id("editorPath").value = target;
+        remapEditorWorkspacePath(path, target);
         await persistActiveWorkspace();
         refreshFiles(currentPath);
+        await refreshEditorExplorer();
         setEditorStatus(`Renamed to ${nextName}`);
         showNotice(`Renamed to ${nextName}`);
       }
@@ -8955,10 +9318,7 @@ def data():
       }
 
       async function closeEditorTab() {
-        replaceEditorModel("main", createEditorModel(defaultEditorPath(), ""));
-        $id("editorPath").value = `/home/${activeUser()}/untitled.txt`;
-        setEditorStatus("Editor cleared");
-        showNotice("Closed editor tab");
+        if (editorActiveTabPath) await closeEditorPath(editorActiveTabPath);
       }
 
       function applyEditorOptions() {
@@ -8985,9 +9345,23 @@ def data():
       }
 
       function toggleEditorFullscreen() {
-        $id("editorView").classList.toggle("editor-fullscreen");
-        editor?.layout();
-        splitEditor?.layout();
+        const view = $id("editorView");
+        const active = view.classList.toggle("editor-fullscreen");
+        document.body.classList.toggle("editor-maximized", active);
+        const button = $id("editorMaximizeButton");
+        if (button) {
+          button.title = active ? "Restore editor" : "Maximize editor";
+          button.setAttribute("aria-label", button.title);
+          button.setAttribute("aria-pressed", String(active));
+          button.innerHTML = `<i data-lucide="${active ? "minimize-2" : "maximize-2"}"></i>`;
+        }
+        window.lucide?.createIcons();
+        requestAnimationFrame(() => {
+          editor?.layout();
+          splitEditor?.layout();
+          editorTerm?.resize?.();
+        });
+        setEditorStatus(active ? "Editor maximized · Esc to restore" : "Editor restored");
       }
 
       function cycleEditorTheme() {
@@ -9023,11 +9397,16 @@ def data():
       async function runCurrentFile(runArgs = "") {
         const path = normalizePath($id("editorPath").value);
         await saveEditor();
-        if (!path.endsWith(".py")) {
-          showNotice("Run Current File currently supports .py files");
-          return;
+        appendEditorOutput(`Running ${path}`);
+        if (path.endsWith(".py")) return await executeInTerminal(`python ${path}${runArgs ? ` ${runArgs}` : ""}`, { postRunSync: false });
+        if (path.endsWith(".lua")) return await executeInTerminal(`lua ${path}${runArgs ? ` ${runArgs}` : ""}`, { postRunSync: false });
+        if (path.endsWith(".php")) return await executeInTerminal(`php ${path}${runArgs ? ` ${runArgs}` : ""}`, { postRunSync: false });
+        if (/\.html?$/i.test(path)) {
+          const root = path.split("/").slice(0, -1).join("/") || "/";
+          return await window.EdgeTermServe.start("static", root, root);
         }
-        await executeInTerminal(`python ${path}${runArgs ? ` ${runArgs}` : ""}`, { postRunSync: false });
+        if (/\.(?:js|mjs|cjs)$/i.test(path)) return await executeInTerminal(`node ${path}${runArgs ? ` ${runArgs}` : ""}`, { postRunSync: false });
+        showNotice(`No run configuration for ${editorFileName(path)}`);
       }
 
       async function runSelection() {
@@ -9143,11 +9522,9 @@ def data():
         add({ id: "file.new", label: "New File", menu: "File", icon: "file-plus-2", shortcut: "Ctrl+N", execute: async () => {
           const target = await askText("New File", "Path", `/home/${activeUser()}/untitled.txt`, { confirmLabel: "Create" });
           if (!target) return;
-          $id("editorPath").value = normalizePath(target);
-          replaceEditorModel("main", createEditorModel(normalizePath(target), ""));
-          setView("editorView");
-          editor.focus();
-          setEditorStatus("New file");
+          await writeRuntimeFileAndMirror(normalizePath(target), "");
+          await openEditorInTarget(normalizePath(target));
+          await refreshEditorExplorer();
         }});
         add({ id: "file.open", label: "Open File", menu: "File", icon: "folder-open", shortcut: "Ctrl+P", execute: async () => openEditor($id("editorPath").value) });
         add({ id: "file.save", label: "Save", menu: "File", icon: "save", shortcut: "Ctrl+S", execute: saveEditor });
@@ -9180,7 +9557,7 @@ def data():
         }});
         add({ id: "edit.comment", label: "Toggle Comment", menu: "Edit", icon: "message-square-code", execute: () => editor.getAction("editor.action.commentLine")?.run() });
         add({ id: "edit.palette", label: "Command Palette", menu: "Edit", icon: "command", shortcut: "Ctrl+Shift+P", execute: () => openCommandPalette("commands") });
-        add({ id: "run.current", label: "Run Current File", menu: "Run", icon: "play", shortcut: "Ctrl+Enter", when: (ctx) => ctx.isPython, execute: () => runCurrentFile() });
+        add({ id: "run.current", label: "Run Current File", menu: "Run", icon: "play", shortcut: "Ctrl+Enter", when: (ctx) => ctx.isRunnable, execute: () => runCurrentFile() });
         add({ id: "run.selection", label: "Run Selection", menu: "Run", icon: "play-circle", when: () => !!currentEditorSelectionText().trim(), execute: runSelection });
         add({ id: "run.args", label: "Run With Arguments", menu: "Run", icon: "list-tree", when: (ctx) => ctx.isPython, execute: runWithArguments });
         add({ id: "run.stop", label: "Stop Program", menu: "Run", icon: "square", execute: stopProgram });
@@ -9219,7 +9596,7 @@ def data():
           { id: "toolbar.new", icon: "file-plus-2", label: "New File", command: "file.new" },
           { id: "toolbar.open", icon: "folder-open", label: "Open File", command: "file.open" },
           { id: "toolbar.save", icon: "save", label: "Save", command: "file.save" },
-          { id: "toolbar.run", icon: "play", label: "Run Current File", command: "run.current", primary: true, when: (ctx) => ctx.isPython },
+          { id: "toolbar.run", icon: "play", label: "Run Current File", command: "run.current", primary: true, when: (ctx) => ctx.isRunnable },
           { id: "toolbar.split", icon: "columns-2", label: "Split Editor", command: "view.split" },
           { id: "toolbar.terminal", icon: "terminal", label: "Show Terminal", command: "view.terminal" },
           { id: "toolbar.display", icon: "monitor-play", label: "Show Display", command: "view.display" },
@@ -9232,13 +9609,19 @@ def data():
         const list = $id("workspaceList");
         list.textContent = "";
 
-        for (const workspace of workspaces.filter((item) => !item.transient)) {
+        const visibleWorkspaces = workspaces.filter((item) => !item.transient);
+        if ($id("workspaceCount")) $id("workspaceCount").textContent = String(visibleWorkspaces.length);
+
+        for (const workspace of visibleWorkspaces) {
           const item = document.createElement("div");
           item.className = `workspace-item${workspace.id === activeWorkspaceId ? " active" : ""}`;
           item.dataset.workspaceId = workspace.id;
           item.innerHTML = `
             <div>
-              <div class="workspace-name"></div>
+              <div class="workspace-name-row">
+                <div class="workspace-name"></div>
+                <span class="workspace-active-badge">Active</span>
+              </div>
               <div class="workspace-meta"></div>
             </div>
             <div class="flex gap-2">
@@ -9248,12 +9631,14 @@ def data():
           `;
           item.querySelector(".workspace-name").textContent = workspace.name;
           const storageLabel = workspace.storageType === "local-directory"
-            ? `local dir${workspace.localDirectoryName ? `: ${workspace.localDirectoryName}` : ""}`
-            : "browser storage";
-          item.querySelector(".workspace-meta").textContent = `${storageLabel} - ${new Date(workspace.createdAt).toLocaleString()}`;
+            ? `Local directory${workspace.localDirectoryName ? ` · ${workspace.localDirectoryName}` : ""}`
+            : "On this device";
+          const workspaceDate = new Date(workspace.updatedAt || workspace.createdAt);
+          item.querySelector(".workspace-meta").textContent = `${storageLabel} · ${workspaceDate.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`;
           item.querySelector(".open-workspace").addEventListener("click", (event) => {
             event.stopPropagation();
-            switchWorkspace(workspace.id).catch((err) => {
+            const switchAction = WORKER_SHELL_ENABLED ? switchWorkerWorkspace : switchWorkspace;
+            switchAction(workspace.id).catch((err) => {
               console.error("[WORKSPACE] Switch failed:", err);
               showNotice(`Switch failed: ${err.message || err}`);
             });
@@ -9349,7 +9734,7 @@ def data():
         workspace.name = trimmed;
         workspace.updatedAt = Date.now();
         saveWorkspaceRegistry();
-        prepareActiveMounts();
+        if (!WORKER_SHELL_ENABLED) prepareActiveMounts();
         renderWorkspaces();
         showNotice("Workspace renamed");
       }
@@ -9586,24 +9971,61 @@ def data():
 
       function setView(id) {
         if (!CLOUD_ENABLED && (id === "cloudView" || id === "adminView")) id = "terminalView";
+        if (id !== "editorView" && $id("editorView")?.classList.contains("editor-fullscreen")) toggleEditorFullscreen();
         document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.view === id));
         document.querySelectorAll(".view").forEach((view) => view.classList.toggle("active", view.id === id));
+        const activeTab = document.querySelector(`.tab[data-view="${id}"]`);
+        if ($id("activeViewTitle")) {
+          $id("activeViewTitle").textContent = activeTab?.dataset.label || activeTab?.getAttribute("aria-label") || "Workspace";
+        }
         if (window.innerWidth <= 820) setSidebarOpen(false);
         if (id !== "displayView" && id !== "browserView" && displayState.fullscreen) setDisplayFullscreen(false);
         if (id === "displayView") $id("displayCanvas")?.focus();
+        if (id === "terminalView") {
+          requestAnimationFrame(() => {
+            const externalStatus = externalShellRuntime?.status?.();
+            const nodeStatus = nodeRuntime?.status?.();
+            const terminalCanResume =
+              !pageIsUnloading
+              && !externalStatus?.foreground
+              && !externalStatus?.running
+              && !nodeStatus?.running
+              && !nodeStatus?.watching
+              && !workerShellCommandRunning
+              && (workerShellReady || !WORKER_SHELL_ENABLED);
+            if (terminalCanResume) {
+              setTerminalInputReady(true);
+              term?.resume?.();
+            }
+            term?.resize?.();
+            term?.focus?.();
+          });
+        }
         if (id === "filesView") {
           if (WORKER_SHELL_ENABLED) {
-            void refreshWorkerFiles(currentPath || `/home/${activeUser()}`);
+            void refreshWorkerFiles(currentPath || `/home/${activeUser()}`, {
+              fallbackToExistingDirectory: true,
+            });
             window.lucide?.createIcons();
             return;
           }
           void ensureActiveWorkspaceMounted("Loading workspace files...").then(() => refreshFiles());
         }
         if (id === "editorView") {
+          setupEditorWorkspaceEvents();
           if (editor && splitEditor) {
             renderEditorChrome();
             editor?.layout();
             splitEditor?.layout();
+            void refreshEditorExplorer();
+          } else {
+            void ensureActiveWorkspaceMounted("Loading editor workspace...")
+              .then(() => setupMonaco())
+              .then(() => refreshEditorExplorer())
+              .catch((err) => {
+                setEditorStatus("Editor failed to load");
+                showNotice(err?.message || String(err));
+              });
           }
         }
         if (id === "usersView") renderUsers();
@@ -9611,8 +10033,26 @@ def data():
           renderCloud();
           void refreshCloudState();
         }
+        if (id === "backupView") {
+          void initializeExternalBackups()
+            .then((controller) => controller.render())
+            .catch((err) => showNotice(err?.message || String(err)));
+        }
         if (id === "adminView") void refreshAdmin();
         if (id === "settingsView") renderSettings();
+        if (id === "projectsView") {
+          setupDevelopmentWorkspaceEvents();
+          renderRunCenter();
+          void refreshDevelopmentWorkspace().catch((error) => console.warn("[DEVELOPMENT] refresh failed", error));
+        }
+        if (id === "databaseView") {
+          void refreshDatabaseDiscovery().catch((err) => setDatabaseStatus(err?.message || String(err)));
+        }
+        if (id === "developerView") {
+          const root = $id("developerProjectRoot");
+          if (root && (!root.value || root.value === "/home/user")) root.value = `/home/${activeUser()}`;
+          selectDeveloperPanel(developerState.activePanel);
+        }
         window.lucide?.createIcons();
       }
 
@@ -9624,12 +10064,15 @@ def data():
       function editorLanguageForPath(path) {
         const lower = path.toLowerCase();
         if (lower.endsWith(".py")) return "python";
+        if (lower.endsWith(".jsx")) return "javascriptreact";
         if (lower.endsWith(".js") || lower.endsWith(".mjs") || lower.endsWith(".cjs")) return "javascript";
+        if (lower.endsWith(".tsx")) return "typescriptreact";
         if (lower.endsWith(".ts")) return "typescript";
         if (lower.endsWith(".json")) return "json";
         if (lower.endsWith(".md")) return "markdown";
         if (lower.endsWith(".html")) return "html";
         if (lower.endsWith(".css")) return "css";
+        if (lower.endsWith(".sql")) return "sql";
         if (lower.endsWith(".sh")) return "shell";
         return "plaintext";
       }
@@ -10018,6 +10461,294 @@ def data():
               : "Preparing workspace archive...",
           });
         });
+      }
+
+      async function* walkWorkerBackupTree(sourcePath, relativeBase = "", options = {}) {
+        const listing = await workerFs("list", { path: sourcePath });
+        if (!listing?.exists || !listing?.isDir) return;
+        for (const entry of listing.entries || []) {
+          const relativePath = relativeBase ? `${relativeBase}/${entry.name}` : entry.name;
+          if (options.exclude?.(relativePath, entry)) continue;
+          if (entry.isLink) {
+            yield {
+              path: relativePath,
+              type: "symlink",
+              target: String(entry.target || ""),
+              mode: Number(entry.mode || 0o777),
+              mtime: Number(entry.mtime || 0),
+            };
+          } else if (entry.isDir) {
+            yield {
+              path: relativePath,
+              type: "directory",
+              mode: Number(entry.mode || 0o755),
+              mtime: Number(entry.mtime || 0),
+            };
+            yield* walkWorkerBackupTree(entry.path, relativePath, options);
+          } else if (entry.isFile) {
+            yield {
+              path: relativePath,
+              type: "file",
+              mode: Number(entry.mode || 0o644),
+              mtime: Number(entry.mtime || 0),
+              size: Number(entry.size || 0),
+              getData: async () => base64ToBytes(await workerReadBase64(entry.path)),
+            };
+          }
+        }
+      }
+
+      async function* walkMainBackupTree(sourcePath, relativeBase = "", options = {}) {
+        const fs = pyodide.FS;
+        for (const name of fs.readdir(sourcePath).filter((entry) => entry !== "." && entry !== "..")) {
+          const absolutePath = `${sourcePath.replace(/\/$/, "")}/${name}`;
+          const relativePath = relativeBase ? `${relativeBase}/${name}` : name;
+          const linkStat = fs.lstat(absolutePath);
+          const isLink = fs.isLink(linkStat.mode);
+          if (options.exclude?.(relativePath, { isLink })) continue;
+          if (isLink) {
+            yield {
+              path: relativePath,
+              type: "symlink",
+              target: fs.readlink(absolutePath),
+              mode: Number(linkStat.mode || 0o777),
+              mtime: Number(linkStat.mtime || 0),
+            };
+            continue;
+          }
+          if (fs.isDir(linkStat.mode)) {
+            yield {
+              path: relativePath,
+              type: "directory",
+              mode: Number(linkStat.mode || 0o755),
+              mtime: Number(linkStat.mtime || 0),
+            };
+            yield* walkMainBackupTree(absolutePath, relativePath, options);
+            continue;
+          }
+          if (!fs.isFile(linkStat.mode)) continue;
+          yield {
+            path: relativePath,
+            type: "file",
+            mode: Number(linkStat.mode || 0o644),
+            mtime: Number(linkStat.mtime || 0),
+            size: Number(linkStat.size || 0),
+            getData: async () => fs.readFile(absolutePath),
+          };
+        }
+      }
+
+      function externalBackupExcludes(path) {
+        return path === "snapshots" || path.startsWith("snapshots/") || path.includes("/.local/share/edgeterm/snapshots/");
+      }
+
+      async function createExternalBackupSource() {
+        const workspace = activeWorkspace();
+        if (!workspace) throw new Error("No active workspace");
+        await ensureActiveWorkspaceMounted("Loading workspace before backup...");
+        if (WORKER_SHELL_ENABLED) {
+          const storedRoot = `/workspace-store/${workspace.id}`;
+          const hasStoredRoot = await workerFsIsDir(storedRoot);
+          return {
+            workspaceId: workspace.id,
+            workspaceName: workspace.name,
+            rootfsVersion: workspace.rootfsVersion || DEFAULT_ROOTFS_VERSION,
+            flush: async () => {},
+            listEntries: async function* () {
+              if (hasStoredRoot) {
+                yield* walkWorkerBackupTree(storedRoot, "", { exclude: externalBackupExcludes });
+                return;
+              }
+              const roots = [
+                [`/home/${activeUser()}`, "home/user"],
+                ["/packages", "packages"],
+                ["/var/lib/pkg", "var/lib/pkg"],
+                ["/var/cache/pkg", "var/cache/pkg"],
+                ["/var/lib/apt", "var/lib/apt"],
+                ["/var/lib/dpkg", "var/lib/dpkg"],
+                ["/var/cache/apt", "var/cache/apt"],
+                ["/etc/apt", "etc/apt"],
+                ["/usr/local", "usr/local"],
+                ["/opt", "opt"],
+                ["/etc/appmode", "etc/appmode"],
+              ];
+              for (const [sourcePath, relativePath] of roots) {
+                if (!(await workerFsIsDir(sourcePath))) continue;
+                yield { path: relativePath, type: "directory", mode: 0o755, mtime: 0 };
+                yield* walkWorkerBackupTree(sourcePath, relativePath, { exclude: externalBackupExcludes });
+              }
+            },
+          };
+        }
+        await persistActiveWorkspace();
+        const sourcePath = workspacePath(workspace.id);
+        return {
+          workspaceId: workspace.id,
+          workspaceName: workspace.name,
+          rootfsVersion: workspace.rootfsVersion || DEFAULT_ROOTFS_VERSION,
+          flush: async () => await persistActiveWorkspace(),
+          listEntries: () => walkMainBackupTree(sourcePath, "", { exclude: externalBackupExcludes }),
+        };
+      }
+
+      async function currentExternalBackupEntries() {
+        const source = await createExternalBackupSource();
+        const entries = [];
+        for await (const entry of source.listEntries()) {
+          const item = { path: entry.path, type: entry.type };
+          if (entry.type === "file") item.hash = await bridgeSha256Bytes(await entry.getData());
+          entries.push(item);
+        }
+        return entries;
+      }
+
+      function applyMainRestoreMetadata(path, entry) {
+        try {
+          if (entry.mode) pyodide.FS.chmod(path, Number(entry.mode) & 0o7777);
+          if (entry.mtime) pyodide.FS.utime(path, Number(entry.mtime), Number(entry.mtime));
+        } catch {}
+      }
+
+      async function createExternalBackupRestoreTarget(manifest) {
+        const previousWorkspaceId = activeWorkspaceId;
+        const restoredName = `${manifest.workspace?.name || "EdgeTerm workspace"} Restored`;
+        if (WORKER_SHELL_ENABLED) {
+          const id = `ws-${Date.now()}-restore`;
+          const workspace = {
+            id,
+            name: restoredName,
+            createdAt: Date.now(),
+            rootfsVersion: manifest.workspace?.rootfs_version || "restored",
+            users: ["user"],
+            userName: "user",
+            storageType: "browser-storage",
+          };
+          return {
+            begin: async () => {
+              workspaces.push(workspace);
+              activeWorkspaceId = id;
+              saveWorkspaceRegistry();
+              await workerFs("switchWorkspace", { workspaceId: id, users: ["user"], clear: true });
+              await bridgeNotifyExternalShellWorkspaceChanged();
+              return { id, previousWorkspaceId };
+            },
+            createDirectory: async (entry) => await workerFs("mkdir", { path: `/${entry.path}` }),
+            createSymlink: async (entry) => await workerFs("symlink", {
+              path: `/${entry.path}`,
+              target: entry.target,
+            }),
+            writeFile: async (entry, bytes) => await workerFs("writeFile", {
+              path: `/${entry.path}`,
+              data: bytesToBase64(bytes),
+              encoding: "base64",
+            }),
+            commit: async () => {
+              saveWorkspaceRegistry();
+              renderWorkspaces();
+              setWorkerPrompt(`/home/${activeUser()}`);
+              await refreshWorkerFiles(`/home/${activeUser()}`);
+              syncShareWritebackState();
+            },
+            rollback: async () => {
+              workspaces = workspaces.filter((item) => item.id !== id);
+              activeWorkspaceId = previousWorkspaceId;
+              saveWorkspaceRegistry();
+              await workerFs("switchWorkspace", { workspaceId: previousWorkspaceId, users: activeWorkspace()?.users || ["user"], clear: false });
+              await bridgeNotifyExternalShellWorkspaceChanged();
+              renderWorkspaces();
+            },
+          };
+        }
+
+        let restoredId = "";
+        return {
+          begin: async () => {
+            restoredId = await createWorkspaceFromZip(restoredName, null, {
+              switchOptions: { skipBootShell: true, skipRefreshFiles: true, skipAutoStartAppMode: true },
+            });
+            clearDirectory(workspacePath(restoredId));
+            ensureDir(workspacePath(restoredId));
+            return { id: restoredId, previousWorkspaceId };
+          },
+          createDirectory: async (entry) => {
+            const target = workspacePath(restoredId, `/${entry.path}`);
+            ensureDir(target);
+            applyMainRestoreMetadata(target, entry);
+          },
+          createSymlink: async (entry) => {
+            const target = workspacePath(restoredId, `/${entry.path}`);
+            ensureDir(target.split("/").slice(0, -1).join("/") || "/");
+            try {
+              if (pyodide.FS.analyzePath(target).exists) pyodide.FS.unlink(target);
+            } catch {}
+            pyodide.FS.symlink(entry.target, target);
+          },
+          writeFile: async (entry, bytes) => {
+            const target = workspacePath(restoredId, `/${entry.path}`);
+            ensureDir(target.split("/").slice(0, -1).join("/") || "/");
+            pyodide.FS.writeFile(target, bytes);
+            applyMainRestoreMetadata(target, entry);
+          },
+          commit: async () => {
+            const workspace = workspaces.find((item) => item.id === restoredId);
+            if (workspace) workspace.rootfsVersion = manifest.workspace?.rootfs_version || "restored";
+            await ensureWorkspaceLayout(restoredId);
+            await clearWorkspaceJournal(restoredId);
+            await syncfs(false);
+            prepareActiveMounts();
+            saveWorkspaceRegistry();
+            renderWorkspaces();
+            await bootShell();
+            refreshFiles(`/home/${activeUser()}`);
+          },
+          rollback: async () => {
+            if (restoredId) {
+              try {
+                removeTree(workspacePath(restoredId));
+              } catch {}
+              workspaces = workspaces.filter((item) => item.id !== restoredId);
+            }
+            if (workspaces.some((item) => item.id === previousWorkspaceId)) {
+              activeWorkspaceId = previousWorkspaceId;
+              saveWorkspaceRegistry();
+              await mountWorkspaceStorage(previousWorkspaceId);
+              await ensureWorkspaceLayout(previousWorkspaceId);
+              prepareActiveMounts();
+              renderWorkspaces();
+              await bootShell();
+            }
+          },
+        };
+      }
+
+      async function initializeExternalBackups() {
+        if (backupUiController) return backupUiController;
+        backupUiController = new BackupUiController({
+          oauthBroker:
+            window.EDGETERM_BACKUP_OAUTH_BROKER ||
+            runtimeOptions.get("backupBroker") ||
+            "",
+          requestHost: EMBED_ENABLED
+            ? async (method, params = {}) => {
+                if (!edgeTermBridgeServer?.connected) {
+                  const error = new Error("DigitalPlat Bridge is not connected.");
+                  error.code = "bridge_host_unavailable";
+                  error.recoverable = true;
+                  throw error;
+                }
+                return await edgeTermBridgeServer.requestHost(method, params);
+              }
+            : null,
+          getWorkspace: () => activeWorkspace(),
+          createSource: createExternalBackupSource,
+          currentEntries: currentExternalBackupEntries,
+          createRestoreTarget: createExternalBackupRestoreTarget,
+          formatBytes,
+          notice: showNotice,
+          confirm: async (message) => await askConfirm("Backups", message, { confirmLabel: "Continue" }),
+        });
+        await backupUiController.init();
+        return backupUiController;
       }
 
       async function writeActiveWorkspaceToLocalDirectory(handle, options = {}) {
@@ -11531,7 +12262,7 @@ def data():
         URL.revokeObjectURL(url);
       }
 
-      function normalizeWasmCommandEntries(manifest, packageName) {
+      function normalizeWasmCommandEntries(manifest, packageName, packageRootOverride = "") {
         const entries = [];
         const append = (commandName, definition = {}) => {
           const entry = typeof definition === "string" ? { launcher: definition } : { ...definition };
@@ -11541,9 +12272,9 @@ def data():
             command: commandName,
             packageName,
             manifest,
-            packageRoot: packageRootPath(packageName),
-            launcherPath: `${packageRootPath(packageName)}/${launcher}`,
-            wasmPath: `${packageRootPath(packageName)}/${wasm}`,
+            packageRoot: packageRootOverride || packageRootPath(packageName),
+            launcherPath: `${packageRootOverride || packageRootPath(packageName)}/${launcher}`,
+            wasmPath: `${packageRootOverride || packageRootPath(packageName)}/${wasm}`,
             factoryExport: entry.factoryExport || manifest.factoryExport || null,
             thisProgram: entry.thisProgram || manifest.thisProgram || commandName,
           });
@@ -11564,19 +12295,25 @@ def data():
 
       function discoverWasmPackages() {
         const registry = new Map();
-        if (!pyodide.FS.analyzePath("/packages").exists) return registry;
-        for (const packageName of pyodide.FS.readdir("/packages")) {
-          if (packageName === "." || packageName === "..") continue;
-          const manifestPath = packageManifestPath(packageName);
-          if (!pyodide.FS.analyzePath(manifestPath).exists) continue;
-          let manifest;
-          try {
-            manifest = readJsonFile(manifestPath);
-          } catch (err) {
-            console.warn("[WASM] Invalid package manifest:", manifestPath, err);
-            continue;
+        const roots = ["/packages", "/usr/local/share/edgeterm/runtime-packages"];
+        for (const root of roots) {
+          if (!pyodide.FS.analyzePath(root).exists) continue;
+          for (const packageName of pyodide.FS.readdir(root)) {
+            if (packageName === "." || packageName === "..") continue;
+            const packageRoot = `${root}/${packageName}`;
+            const manifestPath = `${packageRoot}/package.json`;
+            if (!pyodide.FS.analyzePath(manifestPath).exists) continue;
+            let manifest;
+            try {
+              manifest = readJsonFile(manifestPath);
+            } catch (err) {
+              console.warn("[WASM] Invalid package manifest:", manifestPath, err);
+              continue;
+            }
+            for (const entry of normalizeWasmCommandEntries(manifest, packageName, packageRoot)) {
+              registry.set(entry.command, entry);
+            }
           }
-          for (const entry of normalizeWasmCommandEntries(manifest, packageName)) registry.set(entry.command, entry);
         }
         return registry;
       }
@@ -11623,6 +12360,9 @@ def data():
       async function ensureWasmEntryFiles(entry) {
         let nextEntry = entry;
         if (!pyodide.FS.analyzePath(nextEntry.launcherPath).exists || !pyodide.FS.analyzePath(nextEntry.wasmPath).exists) {
+          restorePersistedRuntimePackage(nextEntry.packageName);
+        }
+        if (!pyodide.FS.analyzePath(nextEntry.launcherPath).exists || !pyodide.FS.analyzePath(nextEntry.wasmPath).exists) {
           await restoreBundledWasmPackageAssets(nextEntry.packageName);
         }
         if (!pyodide.FS.analyzePath(nextEntry.launcherPath).exists) {
@@ -11653,6 +12393,7 @@ def data():
       }
 
       function clearWasmCommandLinks() {
+        if (WORKER_SHELL_ENABLED || !pyodide?.FS) return;
         for (const link of wasmCommandLinks) {
           try {
             if (pyodide.FS.analyzePath(link).exists) pyodide.FS.unlink(link);
@@ -11662,6 +12403,7 @@ def data():
       }
 
       function refreshWasmCommandLinks() {
+        if (WORKER_SHELL_ENABLED || !pyodide?.FS) return new Map();
         clearWasmCommandLinks();
         const registry = discoverWasmPackages();
         for (const [commandName, entry] of registry.entries()) {
@@ -11764,8 +12506,9 @@ return new Promise((resolve, reject) => {
               const extensionArgs = [];
               const extensions = { ...(moduleArg.extensions || {}) };
               try {
-                if (!extensions.intl && phpModule.FS?.analyzePath?.("/packages/php/intl.so")?.exists) {
-                  extensions.intl = "/packages/php/intl.so";
+                const installedIntl = `${entry.packageRoot}/intl.so`;
+                if (!extensions.intl && phpModule.FS?.analyzePath?.(installedIntl)?.exists) {
+                  extensions.intl = installedIntl;
                 }
               } catch {}
               for (const extensionPath of Object.values(extensions)) {
@@ -11877,16 +12620,23 @@ return (async () => {
         } catch {
           requestedRoots = [];
         }
+        const explicitRoots = Array.isArray(requestedRoots) && requestedRoots.length;
         const roots = new Set(
-          Array.isArray(requestedRoots) && requestedRoots.length
+          explicitRoots
             ? requestedRoots.map((root) => normalizePath(root)).filter(Boolean)
-            : ["/home", "/tmp", "/var", "/etc", "/packages"]
+            : ["/tmp", "/var", "/etc"]
         );
-        if (entry?.packageName === "php" || entry?.command === "php") roots.add("/packages/php");
+        if (entry?.packageName === "php" || entry?.command === "php") roots.add(entry.packageRoot);
         for (const extensionPath of Object.values(entry?.manifest?.extensions || {})) {
           if (extensionPath) roots.add(extensionPath);
         }
-        roots.add(cwd || "/");
+        const command = String(entry?.command || "");
+        const argv = Array.isArray(args) ? args.map((arg) => String(arg)) : [];
+        const inlineOnly = (
+          (command === "php" && argv.some((arg) => ["-r", "--version", "-v", "--help", "-h", "-i"].includes(arg)))
+          || (command === "lua" && argv.some((arg) => ["-e", "-v", "--version", "-h", "--help"].includes(arg)))
+        );
+        if (explicitRoots || !inlineOnly) roots.add(cwd || "/");
         for (const arg of args) {
           if (!isPotentialPathArg(arg, cwd || "/")) continue;
           roots.add(arg.startsWith("/") ? arg : `${cwd}/${arg}`);
@@ -11976,7 +12726,7 @@ return (async () => {
 
       async function runWasmCommandInWorker(entry, args, stdinText, cwd, env) {
         const workerUrl = new URL(assetUrl("wasm-cli-worker.js"));
-        workerUrl.searchParams.set("v", DEFAULT_ROOTFS_VERSION);
+        workerUrl.searchParams.set("v", EDGETERM_BOOT_BUNDLE_VERSION);
         const worker = new Worker(workerUrl);
         const syncRoots = collectWasmSyncRoots(cwd, args, entry, env);
         const fsEntries = [];
@@ -11991,6 +12741,7 @@ return (async () => {
         return await new Promise((resolve) => {
           let interactiveSession = false;
           let stdinReadActive = false;
+          let sawStreamOutput = false;
           let settled = false;
           const configuredTimeout = Number(env?.EDGETERM_WASM_TIMEOUT_MS || 0);
           const watchdogMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
@@ -11999,6 +12750,10 @@ return (async () => {
             ? 15000
             : 5000;
           const watchdog = setTimeout(() => {
+            if (entry.command === "php" && sawStreamOutput) {
+              finish({ found: true, code: 0, stdout: "", stderr: "" });
+              return;
+            }
             finish({
               found: true,
               code: 1,
@@ -12082,7 +12837,10 @@ return (async () => {
             }
             if (data.type === "stream") {
               const text = String(data.text || "");
-              if (text) term.echo(text, { newline: false });
+              if (text) {
+                sawStreamOutput = true;
+                term.echo(text, { newline: false });
+              }
               return;
             }
             if (data.type === "done") {
@@ -12122,7 +12880,7 @@ return (async () => {
             packageRoot: entry.packageRoot,
             thisProgram: entry.thisProgram,
             extensions: {
-              ...(entry.packageName === "php" || entry.command === "php" ? { intl: "/packages/php/intl.so" } : {}),
+              ...(entry.packageName === "php" || entry.command === "php" ? { intl: `${entry.packageRoot}/intl.so` } : {}),
               ...(entry.manifest?.extensions || {}),
             },
             fsEntries,
@@ -12189,7 +12947,7 @@ return (async () => {
             arguments: [...effectiveArgs],
             thisProgram: entry.thisProgram,
             extensions: {
-              ...(entry.packageName === "php" || entry.command === "php" ? { intl: "/packages/php/intl.so" } : {}),
+              ...(entry.packageName === "php" || entry.command === "php" ? { intl: `${entry.packageRoot}/intl.so` } : {}),
               ...(entry.manifest?.extensions || {}),
             },
             ENV: { ...env, PWD: cwd },
@@ -12357,7 +13115,7 @@ return (async () => {
           const threading = normalizeWineThreading(options.threading);
           if (threading === "single") return "SingleThreaded";
           if (threading === "multi" && canUseThreadedWine()) return "MultiThreaded";
-          return canUseThreadedWine() ? "MultiThreaded" : "SingleThreaded";
+          return "SingleThreaded";
         };
         const wineAssetUrl = async (relativePath, type = "application/octet-stream") => {
           const fsPath = `${releaseRoot}/${relativePath}`;
@@ -12480,6 +13238,9 @@ return (async () => {
           const shellUrl = await wineAssetUrl(`${build}/boxedwine-shell.js`, "text/javascript");
           const loaderUrl = await wineAssetUrl(`${build}/boxedwine.js`, "text/javascript");
           const cssUrl = await wineAssetUrl(`${build}/boxedwine.css`, "text/css");
+          const shellSource = (await (await fetch(shellUrl)).text()).replace(/<\/script/gi, "<\\/script");
+          const loaderSource = (await (await fetch(loaderUrl)).text()).replace(/<\/script/gi, "<\\/script");
+          const cssSource = (await (await fetch(cssUrl)).text()).replace(/<\/style/gi, "<\\/style");
           const wasmUrl = await wineAssetUrl(`${build}/boxedwine.wasm`, "application/wasm");
           const rootZipRelativePath = "Wine11/boxedwine.zip";
           const rootZipUrl = await wineAssetUrl(rootZipRelativePath, "application/zip");
@@ -12498,7 +13259,7 @@ return (async () => {
 <head>
   <meta charset="utf-8">
   <title>EdgeTerm Wine - ${escapeHtml(process.title)}</title>
-  <link rel="stylesheet" href="${cssUrl}">
+  <style>${cssSource}</style>
   <style>
     html, body, #dropzone, .emscripten_border { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050505; }
     #loading { position: fixed; inset: 0; display: grid; place-items: center; color: #dbeafe; background: #020617; z-index: 5; font: 14px system-ui, sans-serif; }
@@ -12524,7 +13285,7 @@ return (async () => {
   <textarea id="output"></textarea>
   <div id="openModal" class="modalDialog"><div><a href="#close" class="close">X</a><input id="selectedItem"><div id="tree"></div><h3 id="loadStatus"></h3></div></div>
   <div id="openModalExe" class="modalDialog"><div><a id="openModalExeClick" href="#close" class="close">X</a><div id="message"></div><div id="items"></div></div></div>
-  <script src="${shellUrl}"></script>
+  <script>${shellSource}</script>
   <script>
     window.addEventListener("error", function(event) {
       parent.postMessage({ type: "edgeterm-wine-log", stream: "stderr", text: String(event.message || "BoxedWine script error") }, "*");
@@ -12567,7 +13328,7 @@ return (async () => {
       if (!text) document.getElementById("loading").style.display = "none";
     };
   </script>
-  <script async src="${loaderUrl}" onerror="parent.postMessage({ type: 'edgeterm-wine-log', stream: 'stderr', text: 'failed to load boxedwine.js' }, '*')"></script>
+  <script>${loaderSource}</script>
 </body>
 </html>`;
           renderDisplayMessage({ type: "html", content: `<iframe class="wine-runtime-frame" sandbox="allow-scripts allow-same-origin allow-pointer-lock allow-downloads allow-forms" srcdoc="${escapeHtml(html)}"></iframe>` });
@@ -12789,11 +13550,35 @@ return (async () => {
         const nextName = await askText("Rename Item", "New name", currentName, { confirmLabel: "Rename" });
         if (!nextName) return;
         const target = `${path.split("/").slice(0, -1).join("/")}/${nextName}`;
-        pyodide.FS.rename(path, target);
+        if (WORKER_SHELL_ENABLED) await workerFs("rename", { path, target });
+        else pyodide.FS.rename(path, target);
+        remapEditorWorkspacePath(path, target);
+        await bridgeNotifyExternalShellWorkspaceChanged();
         await persistActiveWorkspace();
         refreshWasmCommandLinks();
-        refreshFiles();
+        if (WORKER_SHELL_ENABLED) await refreshWorkerFiles(currentPath);
+        else refreshFiles();
         showNotice(`Renamed to ${nextName}`);
+      }
+
+      async function moveTerminalOutsideRemovedPaths(paths) {
+        const normalizedPaths = paths.map((path) => normalizePath(path));
+        const current = normalizePath(terminalCurrentPath || `/home/${activeUser()}`);
+        if (!normalizedPaths.some((path) => editorPathInside(current, path))) return current;
+        let fallback = current;
+        while (normalizedPaths.some((path) => editorPathInside(fallback, path))) {
+          const parent = fallback.split("/").slice(0, -1).join("/") || "/";
+          if (parent === fallback) break;
+          fallback = parent;
+        }
+        if (WORKER_SHELL_ENABLED) {
+          const result = await workerFs("chdir", { path: fallback });
+          setWorkerPrompt(result.cwd || fallback);
+        } else {
+          await synchronizeShellWorkingDirectory(fallback);
+          await updatePrompt();
+        }
+        return fallback;
       }
 
       async function deleteSelectedPaths(paths) {
@@ -12801,6 +13586,39 @@ return (async () => {
         await ensureWorkspaceMountedForRuntimePath(paths[0], "Loading workspace files for delete...");
         const label = paths.length === 1 ? paths[0] : `${paths.length} items`;
         if (!(await askConfirm("Delete Files", `Delete ${label}?`, { confirmLabel: "Delete", danger: true }))) return;
+        if (WORKER_SHELL_ENABLED) {
+          await moveTerminalOutsideRemovedPaths(paths);
+          showProgressNotice({ label: "Deleting files...", current: 0, total: paths.length, detail: `0 of ${paths.length} removed` });
+          const removedPaths = [];
+          try {
+            for (let index = 0; index < paths.length; index += 1) {
+              await workerFs("removeTree", { path: paths[index] });
+              removedPaths.push(paths[index]);
+              showProgressNotice({
+                label: "Deleting files...",
+                current: index + 1,
+                total: paths.length,
+                detail: `${index + 1} of ${paths.length} removed`,
+              });
+            }
+          } catch (error) {
+            removeEditorWorkspacePaths(removedPaths);
+            clearSelection();
+            await refreshWorkerFiles(currentPath);
+            console.warn("[FILES] delete failed", error);
+            showNotice(`Delete failed: ${error?.message || error}`);
+            return;
+          } finally {
+            hideProgressNotice();
+          }
+          await bridgeNotifyExternalShellWorkspaceChanged();
+          removeEditorWorkspacePaths(paths);
+          clearSelection();
+          await refreshWorkerFiles(currentPath);
+          showNotice(paths.length === 1 ? `Deleted ${label}` : `Deleted ${paths.length} items`);
+          return;
+        }
+        await moveTerminalOutsideRemovedPaths(paths);
         const progressState = {
           total: Math.max(1, paths.reduce((sum, path) => sum + countTreeEntries(path), 0)),
           deleted: 0,
@@ -12813,6 +13631,7 @@ return (async () => {
           detail: `0 of ${progressState.total} removed`,
         });
         for (const path of paths) await deleteTreeWithProgress(path, progressState);
+        removeEditorWorkspacePaths(paths);
         await persistActiveWorkspace();
         refreshWasmCommandLinks();
         clearSelection();
@@ -12954,19 +13773,29 @@ else:
       async function pasteClipboardItems() {
         if (!clipboard?.paths?.length) return;
         await ensureWorkspaceMountedForRuntimePath(currentPath, "Loading workspace files for paste...");
+        const movedPaths = [];
         for (const source of clipboard.paths) {
           const name = source.split("/").filter(Boolean).pop();
           const target = `${currentPath === "/" ? "" : currentPath}/${name}`;
-          if (clipboard.mode === "cut") pyodide.FS.rename(source, target);
+          if (WORKER_SHELL_ENABLED) {
+            if (clipboard.mode === "cut") {
+              await workerFs("rename", { path: source, target });
+              movedPaths.push([source, target]);
+            }
+            else await workerFs("copyTree", { source, target });
+          } else if (clipboard.mode === "cut") pyodide.FS.rename(source, target);
           else {
             removeTree(target);
             copyTree(source, target);
           }
         }
+        for (const [source, target] of movedPaths) remapEditorWorkspacePath(source, target);
+        await bridgeNotifyExternalShellWorkspaceChanged();
         if (clipboard.mode === "cut") clipboard = null;
         await persistActiveWorkspace();
         refreshWasmCommandLinks();
-        refreshFiles();
+        if (WORKER_SHELL_ENABLED) await refreshWorkerFiles(currentPath);
+        else refreshFiles();
         showNotice("Paste completed");
       }
 
@@ -12977,8 +13806,13 @@ else:
 
         if (action === "open") {
           if (paths.length > 1) return showNotice("Open works on one item at a time");
-          const stat = pyodide.FS.stat(paths[0]);
-          if (pyodide.FS.isDir(stat.mode)) refreshFiles(paths[0]);
+          const isDirectory = WORKER_SHELL_ENABLED
+            ? await workerFsIsDir(paths[0])
+            : pyodide.FS.isDir(pyodide.FS.stat(paths[0]).mode);
+          if (isDirectory) {
+            if (WORKER_SHELL_ENABLED) await refreshWorkerFiles(paths[0]);
+            else refreshFiles(paths[0]);
+          }
           else if (isPreviewablePath(paths[0])) await openPreview(paths[0]);
           else await openEditor(paths[0]);
           return;
@@ -12991,7 +13825,9 @@ else:
           if (paths.length > 1) return showNotice("Unzip works on one archive at a time");
           return extractArchivePath(paths[0]);
         }
-        if (action === "download") return downloadSelectedPaths(paths);
+        if (action === "download") {
+          return WORKER_SHELL_ENABLED ? downloadWorkerSelectedPaths(paths) : downloadSelectedPaths(paths);
+        }
         if (action === "copy") {
           clipboard = { mode: "copy", paths: [...paths] };
           return showNotice(`Copied ${paths.length === 1 ? "item" : `${paths.length} items`}`);
@@ -13019,7 +13855,14 @@ else:
         await writeRuntimeFileAndMirror(path, content);
         refreshFilesIfVisible(currentPath);
         monaco.editor.setModelLanguage(editor.getModel(), editorLanguageForPath(path));
+        const tab = editorOpenTabs.get(path);
+        if (tab) {
+          tab.savedValue = content;
+          tab.dirty = false;
+          renderEditorTabs();
+        }
         setEditorStatus(`Saved ${path}`);
+        appendEditorOutput(`Saved ${path}`);
         showNotice(`Saved ${path}`);
       }
 
@@ -13053,7 +13896,13 @@ else:
         await setupMonaco();
         const instance = editorInstanceForTarget(targetName);
         if (!instance) return;
-        const loaded = loadEditorFile(path);
+        const normalizedPath = normalizePath(path);
+        if (targetName === "main" && editorOpenTabs.has(normalizedPath)) {
+          activateEditorTab(normalizedPath);
+          if (options.switchView !== false) setView("editorView");
+          return normalizedPath;
+        }
+        const loaded = loadEditorFile(normalizedPath);
         if (loaded.created) {
           if (syncRuntimePathToWorkspace(loaded.path)) {
             const target = workspaceMirrorPathForRuntimePath(loaded.path);
@@ -13066,7 +13915,13 @@ else:
         }
         editorPathFieldForTarget(targetName).value = loaded.path;
         if (targetName === "split") splitEditorPath = loaded.path;
-        replaceEditorModel(targetName, createEditorModel(loaded.path, loaded.content));
+        const model = createEditorModel(loaded.path, loaded.content);
+        if (targetName === "main") {
+          editorOpenTabs.set(loaded.path, { model, savedValue: loaded.content, dirty: false });
+          activateEditorTab(loaded.path, { focus: false });
+        } else {
+          replaceEditorModel(targetName, model);
+        }
         if (targetName === "main") {
           setEditorStatus(`Opened ${loaded.path}`);
         } else {
@@ -13075,6 +13930,10 @@ else:
         if (options.switchView !== false) setView("editorView");
         instance.focus();
         instance.layout();
+        if (targetName === "main") {
+          editorWorkspaceRootPath = normalizePath($id("editorWorkspaceRoot")?.value || `/home/${activeUser()}`);
+          void refreshEditorExplorer();
+        }
         if (!options.quiet) showNotice(`Opened ${loaded.path}`);
         return loaded.path;
       }
@@ -13096,7 +13955,6 @@ else:
             const identity = stableEdgeServeIdentity(normalizedMode, spec, cwd);
             const instanceJson = await this.createInstance(normalizedMode, spec, cwd, identity);
             const instance = JSON.parse(instanceJson);
-            this.instances.set(instance.id, instance);
             const serveConfig = {
               enabled: true,
               runtime: "python",
@@ -13119,6 +13977,7 @@ else:
                 allowDebugTerminal: true,
               },
             };
+            registerEdgeServeInstance(instance, serveConfig);
             appModeState.config = normalizeAppModeConfig(serveConfig);
             appModeState.renderTarget = "display";
             createOrActivateDisplayBrowserTab(instance, `${instance.routePrefix}/`);
@@ -13152,9 +14011,11 @@ else:
                 label: target,
               });
             }
+            if (normalizeEdgeServeRouteMode(mode) === "asgi") await pyodide.loadPackage("ssl");
             pyodide.globals.set("__edgeterm_edgeserve_json", JSON.stringify({ mode, target, cwd, ...identity }));
             return await pyodide.runPythonAsync(`
 import json
+import importlib
 import os
 import sys
 
@@ -13167,6 +14028,48 @@ if os.path.isdir("/usr/lib") and "/usr/lib" not in sys.path:
 
 import edgeterm_wsgi
 
+requested_mode = str(payload.get("mode") or "").lower()
+if requested_mode in {"asgi", "fastapi", "starlette"}:
+    import glob
+    import shutil
+
+    user_site = "/home/user/.local/lib/python3.12/site-packages"
+    for name in ("ssl.py", "_ssl.so"):
+        path = os.path.join(user_site, name)
+        if os.path.isfile(path):
+            os.remove(path)
+    for path in glob.glob(os.path.join(user_site, "ssl-*.dist-info")):
+        shutil.rmtree(path, ignore_errors=True)
+    sys.modules.pop("ssl", None)
+    sys.modules.pop("_ssl", None)
+    importlib.invalidate_caches()
+    removed_user_site = False
+    if user_site in sys.path:
+        sys.path.remove(user_site)
+        removed_user_site = True
+    try:
+        import ssl
+    finally:
+        if removed_user_site and user_site not in sys.path:
+            sys.path.insert(0, user_site)
+app_spec = str(payload.get("target") or "")
+app_module = app_spec.split(":", 1)[0].strip()
+if app_module.endswith(".py"):
+    app_module = app_module[:-3].replace("/", ".").replace("\\\\", ".")
+app_root = app_module.split(".", 1)[0] if app_module else ""
+working_directory = os.path.abspath(payload.get("cwd") or os.getcwd())
+for module_name, module in list(sys.modules.items()):
+    module_file = str(getattr(module, "__file__", "") or "")
+    project_local = False
+    if module_file:
+        try:
+            project_local = os.path.commonpath([working_directory, os.path.abspath(module_file)]) == working_directory
+        except (OSError, ValueError):
+            project_local = False
+    target_module = bool(app_root) and (module_name == app_root or module_name.startswith(app_root + "."))
+    if project_local or target_module:
+        sys.modules.pop(module_name, None)
+importlib.invalidate_caches()
 info = edgeterm_wsgi.create_instance(
     payload.get("mode") or "flask",
     payload.get("target") or "",
@@ -13222,17 +14125,125 @@ json.dumps(info)
         showNotice(`Main editor switched to ${path}`);
       }
 
+      async function runRoutedCommandSequence(line, initialCwd, execute) {
+        const sequence = splitTopLevelCommandSequence(line);
+        if (!sequence || sequence.length < 2) return null;
+        let currentCwd = String(initialCwd || `/home/${activeUser()}`);
+        let previousExitCode = 0;
+        let lastResult = {
+          exitCode: 0,
+          cwd: currentCwd,
+        };
+        for (const entry of sequence) {
+          if (entry.operator === "&&" && previousExitCode !== 0) continue;
+          if (entry.operator === "||" && previousExitCode === 0) continue;
+          lastResult = await execute(
+            expandShellLastStatus(entry.source, previousExitCode),
+            currentCwd,
+          );
+          previousExitCode = Number(lastResult?.exitCode || 0);
+          currentCwd = String(lastResult?.cwd || currentCwd);
+        }
+        return {
+          ...lastResult,
+          cwd: currentCwd,
+          exitCode: previousExitCode,
+        };
+      }
+
+      function commandSequenceNeedsHostRouting(line) {
+        const sequence = splitTopLevelCommandSequence(line);
+        return Boolean(sequence?.length > 1 && sequence.some(({ source }) => (
+          bridgeStandardServerCommand(source)
+          || isNodeCommand(source)
+          || !isExternalShellCommand(source)
+        )));
+      }
+
+      async function runStandardServerCommand(line, commandCwd) {
+        const standardServer = bridgeStandardServerCommand(line);
+        if (!standardServer) return null;
+        const app = await bridgeStartApp({
+          ...standardServer,
+          root: commandCwd,
+          label: `${standardServer.framework} app`,
+        });
+        term?.echo?.(`EdgeTerm virtual listener ready at http://127.0.0.1:${app.virtual_port}${app.route_prefix || "/"}`);
+        setWorkerPrompt(commandCwd);
+        return { exitCode: 0, cwd: commandCwd, app };
+      }
+
       async function runCommand(command, options = {}) {
         const line = command ?? "";
         let mayMutateBeforeRun = false;
         try {
-          if (!line.trim()) return;
+          if (!line.trim()) return { exitCode: 0, cwd: await getShellPromptPath() };
+          const commandCwd = normalizePath(options.cwd || await getShellPromptPath());
+          const standardServerResult = await runStandardServerCommand(line, commandCwd);
+          if (standardServerResult) return standardServerResult;
+          if (!options.sequencePart) {
+            if (commandSequenceNeedsHostRouting(line)) {
+              const routedResult = await runRoutedCommandSequence(
+                line,
+                commandCwd,
+                async (entry, cwd) => await runCommand(entry, {
+                  ...options,
+                  cwd,
+                  sequencePart: true,
+                }),
+              );
+              if (routedResult) return routedResult;
+            }
+            const wholeExternalResult = await runExternalShellCommand(line, commandCwd);
+            if (wholeExternalResult) {
+              if (wholeExternalResult.interactive) {
+                await synchronizeShellWorkingDirectory(wholeExternalResult.cwd);
+                setWorkerPrompt(wholeExternalResult.cwd);
+              } else {
+                await synchronizeShellWorkingDirectory(wholeExternalResult.cwd);
+                await updatePrompt();
+              }
+              return wholeExternalResult;
+            }
+            const sequenceResult = await runRoutedCommandSequence(
+              line,
+              commandCwd,
+              async (entry, cwd) => await runCommand(entry, {
+                ...options,
+                cwd,
+                sequencePart: true,
+              }),
+            );
+            if (sequenceResult) return sequenceResult;
+          }
+          const externalResult = await runExternalShellCommand(line, commandCwd);
+          if (externalResult) {
+            if (externalResult.interactive) {
+              await synchronizeShellWorkingDirectory(externalResult.cwd);
+              setWorkerPrompt(externalResult.cwd);
+            }
+            else {
+              await synchronizeShellWorkingDirectory(externalResult.cwd);
+              await updatePrompt();
+            }
+            return externalResult;
+          }
           if (line.trim() === "exit") {
             term.echo("Goodbye.");
-            return;
+            return { exitCode: 0, cwd: await getShellPromptPath() };
+          }
+          if (isNodeCommand(line)) {
+            await ensureActiveWorkspaceMounted("Loading workspace files for Node command...");
+            const cwd = await getShellPromptPath();
+            const result = await getNodeRuntime().runCommand(line, cwd);
+            await updatePrompt();
+            return result;
           }
           if (commandNeedsWorkspaceLoad(line)) {
             await ensureActiveWorkspaceMounted("Loading workspace files for command...");
+          }
+          if (commandNeedsSqliteRuntime(line)) {
+            await pyodide.loadPackage("sqlite3");
           }
           mayMutateBeforeRun = commandMayMutateWorkspace(line);
 
@@ -13255,14 +14266,20 @@ except Exception as exc:
         } catch (err) {
           term.error("[ERROR] " + formatError(err));
           await updatePrompt();
-          return;
+          return { exitCode: 1, cwd: await getShellPromptPath(), error: formatError(err) };
         }
 
         try {
           const mayMutateWorkspace = mayMutateBeforeRun;
-          if (commandMayChangePackages(line)) persistPackageMetadataCache();
+          if (commandMayChangePackages(line)) {
+            persistPackageMetadataCache();
+            persistRuntimePackagesToWorkspace();
+          }
           if (mayMutateWorkspace && options.postRunSync !== false) {
             await persistActiveWorkspace();
+          }
+          if (mayMutateWorkspace) {
+            await externalShellRuntime?.notifyWorkspaceChanged?.();
           }
           if (mayMutateWorkspace) refreshFilesIfVisible(currentPath);
         } catch (err) {
@@ -13270,6 +14287,10 @@ except Exception as exc:
         }
 
         await updatePrompt();
+        return {
+          exitCode: bridgeShellExitCode(),
+          cwd: await getShellPromptPath(),
+        };
       }
 
       function commandNeedsWorkspaceLoad(line) {
@@ -13283,7 +14304,12 @@ except Exception as exc:
 
       function commandMayChangePackages(line) {
         const source = String(line || "").trim();
-        return /^(pkg|edgepkg)\s+(install|remove|purge|upgrade|autoremove|clean)\b/i.test(source);
+        return /(?:^|[;&|]\s*)(pkg|edgepkg)\s+(install|remove|purge|upgrade|autoremove|clean)\b/i.test(source);
+      }
+
+      function commandNeedsSqliteRuntime(line) {
+        const source = String(line || "");
+        return /\b(django-admin|manage\.py)\b/i.test(source) || /\bedgeserve\s+django\b/i.test(source) || /\b(import\s+sqlite3|from\s+sqlite3\s+import)\b/i.test(source);
       }
 
       function commandNeedsImmediateWorkspacePersist(line) {
@@ -13399,6 +14425,9 @@ except Exception as exc:
       }
 
       async function getShellPromptPath() {
+        if (WORKER_SHELL_ENABLED) {
+          return normalizePath(terminalCurrentPath || `/home/${activeUser()}`);
+        }
         try {
           return pyodide.runPython(`
 import builtins, os, re
@@ -13414,12 +14443,16 @@ match.group(1) if match else path
 
       async function updatePrompt() {
         const cwd = await getShellPromptPath();
-        term.set_prompt(`${cwd} $ `);
+        term?.set_prompt?.(`${cwd} $ `);
+        primaryTerm?.set_prompt?.(`${cwd} $ `);
+        editorTerm?.set_prompt?.(`${cwd} $ `);
       }
 
       function setWorkerPrompt(cwd = `/home/${activeUser()}`) {
-        currentPath = normalizePath(cwd || `/home/${activeUser()}`);
-        term.set_prompt(`${currentPath} $ `);
+        terminalCurrentPath = normalizePath(cwd || `/home/${activeUser()}`);
+        term?.set_prompt?.(`${terminalCurrentPath} $ `);
+        primaryTerm?.set_prompt?.(`${terminalCurrentPath} $ `);
+        editorTerm?.set_prompt?.(`${terminalCurrentPath} $ `);
       }
 
       function createWorkerShellRequest() {
@@ -13433,7 +14466,31 @@ match.group(1) if match else path
         const request = workerShellRequests.get(message.id);
         if (!request) return;
         workerShellRequests.delete(message.id);
-        if (message.type === "error" || message.type === "fsError") request.reject(new Error(message.error || "Worker shell failed"));
+        if (message.type === "error" || message.type === "fsError") {
+          const rawError = message.error;
+          let errorMessage = "Worker shell failed";
+          if (typeof rawError === "string" && rawError.trim()) {
+            errorMessage = rawError;
+          } else if (rawError && typeof rawError === "object") {
+            const nestedMessage =
+              typeof rawError.message === "string"
+                ? rawError.message
+                : typeof rawError.stack === "string"
+                  ? rawError.stack
+                  : "";
+            if (nestedMessage.trim()) {
+              errorMessage = nestedMessage;
+            } else {
+              try {
+                const serialized = JSON.stringify(rawError);
+                if (serialized && serialized !== "{}") errorMessage = serialized;
+              } catch {}
+            }
+          } else if (rawError !== null && rawError !== undefined) {
+            errorMessage = String(rawError);
+          }
+          request.reject(new Error(errorMessage));
+        }
         else request.resolve(message);
       }
 
@@ -13720,7 +14777,9 @@ match.group(1) if match else path
           return;
         }
         if (message.type === "inputRequest") {
+          setTerminalInputReady(true);
           term.read(message.prompt || "", (value) => {
+            setTerminalInputReady(false);
             workerShell?.postMessage({ type: "inputResponse", id: message.id, value: value ?? "" });
           });
           term.resume();
@@ -13736,8 +14795,8 @@ match.group(1) if match else path
           return;
         }
         if (message.type === "ready") {
-          workerShellReady = true;
           setWorkerPrompt(message.cwd);
+          setRuntimeStatus("Preparing command environment...", "loading");
           completeWorkerShellRequest({ ...message, id: 0 });
           return;
         }
@@ -13750,19 +14809,37 @@ match.group(1) if match else path
         markRuntimePhase("worker-shell-boot");
         window.term = term;
         workerShellReady = false;
-        workerShell = new Worker(`${assetUrl("pyodide-shell-worker.js")}?v=${EDGETERM_BOOT_BUNDLE_VERSION}`);
+        externalShellFallbackActive = false;
+        const workerAssetBase = new URL("./", location.href).toString();
+        const workerUrl = new URL("pyodide-shell-worker.js", workerAssetBase);
+        workerUrl.searchParams.set("v", EDGETERM_BOOT_BUNDLE_VERSION);
+        workerShell = new Worker(workerUrl);
         const readyPromise = new Promise((resolve, reject) => {
           workerShellRequests.set(0, { resolve, reject });
         });
         workerShell.onmessage = (event) => handleWorkerShellMessage(event.data || {});
         workerShell.onerror = (event) => {
-          const error = new Error(event.message || "Worker shell failed");
+          const details = [
+            String(event.message || "Worker shell failed"),
+            event.filename
+              ? `${String(event.filename)}:${Number(event.lineno || 0)}:${Number(event.colno || 0)}`
+              : "",
+          ].filter(Boolean).join(" at ");
+          const error = new Error(details);
+          window.__edgeTermRuntimeDiagnostics = {
+            ...(window.__edgeTermRuntimeDiagnostics || {}),
+            workerShellBootError: {
+              message: details,
+              stack: String(event.error?.stack || ""),
+              observedAt: new Date().toISOString(),
+            },
+          };
           for (const request of workerShellRequests.values()) request.reject(error);
           workerShellRequests.clear();
         };
         workerShell.postMessage({
           type: "boot",
-          assetBase: ASSET_BASE || "/static/",
+          assetBase: workerAssetBase,
           version: EDGETERM_BOOT_BUNDLE_VERSION,
           user: activeUser(),
           workspaceId: activeWorkspaceId,
@@ -13770,20 +14847,191 @@ match.group(1) if match else path
           users: activeWorkspace()?.users || ["user"],
         });
         await readyPromise;
+        showBootStatus("Preparing POSIX command environment...");
+        try {
+          await warmExternalShellForBoot(
+            currentPath || `/home/${activeUser()}`,
+            `/home/${activeUser()}`,
+            { omitInstalledPayload: true },
+          );
+        } catch (error) {
+          externalShellFallbackActive = true;
+          window.__edgeTermRuntimeDiagnostics = {
+            ...(window.__edgeTermRuntimeDiagnostics || {}),
+            externalShellBootError: {
+              code: String(error?.code || "external_shell_prepare_failed"),
+              message: String(error?.message || "The external shell did not start."),
+              stack: String(error?.stack || ""),
+              runtimeStatus: externalShellRuntime?.status?.() || null,
+              observedAt: new Date().toISOString(),
+            },
+          };
+          console.info(
+            "[EXTERNAL SHELL] Python fallback is active:",
+            error.code || "external_shell_prepare_failed",
+            error.message || "The external shell did not start.",
+          );
+          showBootStatus("POSIX command runtime unavailable. Python tools remain available.", true);
+        }
+        workerShellReady = true;
+        setTerminalInputReady(true);
+        term?.resume?.();
+        editorTerm?.resume?.();
         console.info(`[BOOT] worker shell ready +${Math.round(performance.now() - bootStartedAt)}ms`);
       }
 
-      async function runWorkerCommand(command) {
+      async function warmExternalShellForBoot(cwd, workspaceRoot, options) {
+        const runtime = getExternalShellRuntime();
+        try {
+          return await runtime.warmup(cwd, workspaceRoot, options);
+        } catch (error) {
+          const retryableCodes = new Set([
+            "external_shell_worker_crashed",
+            "external_shell_worker_bootstrap_failed",
+            "external_shell_worker_uncaught_error",
+            "external_shell_worker_unhandled_rejection",
+          ]);
+          if (!retryableCodes.has(String(error?.code || ""))) throw error;
+          console.info("[EXTERNAL SHELL] Retrying a recoverable cold-start failure.");
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          return await runtime.warmup(cwd, workspaceRoot, options);
+        }
+      }
+
+      async function interruptWorkerShellCommand() {
+        if (!workerShellCommandRunning || !workerShell) return false;
+        if (workerShellRestartPromise) return await workerShellRestartPromise;
+        workerShellRestartPromise = (async () => {
+          const cancellationError = Object.assign(new Error("Command interrupted"), {
+            code: "worker_command_interrupted",
+          });
+          for (const request of workerShellRequests.values()) request.reject(cancellationError);
+          workerShellRequests.clear();
+          workerShell.terminate();
+          workerShell = null;
+          workerShellReady = false;
+          workerShellCommandRunning = false;
+          showBootStatus("Restarting EdgeTerm runtime...");
+          await bootWorkerShell(performance.now());
+          term?.resume?.();
+          term?.set_command?.("");
+          term?.focus?.();
+          return true;
+        })().finally(() => {
+          workerShellRestartPromise = null;
+        });
+        return await workerShellRestartPromise;
+      }
+
+      async function interruptActiveTerminalCommand() {
+        const externalStatus = externalShellRuntime?.status?.();
+        const nodeStatus = nodeRuntime?.status?.();
+        if (nodeStatus?.running || nodeStatus?.watching) {
+          nodeRuntime.cancel();
+          return true;
+        }
+        if (
+          externalStatus?.interactive
+          || externalStatus?.interactiveDormant
+          || externalStatus?.foreground
+        ) {
+          await externalShellRuntime.interrupt();
+          return true;
+        }
+        if (externalStatus?.running) {
+          externalShellRuntime.cancel();
+          return true;
+        }
+        if (nodeStatus?.preview) {
+          nodeRuntime.cancel();
+          return true;
+        }
+        return await interruptWorkerShellCommand();
+      }
+
+      async function runWorkerCommand(command, options = {}) {
         const line = command ?? "";
-        if (!line.trim()) return;
+        const commandCwd = normalizePath(options.cwd || terminalCurrentPath || `/home/${activeUser()}`);
+        if (!line.trim()) return { exitCode: 0, cwd: commandCwd };
+        const standardServerResult = await runStandardServerCommand(line, commandCwd);
+        if (standardServerResult) return standardServerResult;
+        if (!options.sequencePart) {
+          if (commandSequenceNeedsHostRouting(line)) {
+            const routedResult = await runRoutedCommandSequence(
+              line,
+              commandCwd,
+              async (entry, cwd) => await runWorkerCommand(entry, {
+                ...options,
+                cwd,
+                sequencePart: true,
+              }),
+            );
+            if (routedResult) return routedResult;
+          }
+          const wholeExternalResult = await runExternalShellCommand(line, commandCwd);
+          if (wholeExternalResult) {
+            if (wholeExternalResult.interactive) setWorkerPrompt(wholeExternalResult.cwd);
+            else await synchronizeShellWorkingDirectory(wholeExternalResult.cwd);
+            return wholeExternalResult;
+          }
+          const sequenceResult = await runRoutedCommandSequence(
+            line,
+            commandCwd,
+            async (entry, cwd) => await runWorkerCommand(entry, {
+              ...options,
+              cwd,
+              sequencePart: true,
+            }),
+          );
+          if (sequenceResult) return sequenceResult;
+        }
+        const externalResult = await runExternalShellCommand(
+          line,
+          commandCwd,
+        );
+        if (externalResult) {
+          if (externalResult.interactive) setWorkerPrompt(externalResult.cwd);
+          else await synchronizeShellWorkingDirectory(externalResult.cwd);
+          return externalResult;
+        }
         if (line.trim() === "exit") {
           term.echo("Goodbye.");
-          return;
+          return { exitCode: 0, cwd: commandCwd };
+        }
+        if (isNodeCommand(line)) {
+          await ensureActiveWorkspaceMounted("Loading workspace files for Node command...");
+          const cwd = commandCwd;
+          const result = await getNodeRuntime().runCommand(line, cwd);
+          setWorkerPrompt(result.cwd || cwd);
+          return result;
         }
         const { id, promise } = createWorkerShellRequest();
-        workerShell.postMessage({ type: "run", id, line });
-        const result = await promise;
+        workerShell.postMessage({
+          type: "run",
+          id,
+          line,
+          cwd: commandCwd,
+          env: options.env && typeof options.env === "object" ? options.env : {},
+        });
+        workerShellCommandRunning = true;
+        $id("stopTerminalCommand")?.classList.remove("hidden");
+        let result;
+        try {
+          result = await promise;
+        } catch (error) {
+          if (error?.code === "worker_command_interrupted") {
+            return { exitCode: 130, cwd: commandCwd, interrupted: true };
+          }
+          throw error;
+        } finally {
+          workerShellCommandRunning = false;
+          $id("stopTerminalCommand")?.classList.add("hidden");
+        }
         setWorkerPrompt(result.cwd);
+        return {
+          exitCode: Number(result.exitCode || 0),
+          cwd: result.cwd,
+        };
       }
 
       async function workerFs(op, payload = {}) {
@@ -13820,6 +15068,864 @@ match.group(1) if match else path
         return !!info.exists && !!info.isDir;
       }
 
+      function nodeRuntimeFsError(code, message) {
+        const error = new Error(message);
+        error.code = code;
+        return error;
+      }
+
+      function nodeRuntimeOutput(stream, value) {
+        const text = String(value || "");
+        if (!text) return;
+        if (stream === "stderr") term?.error?.(text, { newline: false });
+        else term?.echo?.(text, { newline: false });
+      }
+
+      function mainNodeRuntimeReadTree(root, options = {}) {
+        const normalizedRoot = normalizePath(root);
+        if (!pyodide?.FS?.analyzePath(normalizedRoot).exists) {
+          throw nodeRuntimeFsError("fs_not_found", `Directory not found: ${normalizedRoot}`);
+        }
+        const includeNodeModules = options.includeNodeModules !== false;
+        const excluded = new Set(
+          (Array.isArray(options.exclude) ? options.exclude : [])
+            .map((value) => String(value || "").trim())
+            .filter(Boolean),
+        );
+        if (!includeNodeModules) excluded.add("node_modules");
+        const maxFiles = Math.max(1, Math.min(Number(options.maxFiles || 30_000), 50_000));
+        const maxBytes = Math.max(
+          1,
+          Math.min(Number(options.maxBytes || 157_286_400), 268_435_456),
+        );
+        const files = [];
+        let totalBytes = 0;
+        const stack = [normalizedRoot];
+        while (stack.length) {
+          const directory = stack.pop();
+          for (const name of pyodide.FS.readdir(directory).filter(
+            (entry) => entry !== "." && entry !== "..",
+          )) {
+            if (excluded.has(name)) continue;
+            const target = normalizePath(`${directory}/${name}`);
+            const stat = pyodide.FS.stat(target);
+            if (pyodide.FS.isDir(stat.mode)) {
+              if (options.includeDirectories) {
+                files.push({
+                  path: target.slice(normalizedRoot.length).replace(/^\/+/, ""),
+                  dir: true,
+                  mtime: Number(stat.mtime?.getTime?.() || 0),
+                });
+              }
+              stack.push(target);
+              continue;
+            }
+            const bytes = pyodide.FS.readFile(target);
+            totalBytes += bytes.byteLength;
+            if (files.length >= maxFiles || totalBytes > maxBytes) {
+              throw nodeRuntimeFsError(
+                "node_project_limit_exceeded",
+                "The project exceeds the Node runtime file or size limit.",
+              );
+            }
+            files.push({
+              path: target.slice(normalizedRoot.length).replace(/^\/+/, ""),
+              encoding: "base64",
+              data: bytesToBase64(bytes),
+              size: bytes.byteLength,
+              mtime: Number(stat.mtime?.getTime?.() || 0),
+            });
+          }
+        }
+        files.sort((left, right) => left.path.localeCompare(right.path));
+        return files;
+      }
+
+      async function mainNodeRuntimeWriteFiles(entries) {
+        const mirrorTargets = [];
+        const mirrorBytes = new Map();
+        let needsFallbackPersist = false;
+        for (const entry of Array.isArray(entries) ? entries : []) {
+          const path = assertBridgeWorkspacePath(entry.path);
+          ensureDir(path.split("/").slice(0, -1).join("/") || "/");
+          const data =
+            entry.encoding === "base64"
+              ? base64ToBytes(entry.data)
+              : String(entry.data ?? entry.text ?? "");
+          const bytes = encodeFileContent(data);
+          pyodide.FS.writeFile(path, bytes);
+          const mirrorTarget = workspaceMirrorPathForRuntimePath(path);
+          if (mirrorTarget) {
+            ensureDir(mirrorTarget.split("/").slice(0, -1).join("/") || "/");
+            pyodide.FS.writeFile(mirrorTarget, bytes);
+            mirrorTargets.push(mirrorTarget);
+            mirrorBytes.set(mirrorTarget, bytes);
+          } else {
+            needsFallbackPersist = true;
+          }
+        }
+        if (mirrorTargets.length) {
+          await persistWorkspaceMirrorTargets(mirrorTargets, activeWorkspaceId, mirrorBytes);
+        }
+        if (needsFallbackPersist) schedulePersistActiveWorkspace(750);
+        if (entries.length) markWorkspaceMutation();
+        refreshFilesIfVisible(currentPath);
+        return { files: entries.length };
+      }
+
+      function mainNodeRuntimeFingerprint(root, options = {}) {
+        const normalizedRoot = normalizePath(root);
+        const excluded = new Set(
+          (Array.isArray(options.exclude) ? options.exclude : [])
+            .map((value) => String(value || "").trim())
+            .filter(Boolean),
+        );
+        let hash = 2_166_136_261;
+        let files = 0;
+        let bytes = 0;
+        const mix = (value) => {
+          for (const character of String(value || "")) {
+            hash ^= character.charCodeAt(0);
+            hash = Math.imul(hash, 16_777_619) >>> 0;
+          }
+        };
+        const stack = [normalizedRoot];
+        while (stack.length) {
+          const directory = stack.pop();
+          if (!pyodide.FS.analyzePath(directory).exists) continue;
+          const names = pyodide.FS.readdir(directory)
+            .filter((name) => name !== "." && name !== "..")
+            .sort();
+          for (const name of names) {
+            if (excluded.has(name)) continue;
+            const target = normalizePath(`${directory}/${name}`);
+            const stat = pyodide.FS.stat(target);
+            if (pyodide.FS.isDir(stat.mode)) stack.push(target);
+            else {
+              files += 1;
+              bytes += Number(stat.size || 0);
+              mix(`${target}:${stat.size || 0}:${stat.mtime?.getTime?.() || 0}`);
+            }
+          }
+        }
+        return `${files}:${bytes}:${hash.toString(16)}`;
+      }
+
+      function createNodeRuntimeFsAdapter() {
+        return {
+          async readText(path) {
+            const target = assertBridgeWorkspacePath(path);
+            if (WORKER_SHELL_ENABLED) {
+              const result = await workerFs("readFile", { path: target });
+              if (!result.exists || result.isDir) {
+                throw nodeRuntimeFsError("fs_not_found", `File not found: ${target}`);
+              }
+              return String(result.text || "");
+            }
+            if (!pyodide?.FS?.analyzePath(target).exists) {
+              throw nodeRuntimeFsError("fs_not_found", `File not found: ${target}`);
+            }
+            return pyodide.FS.readFile(target, { encoding: "utf8" });
+          },
+          async readBinary(path) {
+            const target = assertBridgeWorkspacePath(path);
+            if (WORKER_SHELL_ENABLED) {
+              const result = await workerFs("readFile", { path: target, encoding: "base64" });
+              if (!result.exists || result.isDir) {
+                throw nodeRuntimeFsError("fs_not_found", `File not found: ${target}`);
+              }
+              return { encoding: "base64", data: String(result.data || ""), size: Number(result.size || 0) };
+            }
+            if (!pyodide?.FS?.analyzePath(target).exists) {
+              throw nodeRuntimeFsError("fs_not_found", `File not found: ${target}`);
+            }
+            const bytes = pyodide.FS.readFile(target);
+            return { encoding: "base64", data: bytesToBase64(bytes), size: bytes.byteLength };
+          },
+          async writeText(path, content) {
+            const target = assertBridgeWorkspacePath(path);
+            if (WORKER_SHELL_ENABLED) {
+              await workerFs("writeFile", {
+                path: target,
+                data: String(content ?? ""),
+                deferPersist: true,
+              });
+            } else {
+              await writeRuntimeFileAndMirror(target, String(content ?? ""));
+            }
+            if (WORKER_SHELL_ENABLED) markWorkspaceMutation();
+            edgeTermBridgeServer?.emit("fs.changed", { changes: [{ path: target }] });
+            return { path: target };
+          },
+          async writeFiles(entries) {
+            const normalized = (Array.isArray(entries) ? entries : []).map((entry) => ({
+              ...entry,
+              path: assertBridgeWorkspacePath(entry.path),
+            }));
+            if (WORKER_SHELL_ENABLED) {
+              const batchSize = 200;
+              for (let offset = 0; offset < normalized.length; offset += batchSize) {
+                await workerFs("writeFiles", {
+                  entries: normalized.slice(offset, offset + batchSize),
+                  deferPersist: true,
+                });
+              }
+            } else {
+              await mainNodeRuntimeWriteFiles(normalized);
+            }
+            edgeTermBridgeServer?.emit("fs.changed", {
+              changes: normalized.map((entry) => ({ path: entry.path })),
+            });
+            return { files: normalized.length };
+          },
+          async mkdir(path) {
+            const target = assertBridgeWorkspacePath(path);
+            if (WORKER_SHELL_ENABLED) {
+              await workerFs("mkdir", { path: target });
+            } else {
+              ensureDir(target);
+              const mirrorTarget = workspaceMirrorPathForRuntimePath(target);
+              if (mirrorTarget) {
+                ensureDir(mirrorTarget);
+                await persistWorkspaceMirrorTargets([mirrorTarget]);
+              } else {
+                schedulePersistActiveWorkspace(750);
+              }
+            }
+            markWorkspaceMutation();
+            edgeTermBridgeServer?.emit("fs.changed", { changes: [{ path: target }] });
+            return { path: target };
+          },
+          async removeTree(path) {
+            const target = assertBridgeWorkspacePath(path);
+            const root = `/home/${activeUser()}`;
+            if (target === root) {
+              throw nodeRuntimeFsError("fs_delete_forbidden", "The workspace root cannot be removed.");
+            }
+            if (WORKER_SHELL_ENABLED) {
+              await workerFs("removeTree", { path: target, deferPersist: true });
+            } else {
+              const mirrorTarget = workspaceMirrorPathForRuntimePath(target);
+              if (pyodide?.FS?.analyzePath(target).exists) removeTree(target);
+              if (mirrorTarget) {
+                if (pyodide?.FS?.analyzePath(mirrorTarget).exists) removeTree(mirrorTarget);
+                await persistWorkspaceMirrorTargets([mirrorTarget]);
+              } else {
+                schedulePersistActiveWorkspace(750);
+              }
+            }
+            markWorkspaceMutation();
+            edgeTermBridgeServer?.emit("fs.changed", {
+              changes: [{ path: target, deleted: true }],
+            });
+            return { path: target };
+          },
+          async flush() {
+            if (WORKER_SHELL_ENABLED) {
+              await workerFs("flush", {});
+            } else {
+              await flushQueuedWorkspaceJournalEntries();
+              schedulePersistActiveWorkspace(1000);
+            }
+            return { persisted: true };
+          },
+          async generation() {
+            return `${activeWorkspaceId}:${workspaceMutationGeneration}`;
+          },
+          async readTree(root, options = {}) {
+            const target = assertBridgeWorkspacePath(root);
+            if (WORKER_SHELL_ENABLED) {
+              const result = await workerFs("readTree", {
+                root: target,
+                ...options,
+              });
+              return result.files || [];
+            }
+            return mainNodeRuntimeReadTree(target, options);
+          },
+          async fingerprint(root, options = {}) {
+            const target = assertBridgeWorkspacePath(root);
+            if (WORKER_SHELL_ENABLED) {
+              const result = await workerFs("fingerprint", {
+                root: target,
+                ...options,
+              });
+              return String(result.fingerprint || "");
+            }
+            return mainNodeRuntimeFingerprint(target, options);
+          },
+        };
+      }
+
+      function createExternalShellFsAdapter() {
+        const workspaceAdapter = createNodeRuntimeFsAdapter();
+        const packageRoots = new Set([
+          "/usr",
+          "/opt",
+          "/etc",
+          "/var",
+        ]);
+        const packagePath = (value) => {
+          const target = normalizePath(value);
+          const allowed = [...packageRoots].some(
+            (root) => target === root || target.startsWith(`${root}/`),
+          );
+          if (!allowed) return null;
+          return target;
+        };
+        const packageRuntimePath = (value) => {
+          const target = packagePath(value);
+          if (!target) return null;
+          const root = target.split("/").filter(Boolean)[0] || "";
+          if (["etc", "usr", "var"].includes(root)) {
+            return `${activeRootfsPath()}${target}`;
+          }
+          return target;
+        };
+        const persistPackageTargets = async (targets) => {
+          const mirrors = targets
+            .map((target) => workspaceMirrorPathForRuntimePath(target))
+            .filter(Boolean);
+          if (mirrors.length) await persistWorkspaceMirrorTargets(mirrors);
+          if (targets.length) markWorkspaceMutation();
+        };
+        return {
+          ...workspaceAdapter,
+          async ensureReady() {
+            await ensureActiveWorkspaceMounted("Loading workspace files for the command...");
+          },
+          async readText(path) {
+            const target = packagePath(path);
+            if (!target) return await workspaceAdapter.readText(path);
+            if (WORKER_SHELL_ENABLED) {
+              const result = await workerFs("readFile", { path: target });
+              if (!result.exists || result.isDir) {
+                throw nodeRuntimeFsError("fs_not_found", `File not found: ${target}`);
+              }
+              return String(result.text || "");
+            }
+            const runtimeTarget = packageRuntimePath(target);
+            if (!pyodide?.FS?.analyzePath(runtimeTarget).exists) {
+              throw nodeRuntimeFsError("fs_not_found", `File not found: ${target}`);
+            }
+            return pyodide.FS.readFile(runtimeTarget, { encoding: "utf8" });
+          },
+          async readBinary(path) {
+            const target = packagePath(path);
+            if (!target) return await workspaceAdapter.readBinary(path);
+            if (WORKER_SHELL_ENABLED) {
+              const result = await workerFs("readFile", { path: target, encoding: "base64" });
+              if (!result.exists || result.isDir) {
+                throw nodeRuntimeFsError("fs_not_found", `File not found: ${target}`);
+              }
+              return {
+                encoding: "base64",
+                data: String(result.data || ""),
+                size: Number(result.size || 0),
+              };
+            }
+            const runtimeTarget = packageRuntimePath(target);
+            if (!pyodide?.FS?.analyzePath(runtimeTarget).exists) {
+              throw nodeRuntimeFsError("fs_not_found", `File not found: ${target}`);
+            }
+            const bytes = pyodide.FS.readFile(runtimeTarget);
+            return { encoding: "base64", data: bytesToBase64(bytes), size: bytes.byteLength };
+          },
+          async writeText(path, text) {
+            const target = packagePath(path);
+            if (!target) return await workspaceAdapter.writeText(path, text);
+            const entry = {
+              path: target,
+              encoding: "utf8",
+              text: String(text ?? ""),
+            };
+            if (WORKER_SHELL_ENABLED) {
+              await workerFs("writeFiles", { entries: [entry], deferFlush: true });
+            } else {
+              const runtimeTarget = packageRuntimePath(target);
+              ensureDir(runtimeTarget.split("/").slice(0, -1).join("/") || "/");
+              pyodide.FS.writeFile(runtimeTarget, entry.text);
+              syncRuntimePathToWorkspace(target);
+              await persistPackageTargets([target]);
+            }
+            if (WORKER_SHELL_ENABLED) markWorkspaceMutation();
+            return { path: target };
+          },
+          async writeFiles(entries) {
+            const normalized = Array.isArray(entries) ? entries : [];
+            if (!normalized.length || normalized.some((entry) => !packagePath(entry.path))) {
+              console.info(
+                "[EXTERNAL SHELL] workspace write",
+                normalized.map((entry) => String(entry?.path || "")).join(", "),
+              );
+              return await workspaceAdapter.writeFiles(entries);
+            }
+            if (WORKER_SHELL_ENABLED) {
+              await workerFs("writeFiles", { entries: normalized, deferFlush: true });
+            } else {
+              const changedTargets = [];
+              for (const entry of normalized) {
+                const target = packagePath(entry.path);
+                const runtimeTarget = packageRuntimePath(target);
+                ensureDir(runtimeTarget.split("/").slice(0, -1).join("/") || "/");
+                const data = entry.encoding === "base64"
+                  ? base64ToBytes(entry.data)
+                  : String(entry.data ?? entry.text ?? "");
+                pyodide.FS.writeFile(runtimeTarget, data);
+                syncRuntimePathToWorkspace(target);
+                changedTargets.push(target);
+              }
+              await persistPackageTargets(changedTargets);
+            }
+            if (WORKER_SHELL_ENABLED && normalized.length) markWorkspaceMutation();
+            return { files: normalized.length };
+          },
+          async mkdir(path) {
+            const target = packagePath(path);
+            if (!target) {
+              console.info("[EXTERNAL SHELL] workspace directory", String(path || ""));
+              return await workspaceAdapter.mkdir(path);
+            }
+            if (WORKER_SHELL_ENABLED) {
+              await workerFs("mkdir", { path: target, deferFlush: true });
+            }
+            else {
+              ensureDir(packageRuntimePath(target));
+              if (!packageRoots.has(target)) syncRuntimePathToWorkspace(target);
+              await persistPackageTargets([target]);
+            }
+            if (WORKER_SHELL_ENABLED) markWorkspaceMutation();
+            return { path: target };
+          },
+          async removeTree(path) {
+            const target = packagePath(path);
+            if (!target || packageRoots.has(target)) {
+              console.info("[EXTERNAL SHELL] workspace removal", String(path || ""));
+              return await workspaceAdapter.removeTree(path);
+            }
+            if (WORKER_SHELL_ENABLED) {
+              await workerFs("removeTree", { path: target, deferFlush: true });
+            } else if (pyodide?.FS?.analyzePath(packageRuntimePath(target)).exists) {
+              removeTree(packageRuntimePath(target));
+              syncRuntimePathToWorkspace(target);
+              await persistPackageTargets([target]);
+            }
+            if (WORKER_SHELL_ENABLED) markWorkspaceMutation();
+            return { path: target };
+          },
+          async readTree(root, options = {}) {
+            const target = normalizePath(root);
+            if (!packagePath(target)) {
+              console.info("[EXTERNAL SHELL] workspace read", target);
+              return await workspaceAdapter.readTree(target, options);
+            }
+            if (WORKER_SHELL_ENABLED) {
+              const result = await workerFs("readTree", { root: target, ...options });
+              return result.files || [];
+            }
+            return mainNodeRuntimeReadTree(target, options);
+          },
+        };
+      }
+
+      function getNodeRuntime() {
+        if (nodeRuntime) return nodeRuntime;
+        nodeRuntime = createEdgeTermNodeRuntime({
+          fs: createNodeRuntimeFsAdapter(),
+          assetUrl,
+          output: nodeRuntimeOutput,
+          progress: (event) => {
+            const message = String(event.message || "");
+            if (message) console.info("[NODE]", message);
+            edgeTermBridgeServer?.emit("runtime.node.progress", event);
+          },
+          confirm: async (title, message) =>
+            await askConfirm(title, message, { confirmLabel: "Allow once" }),
+          startPreview: async ({ mode, target, cwd, virtualPort, spaFallback }) => {
+            const app = WORKER_SHELL_ENABLED
+              ? await runWorkerEdgeServeStart({ mode, target, cwd, spaFallback })
+              : await window.EdgeTermServe.start(mode, target, cwd);
+            return { ...app, virtual_port: virtualPort || 3000 };
+          },
+          refreshPreview: async (app) => {
+            if (app?.id) return await bridgeAppAction("preview.open", { app_id: app.id });
+            return { refreshed: false };
+          },
+          stopPreview: (app) => {
+            if (app?.id) stopRunCenterEntry(app, { cancelNodeRuntime: false });
+          },
+          onStatus: (status) => {
+            if (status?.running || status?.watching) {
+              $id("stopTerminalCommand")?.classList.remove("hidden");
+            } else {
+              const externalStatus = externalShellRuntime?.status?.();
+              if (
+                !externalStatus?.running
+                && !externalStatus?.foreground
+                && !workerShellCommandRunning
+              ) {
+                $id("stopTerminalCommand")?.classList.add("hidden");
+              }
+            }
+            edgeTermBridgeServer?.emit("runtime.node.status", status);
+          },
+        });
+        return nodeRuntime;
+      }
+
+      function getProcessHost() {
+        if (processHost) return processHost;
+        processHost = new EdgeTermProcessHost({
+          workspaceGeneration: () => `${activeWorkspaceId}:${workspaceMutationGeneration}`,
+          driver: {
+            start: (params) => bridgeStartTerminal(params),
+            status: (params) => bridgeTerminalStatus(params),
+            output: (params) => bridgeTerminalOutput(params),
+            input: async (params) => {
+              const execution = activeBridgeExecution;
+              if (!execution || execution.id !== String(params.execution_id || "")) {
+                throw bridgeError("process_not_running", "The process is no longer running.");
+              }
+              const runtime = externalShellRuntime;
+              if (!runtime?.status?.().interactive && !runtime?.status?.().interactiveDormant) {
+                throw bridgeError(
+                  "process_input_unavailable",
+                  "The active runtime does not accept foreground input for this process.",
+                );
+              }
+              const accepted = await runtime.writeInput(String(params.data ?? ""));
+              return { accepted };
+            },
+            signal: (params) => bridgeCancelTerminal(params),
+          },
+        });
+        return processHost;
+      }
+
+      function getComponentHost() {
+        if (componentHost) return componentHost;
+        componentHost = new EdgeTermComponentHost();
+        componentHost.register("wasi:cli/environment", async (operation, payload = {}, context = {}) => {
+          const environment = { ...(context.environment || {}) };
+          if (operation === "get-environment") return Object.entries(environment).map(([key, value]) => [key, String(value)]);
+          if (operation === "get-arguments") return Array.isArray(context.arguments) ? context.arguments.map(String) : [];
+          if (operation === "initial-cwd") return String(context.cwd || `/home/${activeUser()}`);
+          throw bridgeError("component_operation_unknown", `Unknown environment operation: ${operation}`);
+        });
+        const terminalHandler = (stream) => async (operation, payload = {}, context = {}) => {
+          if (operation === "write") {
+            const value = String(payload.text ?? payload.data ?? "");
+            if (stream === "stderr") term?.error?.(value, { newline: payload.newline !== false });
+            else term?.echo?.(value, { newline: payload.newline !== false });
+            return { written: new TextEncoder().encode(value).byteLength };
+          }
+          if (operation === "read" && stream === "stdin") {
+            if (typeof context.read !== "function") {
+              throw bridgeError("component_stdin_unavailable", "No terminal input source is attached to this component.");
+            }
+            return await context.read(Number(payload.max_bytes || 65_536));
+          }
+          throw bridgeError("component_operation_unknown", `Unknown terminal operation: ${operation}`);
+        };
+        componentHost.register("wasi:cli/stdin", terminalHandler("stdin"));
+        componentHost.register("wasi:cli/stdout", terminalHandler("stdout"));
+        componentHost.register("wasi:cli/stderr", terminalHandler("stderr"));
+        const filesystemHandler = async (operation, payload = {}) => {
+          if (operation === "preopens") return [{ path: `/home/${activeUser()}`, label: "workspace" }];
+          const path = assertBridgeWorkspacePath(payload.path);
+          if (operation === "stat") return await bridgeStat(path);
+          if (operation === "read") return await bridgeReadText(path, Number(payload.max_bytes || 524_288));
+          if (operation === "write") return await bridgeWriteText(path, String(payload.content ?? ""));
+          if (operation === "list") return await bridgeListFiles({ path });
+          throw bridgeError("component_operation_unknown", `Unknown filesystem operation: ${operation}`);
+        };
+        componentHost.register("wasi:filesystem/types", filesystemHandler);
+        componentHost.register("wasi:filesystem/preopens", filesystemHandler);
+        const clockHandler = async (operation) => {
+          if (operation === "now") return { wall_milliseconds: Date.now(), monotonic_milliseconds: performance.now() };
+          if (operation === "resolution") return { milliseconds: 1 };
+          throw bridgeError("component_operation_unknown", `Unknown clock operation: ${operation}`);
+        };
+        componentHost.register("wasi:clocks/monotonic-clock", clockHandler);
+        componentHost.register("wasi:clocks/wall-clock", clockHandler);
+        componentHost.register("wasi:random/random", async (operation, payload = {}) => {
+          if (operation !== "get-random-bytes") throw bridgeError("component_operation_unknown", `Unknown random operation: ${operation}`);
+          const length = Math.max(0, Math.min(65_536, Number(payload.length || 0)));
+          const bytes = crypto.getRandomValues(new Uint8Array(length));
+          return { bytes: bytesToBase64(bytes), encoding: "base64" };
+        });
+        return componentHost;
+      }
+
+      function getCheckpointStore() {
+        checkpointStore ||= new CheckpointStore({ retention: 30 });
+        return checkpointStore;
+      }
+
+      function getSecretVault() {
+        secretVault ||= new SecretVault();
+        return secretVault;
+      }
+
+      function getTestController() {
+        testController ||= new EdgeTermTestController({ processHost: getProcessHost() });
+        return testController;
+      }
+
+      function getLanguageClient() {
+        if (languageClient) return languageClient;
+        languageClient = new EdgeTermLanguageClient({
+          workerUrl: assetUrl("language-service-worker.js"),
+        });
+        languageClient.addEventListener("textDocument/publishDiagnostics", (event) => {
+          const uri = String(event.detail?.uri || "");
+          if (uri) languageDiagnostics.set(uri, Array.isArray(event.detail?.diagnostics) ? event.detail.diagnostics : []);
+          edgeTermBridgeServer?.emit("language.diagnostics", event.detail || {});
+        });
+        return languageClient;
+      }
+
+      function getDebugController() {
+        if (!debugController) {
+          debugController = new EdgeTermDebugController();
+          debugController.register("python", new PythonDebugAdapter({
+            workerUrl: assetUrl("debug-runtime-worker.js"),
+            readFile: async (path) => (await bridgeReadText(assertBridgeWorkspacePath(path))).content,
+          }));
+        }
+        return debugController;
+      }
+
+      function resolveExternalShellOutputDrain() {
+        if (externalShellOutputQueue.length || externalShellOutputTimer !== null) return;
+        const resolvers = externalShellOutputDrainResolvers;
+        externalShellOutputDrainResolvers = [];
+        for (const resolve of resolvers) resolve();
+      }
+
+      function flushExternalShellOutput({ drain = false } = {}) {
+        if (externalShellOutputTimer !== null) {
+          clearTimeout(externalShellOutputTimer);
+          externalShellOutputTimer = null;
+        }
+        const batchSize = drain
+          ? externalShellOutputQueue.length
+          : externalShellOutputQueue.length > 200
+            ? 32
+            : externalShellOutputQueue.length > 40
+              ? 8
+              : 1;
+        const queued = externalShellOutputQueue.splice(0, batchSize);
+        for (const entry of queued) {
+          const progressLine = externalShellProgressLines.get(entry.stream);
+          if (entry.carriageReturn) {
+            if (!entry.text.trim()) continue;
+            if (progressLine !== undefined && term?.update) {
+              term.update(progressLine, entry.text);
+            } else if (entry.stream === "stderr") {
+              term?.error?.(entry.text);
+              if (term?.last_index) externalShellProgressLines.set(entry.stream, term.last_index());
+            } else {
+              term?.echo?.(entry.text);
+              if (term?.last_index) externalShellProgressLines.set(entry.stream, term.last_index());
+            }
+            continue;
+          }
+          if (progressLine !== undefined) {
+            if (entry.text.trim() && term?.update) term.update(progressLine, entry.text);
+            externalShellProgressLines.delete(entry.stream);
+            continue;
+          }
+          if (entry.inline) {
+            if (entry.stream === "stderr") term?.error?.(entry.text, { newline: false });
+            else term?.echo?.(entry.text, { newline: false });
+          } else if (entry.stream === "stderr") {
+            term?.error?.(entry.text);
+          } else {
+            term?.echo?.(entry.text);
+          }
+        }
+        if (externalShellOutputQueue.length) {
+          externalShellOutputTimer = setTimeout(
+            flushExternalShellOutput,
+            EXTERNAL_SHELL_OUTPUT_INTERVAL_MS,
+          );
+        } else {
+          resolveExternalShellOutputDrain();
+        }
+      }
+
+      function finishExternalShellOutput() {
+        externalShellOutputQueue.push(...externalShellLineStream.flush());
+        externalShellProgressLines.clear();
+        if (!externalShellOutputQueue.length) return Promise.resolve();
+        if (externalShellOutputTimer === null) {
+          externalShellOutputTimer = setTimeout(flushExternalShellOutput, 0);
+        }
+        return new Promise((resolve) => externalShellOutputDrainResolvers.push(resolve));
+      }
+
+      function flushExternalShellPartialOutput() {
+        externalShellOutputQueue.push(...externalShellLineStream.flush());
+        flushExternalShellOutput({ drain: true });
+        externalShellProgressLines.clear();
+      }
+
+      function queueExternalShellOutput(stream, value) {
+        const text = String(value || "");
+        if (!text) return;
+        const normalizedStream = stream === "stderr" ? "stderr" : "stdout";
+        externalShellOutputQueue.push(...externalShellLineStream.push(normalizedStream, text));
+        const partial = externalShellLineStream.peek(normalizedStream);
+        if (/(?:Continue\?\s*\[[Yy]\/n\]|Password:|Passphrase:|(?:^|\n)> )\s*$/.test(partial)) {
+          externalShellOutputQueue.push(
+            ...externalShellLineStream.flush(normalizedStream).map((entry) => ({ ...entry, inline: true })),
+          );
+          externalShellForegroundInputRequested = true;
+          setTerminalInputReady(true);
+          term?.resume?.();
+          term?.focus?.();
+        }
+        if (externalShellOutputQueue.length && externalShellOutputTimer === null) {
+          externalShellOutputTimer = setTimeout(flushExternalShellOutput, 16);
+        }
+      }
+
+      function externalShellOutput(stream, value, options = {}) {
+        if (options.streaming) {
+          queueExternalShellOutput(stream, value);
+          return;
+        }
+        flushExternalShellPartialOutput();
+        const text = String(value || "").trimEnd();
+        if (!text) return;
+        if (stream === "stderr") term?.error?.(text);
+        else term?.echo?.(text);
+      }
+
+      function getExternalShellRuntime() {
+        if (externalShellRuntime) return externalShellRuntime;
+        const externalRuntimeAssetUrl = (path) => new URL(
+          String(path || "").replace(/^\/+/, ""),
+          new URL("./", location.href),
+        ).toString();
+        externalShellRuntime = createEdgeTermExternalShellRuntime({
+          fs: createExternalShellFsAdapter(),
+          assetUrl: externalRuntimeAssetUrl,
+          output: externalShellOutput,
+          progress: (event) => {
+            console.info(
+              "[EXTERNAL SHELL]",
+              String(event?.phase || "working"),
+              String(event?.message || ""),
+            );
+            edgeTermBridgeServer?.emit("runtime.external_shell.progress", event);
+          },
+          confirm: async ({ prompt = "Continue? [Y/n] " } = {}) => {
+            await finishExternalShellOutput();
+            externalShellForegroundInputRequested = true;
+            setTerminalInputReady(true);
+            const answer = await new Promise((resolve) => {
+              term.read(prompt, (value) => resolve(String(value ?? "")));
+              term.resume();
+              term.focus();
+            });
+            externalShellForegroundInputRequested = false;
+            setTerminalInputReady(false);
+            return !/^(?:n|no)$/i.test(answer.trim());
+          },
+          onCwd: (cwd) => setWorkerPrompt(cwd),
+          onStatus: (status) => {
+            const foregroundActive = Boolean(
+              status?.foreground && (status?.interactive || status?.interactiveDormant),
+            );
+            if (foregroundActive) {
+              $id("stopTerminalCommand")?.classList.remove("hidden");
+              if (!externalShellForegroundActive) {
+                externalShellInputBuffer = "";
+                externalShellForegroundInputRequested = false;
+              }
+              setTerminalInputReady(externalShellForegroundInputRequested);
+              term?.set_prompt?.("");
+              primaryTerm?.set_prompt?.("");
+              editorTerm?.set_prompt?.("");
+            } else if (externalShellForegroundActive) {
+              $id("stopTerminalCommand")?.classList.add("hidden");
+              externalShellInputBuffer = "";
+              externalShellForegroundInputRequested = false;
+              const promptPath = status?.cwd || terminalCurrentPath || `/home/${activeUser()}`;
+              void finishExternalShellOutput().then(() => {
+                if (!getExternalShellRuntime().status().foreground) setWorkerPrompt(promptPath);
+              });
+            }
+            externalShellForegroundActive = foregroundActive;
+            edgeTermBridgeServer?.emit("runtime.external_shell.status", status);
+          },
+        });
+        return externalShellRuntime;
+      }
+
+      async function runExternalShellCommand(line, cwd) {
+        const runtime = getExternalShellRuntime();
+        const workspaceRoot = `/home/${activeUser()}`;
+        const normalizedCwd = normalizePath(cwd || workspaceRoot);
+        try {
+          if (!runtime.shouldHandle(line) && runtime.mayRouteInstalledCommand(line)) {
+            await runtime.refreshInstalledCommands();
+          }
+          if (!runtime.shouldHandle(line)) return null;
+          const result = await runtime.run(line, normalizedCwd, workspaceRoot);
+          await finishExternalShellOutput();
+          if (!result?.interactive) setWorkerPrompt(result?.cwd || normalizedCwd);
+          return result;
+        } catch (error) {
+          if (String(error?.code || "") === "external_shell_cancelled") {
+            await finishExternalShellOutput();
+            return {
+              exitCode: 130,
+              cwd: normalizedCwd,
+              interrupted: true,
+              runtime: "busybox-wasix",
+            };
+          }
+          if (runtime.shouldFallback(error)) {
+            console.warn(
+              "[EXTERNAL SHELL] Falling back to the Python shell:",
+              error.code || "external_shell_prepare_failed",
+              error.message || "The external shell did not start.",
+            );
+            return null;
+          }
+          const message = formatError(error);
+          term?.error?.(`[BusyBox] ${message}`);
+          await finishExternalShellOutput();
+          setWorkerPrompt(normalizedCwd);
+          return { exitCode: 1, cwd: normalizedCwd, error: message, runtime: "busybox-wasix" };
+        }
+      }
+
+      async function synchronizeShellWorkingDirectory(cwd) {
+        const target = normalizePath(cwd || `/home/${activeUser()}`);
+        if (WORKER_SHELL_ENABLED) {
+          setWorkerPrompt(target);
+          return;
+        }
+        pyodide.globals.set("__edgeterm_external_shell_cwd", target);
+        await pyodide.runPythonAsync(`
+import builtins
+import os
+
+target = globals().get("__edgeterm_external_shell_cwd", "/home/user")
+shell = getattr(builtins, "EDGETERM_SHELL", None)
+os.chdir(target)
+if shell is not None:
+    shell.logical_cwd = target
+    shell._sync_env()
+else:
+    os.environ["PWD"] = target
+`);
+      }
+
       async function workerReadText(path) {
         const result = await workerFs("readFile", { path: normalizePath(path || "/") });
         if (!result.exists || result.isDir) throw new Error(`File not found: ${path}`);
@@ -13851,7 +15957,13 @@ match.group(1) if match else path
       }
 
       async function dispatchWorkerStaticRequest(url, options, config, extra = {}) {
-        const { path } = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
+        const resolved = resolveAppRequestUrl(url, options.currentPath || appModeState.currentPath || "/");
+        const routePrefix = normalizePath(config.python?.routePrefix || "/");
+        let path = resolved.path;
+        if (routePrefix !== "/" && (path === routePrefix || path.startsWith(`${routePrefix}/`))) {
+          path = path.slice(routePrefix.length) || "/";
+          if (!path.startsWith("/")) path = `/${path}`;
+        }
         const root = normalizePath(config.staticRoot || "/home/user/public");
         let fsPath = path === "/" ? resolveStaticEntrypoint(config) : resolveWorkspaceDirectory(root, `.${path}`);
         const info = await workerFsStat(fsPath);
@@ -13860,6 +15972,18 @@ match.group(1) if match else path
           if (path.length > 1 && path.endsWith("/")) {
             return await dispatchWorkerStaticRequest(path.slice(0, -1), options, config, extra);
           }
+          const finalSegment = path.split("/").filter(Boolean).pop() || "";
+          if (config.static?.spaFallback && !finalSegment.includes(".")) {
+            const fallbackPath = resolveWorkspacePath(
+              root,
+              config.static.indexFile || "index.html",
+            );
+            if ((await workerFsStat(fallbackPath)).exists) {
+              fsPath = fallbackPath;
+            }
+          }
+        }
+        if (!(await workerFsStat(fsPath)).exists) {
           return extra.silentNotFound
             ? { status: 404, headers: { "content-type": "text/plain; charset=utf-8" }, body: "Not found", bodyBase64: "" }
             : {
@@ -13994,9 +16118,6 @@ match.group(1) if match else path
             workingDirectory: cwd,
             label: spec,
           };
-          window.EdgeTermServe ||= { instances: new Map() };
-          window.EdgeTermServe.instances ||= new Map();
-          window.EdgeTermServe.instances.set(instance.id, instance);
           const serveConfig = normalizeAppModeConfig({
             enabled: true,
             runtime: "php",
@@ -14019,6 +16140,7 @@ match.group(1) if match else path
               allowDebugTerminal: true,
             },
           });
+          registerEdgeServeInstance(instance, serveConfig);
           appModeState.config = serveConfig;
           appModeState.renderTarget = "display";
           createOrActivateDisplayBrowserTab(instance, `${instance.routePrefix}/`);
@@ -14035,6 +16157,17 @@ match.group(1) if match else path
           if (!bridgedFromWorker && !(await workerFsIsDir(targetPath)) && !targetIsFile) throw new Error(`Static app target not found: ${targetPath}`);
           const staticRoot = targetIsFile ? normalizePath(targetPath.split("/").slice(0, -1).join("/") || "/") : targetPath;
           const entrypoint = targetIsFile ? targetPath : resolveWorkspacePath(staticRoot, "index.html");
+          const identity = stableEdgeServeIdentity("static", spec, cwd);
+          const instance = {
+            id: identity.instanceId,
+            mode: "static",
+            requestedMode: "static",
+            target: staticRoot,
+            routePrefix: identity.routePrefix,
+            workingDirectory: cwd,
+            label: spec,
+            spaFallback: Boolean(message.spaFallback),
+          };
           const serveConfig = normalizeAppModeConfig({
             enabled: true,
             runtime: "static",
@@ -14045,18 +16178,33 @@ match.group(1) if match else path
             autoStart: false,
             preserveStateOnExit: false,
             showLoadingOverlay: false,
+            static: {
+              indexFile: "index.html",
+              allowInlineScripts: true,
+              spaFallback: Boolean(message.spaFallback),
+            },
+            python: {
+              framework: "edgeserve",
+              appSpec: spec,
+              instanceId: instance.id,
+              routePrefix: instance.routePrefix,
+              serveMode: "static",
+            },
             ui: {
               hideWorkspaceChrome: false,
               allowDebugTerminal: true,
               showAddressBar: true,
             },
           });
+          registerEdgeServeInstance(instance, serveConfig);
           appModeState.config = serveConfig;
           appModeState.renderTarget = "display";
-          const launch = () => enterAppMode(serveConfig, { forceReload: false, throwOnError: true });
+          createOrActivateDisplayBrowserTab(instance, `${instance.routePrefix}/`);
+          syncDisplayBrowserButtons();
+          const launch = () => enterAppMode(serveConfig, { initialUrl: `${instance.routePrefix}/`, forceReload: false, throwOnError: true });
           if (bridgedFromWorker) setTimeout(() => launch().catch((err) => showAppModeError("App Mode startup failed.", formatInitError(err))), 0);
           else await launch();
-          return { id: stableEdgeServeIdentity("static", spec, cwd).instanceId, mode: "static", target: staticRoot, routePrefix: "/", workingDirectory: cwd, label: spec };
+          return instance;
         }
 
         const routeMode = normalizeEdgeServeRouteMode(normalizedMode);
@@ -14075,9 +16223,6 @@ match.group(1) if match else path
           instance.routePrefix ||= identity.routePrefix;
           instance.workingDirectory ||= cwd;
           instance.label ||= spec;
-          window.EdgeTermServe ||= { instances: new Map() };
-          window.EdgeTermServe.instances ||= new Map();
-          window.EdgeTermServe.instances.set(instance.id, instance);
           const serveConfig = normalizeAppModeConfig({
             enabled: true,
             runtime: "python",
@@ -14100,6 +16245,7 @@ match.group(1) if match else path
               allowDebugTerminal: true,
             },
           });
+          registerEdgeServeInstance(instance, serveConfig);
           appModeState.config = serveConfig;
           appModeState.renderTarget = "display";
           createOrActivateDisplayBrowserTab(instance, `${instance.routePrefix}/`);
@@ -14255,6 +16401,7 @@ match.group(1) if match else path
           } else {
             await workerFs("switchWorkspace", { workspaceId: id, users: workspace.users || ["user"], clear: false });
           }
+          await bridgeNotifyExternalShellWorkspaceChanged();
           saveWorkspaceRegistry();
           renderWorkspaces();
           setWorkerPrompt(`/home/${activeUser()}`);
@@ -14264,12 +16411,45 @@ match.group(1) if match else path
         return createdId;
       }
 
+      async function switchWorkerWorkspace(id) {
+        if (id === activeWorkspaceId) return;
+        const workspace = workspaces.find((item) => item.id === id);
+        if (!workspace) throw new Error("Workspace not found");
+        await withBusy("Switching workspace...", async () => {
+          await exitAppMode({ force: true, resetSurface: true, toDebugTerminal: false });
+          const result = await workerFs("switchWorkspace", {
+            workspaceId: id,
+            users: workspace.users || ["user"],
+            clear: false,
+          });
+          activeWorkspaceId = id;
+          // The optional POSIX runtime keeps an isolated workspace snapshot.
+          // Retire it only after the active id changes so the next command is
+          // hydrated from the newly selected workspace.
+          await bridgeNotifyExternalShellWorkspaceChanged();
+          if (Array.isArray(result?.users) && result.users.length) {
+            workspace.users = result.users;
+            if (!workspace.users.includes(workspace.userName)) {
+              workspace.userName = workspace.users.includes("user") ? "user" : workspace.users[0];
+            }
+          }
+          workspace.updatedAt = Date.now();
+          saveWorkspaceRegistry();
+          renderWorkspaces();
+          setWorkerPrompt(`/home/${activeUser()}`);
+          await refreshWorkerFiles(`/home/${activeUser()}`);
+          syncShareWritebackState();
+          await maybeAutoStartAppMode();
+        });
+      }
+
       async function uploadWorkerFiles(files) {
         if (!Array.isArray(files) || files.length === 0) return;
         for (const file of files) {
           const target = normalizePath(`${currentPath === "/" ? "" : currentPath}/${file.name}`);
           await workerFs("writeFile", { path: target, data: bytesToBase64(new Uint8Array(await file.arrayBuffer())), encoding: "base64" });
         }
+        await bridgeNotifyExternalShellWorkspaceChanged();
         await refreshWorkerFiles(currentPath);
         showNotice(files.length === 1 ? `Uploaded ${files[0].name}` : `Uploaded ${files.length} files`);
       }
@@ -14311,25 +16491,30 @@ match.group(1) if match else path
       }
 
       async function exportActiveWorkerWorkspace() {
-        const workspace = activeWorkspace();
-        const zip = new JSZip();
-        const sourcePath = `/workspace-store/${activeWorkspaceId}`;
-        if ((await workerFsStat(sourcePath)).exists) {
-          await addWorkerPathToZip(zip, sourcePath, safeName(workspace?.name || "workspace"));
-        } else {
-          await addWorkerPathToZip(zip, `/home/${activeUser()}`, "home");
-          await addWorkerPathToZip(zip, "/packages", "packages");
-          await addWorkerPathToZip(zip, "/var/lib/pkg", "var/lib/pkg");
-          await addWorkerPathToZip(zip, "/var/cache/pkg", "var/cache/pkg");
-          await addWorkerPathToZip(zip, "/etc/appmode", "etc/appmode");
-        }
-        const blob = await zip.generateAsync({ type: "blob" });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = `${safeName(workspace?.name || "workspace")}.workspace.zip`;
-        link.click();
-        URL.revokeObjectURL(url);
+        await withBusy("Preparing workspace export...", async () => {
+          const workspace = activeWorkspace();
+          await workerFs("flush");
+          const zip = new JSZip();
+          const sourcePath = `/workspace-store/${activeWorkspaceId}`;
+          if ((await workerFsStat(sourcePath)).exists) {
+            await addWorkerPathToZip(zip, sourcePath, safeName(workspace?.name || "workspace"));
+          } else {
+            await addWorkerPathToZip(zip, `/home/${activeUser()}`, "home");
+          }
+          const blob = await zip.generateAsync(
+            { type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } },
+            (metadata) => setLoadingMessage(`Compressing workspace... ${Math.round(metadata.percent || 0)}%`),
+          );
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = `${safeName(workspace?.name || "workspace")}.workspace.zip`;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 30_000);
+        });
+        showNotice("Workspace export downloaded");
       }
 
       async function resetWorkerEnvironment() {
@@ -14384,15 +16569,27 @@ match.group(1) if match else path
         showNotice("Restored local directory into home");
       }
 
-      async function refreshWorkerFiles(path = currentPath) {
-        currentPath = normalizePath(path || `/home/${activeUser()}`);
+      async function refreshWorkerFiles(path = currentPath, options = {}) {
+        const requestedPath = normalizePath(path || `/home/${activeUser()}`);
+        currentPath = requestedPath;
         clearSelection();
         $id("filePath").value = currentPath;
         const list = $id("fileList");
         list.textContent = "Loading...";
         hideContextMenu();
         try {
-          const result = await workerFs("list", { path: currentPath });
+          let result = await workerFs("list", { path: currentPath });
+          if (!result.exists && options.fallbackToExistingDirectory) {
+            let fallbackPath = currentPath;
+            while (!result.exists && fallbackPath !== "/") {
+              fallbackPath = fallbackPath.split("/").slice(0, -1).join("/") || "/";
+              result = await workerFs("list", { path: fallbackPath });
+            }
+            if (result.exists && result.isDir) {
+              currentPath = fallbackPath;
+              $id("filePath").value = currentPath;
+            }
+          }
           list.textContent = "";
           if (!result.exists) {
             list.textContent = "Path not found.";
@@ -14449,6 +16646,7 @@ match.group(1) if match else path
         if (!trimmed || trimmed.includes("/")) return showNotice("Folder name cannot be empty or contain /");
         const target = normalizePath(`${currentPath === "/" ? "" : currentPath}/${trimmed}`);
         await workerFs("mkdir", { path: target });
+        await bridgeNotifyExternalShellWorkspaceChanged();
         await refreshWorkerFiles(currentPath);
         showNotice(`Created folder ${trimmed}`);
       }
@@ -14460,6 +16658,7 @@ match.group(1) if match else path
         if (!trimmed || trimmed.endsWith("/") || trimmed.includes("/")) return showNotice("File name cannot be empty or contain /");
         const target = normalizePath(`${currentPath === "/" ? "" : currentPath}/${trimmed}`);
         await workerFs("writeFile", { path: target, data: "" });
+        await bridgeNotifyExternalShellWorkspaceChanged();
         await refreshWorkerFiles(currentPath);
         showNotice(`Created file ${trimmed}`);
       }
@@ -14481,13 +16680,31 @@ match.group(1) if match else path
         const content = result.exists ? result.text || "" : "";
         editorPathFieldForTarget(targetName).value = target;
         if (targetName === "split") splitEditorPath = target;
-        replaceEditorModel(targetName, createEditorModel(target, content));
+        const model = createEditorModel(target, content);
+        if (targetName === "main") {
+          const existing = editorOpenTabs.get(target);
+          if (!existing) editorOpenTabs.set(target, { model, savedValue: content, dirty: false });
+          else {
+            existing.model = model;
+            existing.savedValue = content;
+            existing.dirty = false;
+          }
+          activateEditorTab(target, { focus: false });
+        } else {
+          replaceEditorModel(targetName, model);
+        }
         if (options.switchView !== false) setView("editorView");
         if (targetName === "main") setEditorStatus(result.exists ? `Opened ${target}` : `New file ${target}`);
         else setSplitEditorStatus(result.exists ? `Opened ${target}` : `New file ${target}`);
         const instance = editorInstanceForTarget(targetName);
         instance?.focus?.();
         instance?.layout?.();
+        if (targetName === "main") {
+          clearTimeout(editorDiagnosticTimer);
+          editorDiagnosticTimer = setTimeout(() => {
+            void updateEditorDiagnostics().catch((error) => console.warn("[EDITOR] diagnostics failed", error));
+          }, 0);
+        }
       }
 
       async function saveWorkerEditor() {
@@ -14495,6 +16712,13 @@ match.group(1) if match else path
         const path = normalizePath($id("editorPath").value || defaultEditorPath());
         const content = editor?.getValue?.() || "";
         await workerFs("writeFile", { path, data: content });
+        await bridgeNotifyExternalShellWorkspaceChanged();
+        const tab = editorOpenTabs.get(path);
+        if (tab) {
+          tab.savedValue = content;
+          tab.dirty = false;
+          renderEditorTabs();
+        }
         setEditorStatus(`Saved ${path}`);
         showNotice(`Saved ${path}`);
         if (document.querySelector("#filesView")?.classList.contains("active")) await refreshWorkerFiles(currentPath);
@@ -14532,6 +16756,120 @@ match.group(1) if match else path
         $id("activeUserLabel").textContent = activeUser();
         $id("activeHomeLabel").textContent = `/home/${activeUser()}`;
         window.lucide?.createIcons();
+      }
+
+      function setupWorkerWorkspaceToolEvents() {
+        const bind = (id, event, handler) => $id(id)?.addEventListener(event, handler);
+
+        bind("projectWizard", "submit", createProjectFromWizard);
+        bind("projectTemplate", "change", () => {
+          const template = selectedProjectTemplate();
+          $id("projectName").value = template.defaultName;
+          setProjectWizardStatus(`Ready to create ${template.label}.`);
+        });
+        bind("refreshRunCenter", "click", renderRunCenter);
+        bind("runCenterList", "click", (event) => void handleRunCenterAction(event));
+
+        loadMysqlConnectionPreferences();
+        document.querySelectorAll("[data-database-engine]").forEach((button) => {
+          button.addEventListener("click", () => setDatabaseEngine(button.dataset.databaseEngine));
+        });
+        bind("databaseRefresh", "click", () => void refreshDatabaseDiscovery().catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseOpen", "click", () => void openDatabase().catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseDiscovered", "change", (event) => {
+          if (event.target.value) $id("databasePath").value = event.target.value;
+        });
+        bind("databaseRefreshSchema", "click", () => void refreshDatabaseSchema({ renderResults: true }).catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseRunQuery", "click", () => void executeDatabaseQuery().catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseExplain", "click", () => {
+          const query = String($id("databaseQuery")?.value || "").trim();
+          if (!query) return showNotice("Enter a SQL statement first.");
+          const explain = /^EXPLAIN\b/i.test(query) ? query : databaseState.engine === "mysql"
+            ? `EXPLAIN ${query.replace(/;+\s*$/, "")};`
+            : `EXPLAIN QUERY PLAN ${query.replace(/;+\s*$/, "")};`;
+          void executeDatabaseQuery(explain).catch((err) => showNotice(err?.message || String(err)));
+        });
+        bind("databaseTableList", "click", (event) => {
+          const button = event.target.closest("[data-database-table]");
+          if (button) void openDatabaseTable(button.dataset.databaseTable).catch((err) => showNotice(err?.message || String(err)));
+        });
+        bind("databaseQuery", "keydown", (event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+            event.preventDefault();
+            void executeDatabaseQuery().catch((err) => showNotice(err?.message || String(err)));
+          }
+        });
+        bind("databaseWordPressShortcut", "click", () => void openDatabaseShortcut("wordpress").catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseDjangoShortcut", "click", () => void openDatabaseShortcut("django").catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseImport", "click", () => $id("databaseImportPicker")?.click());
+        bind("databaseImportPicker", "change", async (event) => {
+          try {
+            await importDatabaseFile(event.target.files?.[0]);
+          } catch (err) {
+            showNotice(`Database import failed: ${err?.message || err}`);
+          } finally {
+            event.target.value = "";
+          }
+        });
+        bind("databaseExport", "click", () => void exportCurrentDatabase().catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseMysqlConnect", "click", () => void connectMysqlDatabase().catch((err) => {
+          setDatabaseStatus("MySQL connection failed.");
+          showNotice(err?.message || String(err));
+        }));
+        bind("databaseMysqlDatabase", "change", () => {
+          saveMysqlConnectionPreferences();
+          databaseState.activeTable = "";
+          $id("databaseActiveName").textContent = mysqlConnectionSettings().database || "MySQL server";
+          void refreshDatabaseSchema({ renderResults: true }).catch((err) => showNotice(err?.message || String(err)));
+        });
+        bind("databaseMysqlStatus", "click", () => void showMysqlStatus().catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseMysqlImport", "click", () => $id("databaseMysqlImportPicker")?.click());
+        bind("databaseMysqlImportPicker", "change", async (event) => {
+          try {
+            await importMysqlSql(event.target.files?.[0]);
+          } catch (err) {
+            showNotice(`SQL import failed: ${err?.message || err}`);
+          } finally {
+            event.target.value = "";
+          }
+        });
+        bind("databaseMysqlExport", "click", () => void exportMysqlDatabase().catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseStructure", "click", () => void showDatabaseStructure().catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseHistory", "click", () => void showDatabaseHistory());
+        bind("databasePreviousPage", "click", () => void changeDatabasePage(-1).catch((err) => showNotice(err?.message || String(err))));
+        bind("databaseNextPage", "click", () => void changeDatabasePage(1).catch((err) => showNotice(err?.message || String(err))));
+
+        bind("developerView", "click", (event) => {
+          const panelButton = event.target.closest("[data-developer-panel]");
+          if (panelButton) selectDeveloperPanel(panelButton.dataset.developerPanel);
+          const templateButton = event.target.closest("[data-template-use]");
+          if (templateButton) useMarketplaceTemplate(templateButton.dataset.templateUse);
+        });
+        bind("gitInitialize", "click", () => void refreshGitStatus("init").catch((err) => showNotice(err?.message || String(err))));
+        bind("gitRefresh", "click", () => void refreshGitStatus().catch((err) => showNotice(err?.message || String(err))));
+        bind("gitCommit", "click", () => void commitGitChanges().catch((err) => showNotice(err?.message || String(err))));
+        bind("githubImport", "click", () => void importGithubRepository().catch((err) => showNotice(err?.message || String(err))));
+        bind("gitDownload", "click", () => void downloadDeveloperProject().catch((err) => showNotice(err?.message || String(err))));
+        bind("dependencyScan", "click", () => void scanDependencies().catch((err) => showNotice(err?.message || String(err))));
+        bind("dependencyRepair", "click", () => void repairDependencies().catch((err) => showNotice(err?.message || String(err))));
+        bind("developerLogsRefresh", "click", renderDeveloperLogs);
+        bind("developerLogsClear", "click", () => {
+          window.EdgeTermServeLogs = [];
+          window.EdgeTermServePageInfo = null;
+          renderDeveloperLogs();
+        });
+        bind("developerLogsDownload", "click", exportDeveloperLogs);
+        bind("wordpressScan", "click", () => void scanWordPressSites().catch((err) => showNotice(err?.message || String(err))));
+        bind("wordpressResults", "click", (event) => void handleWordPressAction(event).catch((err) => showNotice(err?.message || String(err))));
+        bind("snapshotCreate", "click", () => void createLocalSnapshot().catch((err) => showNotice(err?.message || String(err))));
+        bind("snapshotResults", "click", (event) => void handleSnapshotAction(event).catch((err) => showNotice(err?.message || String(err))));
+        bind("performanceAudit", "click", () => void runPerformanceAudit().catch((err) => showNotice(err?.message || String(err))));
+        bind("performanceFlush", "click", () => void flushPerformanceSaves().catch((err) => showNotice(err?.message || String(err))));
+
+        renderRunCenter();
+        renderTemplateMarketplace();
+        renderLocalSnapshots();
+        renderDeveloperLogs();
       }
 
       function setupWorkerEvents() {
@@ -14587,18 +16925,32 @@ match.group(1) if match else path
             return false;
           },
         };
-        const workerSafeViews = new Set(["terminalView", "displayView", "browserView", "filesView", "editorView", "usersView", "settingsView", "cloudView", "adminView"]);
+        const workerSafeViews = new Set([
+          "terminalView",
+          "displayView",
+          "browserView",
+          "filesView",
+          "editorView",
+          "projectsView",
+          "databaseView",
+          "developerView",
+          "backupView",
+          "usersView",
+          "settingsView",
+          "cloudView",
+          "adminView",
+        ]);
         document.querySelectorAll(".tab").forEach((tab) =>
           tab.addEventListener("click", () => {
             const view = tab.dataset.view;
             if (workerSafeViews.has(view)) {
               setView(view);
-              if (view === "filesView") void refreshWorkerFiles(currentPath || `/home/${activeUser()}`);
               if (view === "editorView") void openWorkerEditor($id("editorPath")?.value || defaultEditorPath());
               if (view === "usersView") renderWorkerUsers();
             }
           })
         );
+        setupWorkerWorkspaceToolEvents();
         on("toggleSidebar", "click", () => {
           const app = $id("app");
           if (window.innerWidth <= 820) setSidebarOpen(!app.classList.contains("sidebar-open"));
@@ -14631,6 +16983,35 @@ match.group(1) if match else path
           const paths = getSelectedPaths();
           if (paths.length) await downloadWorkerSelectedPaths(paths);
         });
+        on("copyFile", "click", () => {
+          const paths = getSelectedPaths();
+          if (!paths.length) return;
+          clipboard = { mode: "copy", paths };
+          showNotice(`Copied ${paths.length === 1 ? "item" : `${paths.length} items`}`);
+        });
+        on("cutFile", "click", () => {
+          const paths = getSelectedPaths();
+          if (!paths.length) return;
+          clipboard = { mode: "cut", paths };
+          showNotice(`Cut ${paths.length === 1 ? "item" : `${paths.length} items`}`);
+        });
+        on("pasteFile", "click", () => void pasteClipboardItems().catch((err) => showNotice(err?.message || String(err))));
+        on("renameFile", "click", async () => {
+          const paths = getSelectedPaths();
+          if (paths.length !== 1) return showNotice("Select one item to rename");
+          await renameSelectedPath(paths[0]);
+        });
+        on("deleteFile", "click", async () => {
+          await deleteSelectedPaths(getSelectedPaths());
+        });
+        on("contextMenu", "click", async (event) => {
+          const button = event.target.closest("[data-action]");
+          if (!button) return;
+          await handleContextAction(button.dataset.action);
+        });
+        document.addEventListener("click", (event) => {
+          if (!event.target.closest("#contextMenu")) hideContextMenu();
+        });
         on("editorPath", "keydown", (event) => {
           if (event.key === "Enter") void openWorkerEditor($id("editorPath").value);
         });
@@ -14644,7 +17025,7 @@ match.group(1) if match else path
           event.target.value = "";
         });
         on("createUser", "click", async () => {
-          const rawName = await askText("Create Workspace User", "Linux username", "developer", { confirmLabel: "Create" });
+          const rawName = await askText("Create Workspace User", "Workspace username", "developer", { confirmLabel: "Create" });
           if (!rawName) return;
           const user = safeName(rawName).toLowerCase();
           if (!/^[a-z_][a-z0-9_-]*$/.test(user)) return showNotice("Use lowercase letters, numbers, dash, or underscore");
@@ -15149,7 +17530,7 @@ shell
 
       async function createWorkspaceUser() {
         const workspace = activeWorkspace();
-        const rawName = await askText("Create Workspace User", "Linux username", "developer", { confirmLabel: "Create" });
+        const rawName = await askText("Create Workspace User", "Workspace username", "developer", { confirmLabel: "Create" });
         if (!rawName) return;
 
         const user = safeName(rawName).toLowerCase();
@@ -15203,6 +17584,2429 @@ shell
         refreshFiles(`/home/${activeUser()}`);
       }
 
+      function databaseFileName(path = databaseState.path) {
+        return String(path || "").split("/").filter(Boolean).pop() || "database.sqlite";
+      }
+
+      function setDatabaseStatus(message, timing = "") {
+        const status = $id("databaseResultStatus");
+        const duration = $id("databaseResultTiming");
+        if (status) status.textContent = String(message || "");
+        if (duration) duration.textContent = String(timing || "");
+      }
+
+      function setDatabaseBusy(active) {
+        databaseState.busy = !!active;
+        for (const id of ["databaseOpen", "databaseRefresh", "databaseRunQuery", "databaseExplain", "databaseRefreshSchema", "databaseMysqlConnect", "databaseMysqlStatus", "databaseStructure"]) {
+          const button = $id(id);
+          if (button) button.disabled = databaseState.busy;
+        }
+      }
+
+      function scanDatabaseFiles(root = `/home/${activeUser()}`) {
+        if (!pyodide?.FS) return [];
+        const found = [];
+        const visited = new Set();
+        const ignored = new Set([".git", "node_modules", "__pycache__", ".cache", "vendor"]);
+        let inspected = 0;
+        const walk = (path, depth = 0) => {
+          if (depth > 12 || inspected > 20000 || visited.has(path)) return;
+          visited.add(path);
+          inspected += 1;
+          let stat;
+          try {
+            stat = pyodide.FS.stat(path);
+          } catch {
+            return;
+          }
+          if (!pyodide.FS.isDir(stat.mode)) {
+            if (/\.(?:db|sqlite|sqlite3)$/i.test(path)) found.push(normalizePath(path));
+            return;
+          }
+          let entries = [];
+          try {
+            entries = pyodide.FS.readdir(path);
+          } catch {
+            return;
+          }
+          for (const entry of entries) {
+            if (entry === "." || entry === ".." || ignored.has(entry)) continue;
+            walk(`${path === "/" ? "" : path}/${entry}`, depth + 1);
+          }
+        };
+        walk(normalizePath(root));
+        return [...new Set(found)].sort((left, right) => left.localeCompare(right));
+      }
+
+      function renderDiscoveredDatabases() {
+        const select = $id("databaseDiscovered");
+        if (!select) return;
+        const current = select.value;
+        select.innerHTML = '<option value="">Select a database...</option>';
+        for (const path of databaseState.databases) {
+          const option = document.createElement("option");
+          option.value = path;
+          option.textContent = path;
+          select.appendChild(option);
+        }
+        if (databaseState.databases.includes(current)) select.value = current;
+      }
+
+      async function refreshDatabaseDiscovery() {
+        if (WORKER_SHELL_ENABLED) {
+          const result = await workerFs("databaseDiscover", { root: `/home/${activeUser()}` });
+          databaseState.databases = Array.isArray(result?.databases) ? result.databases : [];
+          renderDiscoveredDatabases();
+          setDatabaseStatus(`Found ${databaseState.databases.length} SQLite database${databaseState.databases.length === 1 ? "" : "s"}.`);
+          return databaseState.databases;
+        }
+        await ensureActiveWorkspaceMounted("Loading workspace files...");
+        databaseState.databases = scanDatabaseFiles();
+        renderDiscoveredDatabases();
+        setDatabaseStatus(`Found ${databaseState.databases.length} SQLite database${databaseState.databases.length === 1 ? "" : "s"}.`);
+        return databaseState.databases;
+      }
+
+      async function runDatabasePython(payload) {
+        if (WORKER_SHELL_ENABLED) return await workerFs("databaseSqlite", payload);
+        await pyodide.loadPackage("sqlite3");
+        pyodide.globals.set("__edgeterm_database_json", JSON.stringify(payload || {}));
+        const raw = await pyodide.runPythonAsync(`
+import json
+import sqlite3
+import time
+
+request = json.loads(__edgeterm_database_json)
+database_path = request.get("path") or ""
+operation = request.get("operation") or "query"
+started = time.perf_counter()
+
+
+def encode_value(value):
+    if value is None or isinstance(value, (str, int, float)):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        data = bytes(value)
+        return {"type": "blob", "bytes": len(data), "hex": data[:128].hex()}
+    return str(value)
+
+
+connection = sqlite3.connect(database_path)
+connection.row_factory = sqlite3.Row
+try:
+    if operation == "schema":
+        rows = connection.execute(
+            "SELECT name, type, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+        result = {
+            "schema": [dict(row) for row in rows],
+            "columns": ["name", "type", "sql"],
+            "rows": [[encode_value(row[key]) for key in row.keys()] for row in rows],
+            "changes": 0,
+        }
+    else:
+        statement = request.get("query") or ""
+        before_changes = connection.total_changes
+        cursor = connection.execute(statement)
+        columns = [item[0] for item in (cursor.description or [])]
+        rows = cursor.fetchmany(500) if columns else []
+        connection.commit()
+        result = {
+            "columns": columns,
+            "rows": [[encode_value(row[column]) for column in columns] for row in rows],
+            "changes": connection.total_changes - before_changes,
+            "truncated": bool(columns and len(rows) == 500),
+        }
+    result["durationMs"] = round((time.perf_counter() - started) * 1000, 2)
+finally:
+    connection.close()
+json.dumps(result)
+`);
+        return JSON.parse(String(raw));
+      }
+
+      function mysqlConnectionSettings() {
+        return {
+          host: String($id("databaseMysqlHost")?.value || "127.0.0.1").trim(),
+          port: Number($id("databaseMysqlPort")?.value || 3306),
+          user: String($id("databaseMysqlUser")?.value || "root").trim(),
+          password: String($id("databaseMysqlPassword")?.value || ""),
+          database: String($id("databaseMysqlDatabase")?.value || "").trim(),
+        };
+      }
+
+      function saveMysqlConnectionPreferences() {
+        const { host, port, user, database } = mysqlConnectionSettings();
+        localStorage.setItem("edgeterm.database.mysql", JSON.stringify({ host, port, user, database }));
+      }
+
+      function loadMysqlConnectionPreferences() {
+        let saved = {};
+        try { saved = JSON.parse(localStorage.getItem("edgeterm.database.mysql") || "{}"); } catch {}
+        if (saved.host) $id("databaseMysqlHost").value = saved.host;
+        if (saved.port) $id("databaseMysqlPort").value = saved.port;
+        if (saved.user) $id("databaseMysqlUser").value = saved.user;
+        if (saved.database) $id("databaseMysqlDatabase").dataset.preferred = saved.database;
+      }
+
+      async function runMysqlDatabaseAction(action, payload = {}) {
+        if (WORKER_SHELL_ENABLED) {
+          throw new Error("MySQL connections require the EdgeTerm server runtime. SQLite is available in this embedded workspace.");
+        }
+        const response = await fetch("/api/database/mysql", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action, connection: mysqlConnectionSettings(), ...payload }),
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.error || `MySQL request failed (${response.status})`);
+        return result;
+      }
+
+      function setDatabaseEngine(engine) {
+        databaseState.engine = engine === "mysql" ? "mysql" : "sqlite";
+        document.querySelectorAll("[data-database-engine]").forEach((button) => {
+          button.classList.toggle("active", button.dataset.databaseEngine === databaseState.engine);
+        });
+        $id("databaseSqliteToolbar")?.classList.toggle("hidden", databaseState.engine !== "sqlite");
+        $id("databaseMysqlToolbar")?.classList.toggle("hidden", databaseState.engine !== "mysql");
+        $id("databaseWordPressShortcut")?.classList.toggle("hidden", databaseState.engine !== "sqlite");
+        $id("databaseDjangoShortcut")?.classList.toggle("hidden", databaseState.engine !== "sqlite");
+        $id("databasePagination")?.classList.add("hidden");
+        databaseState.schema = [];
+        databaseState.activeTable = "";
+        renderDatabaseSchema();
+        $id("databaseActiveName").textContent = databaseState.engine === "mysql" ? "Not connected" : "No database open";
+        $id("databaseQuery").value = databaseState.engine === "mysql"
+          ? "SHOW TABLE STATUS;"
+          : "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name;";
+        $id("databaseQueryLabel").textContent = databaseState.engine === "mysql" ? "MySQL" : "Ready";
+        setDatabaseStatus(databaseState.engine === "mysql" ? "Enter MySQL credentials and connect." : "Open a SQLite database to begin.");
+      }
+
+      async function connectMysqlDatabase() {
+        setDatabaseBusy(true);
+        setDatabaseStatus("Connecting to MySQL...");
+        try {
+          const result = await runMysqlDatabaseAction("databases");
+          databaseState.mysqlConnected = true;
+          databaseState.mysqlDatabases = Array.isArray(result.databases) ? result.databases : [];
+          const select = $id("databaseMysqlDatabase");
+          const selected = select.value || select.dataset.preferred || "";
+          select.innerHTML = '<option value="">Select a database...</option>';
+          for (const name of databaseState.mysqlDatabases) {
+            const option = document.createElement("option");
+            option.value = name;
+            option.textContent = name;
+            select.appendChild(option);
+          }
+          if (databaseState.mysqlDatabases.includes(selected)) select.value = selected;
+          else if (databaseState.mysqlDatabases.length) select.value = databaseState.mysqlDatabases[0];
+          saveMysqlConnectionPreferences();
+          if (select.value) await refreshDatabaseSchema({ renderResults: true });
+          $id("databaseActiveName").textContent = select.value || "MySQL server";
+          setDatabaseStatus(`Connected · ${databaseState.mysqlDatabases.length} databases`, `${result.durationMs} ms`);
+        } finally {
+          setDatabaseBusy(false);
+        }
+      }
+
+      function rememberDatabaseQuery(statement) {
+        const entry = { engine: databaseState.engine, sql: statement, at: Date.now() };
+        databaseState.history = [entry, ...databaseState.history.filter((item) => item.sql !== statement)].slice(0, 30);
+        localStorage.setItem("edgeterm.database.history", JSON.stringify(databaseState.history));
+      }
+
+      function displayDatabaseValue(value) {
+        if (value === null) return { text: "NULL", title: "NULL" };
+        if (value && typeof value === "object" && value.type === "blob") {
+          return { text: `<BLOB ${value.bytes} bytes>`, title: value.hex || "Binary data" };
+        }
+        const text = String(value);
+        return { text, title: text };
+      }
+
+      function renderDatabaseResults(result = {}) {
+        const host = $id("databaseResults");
+        if (!host) return;
+        host.innerHTML = "";
+        const columns = Array.isArray(result.columns) ? result.columns : [];
+        const rows = Array.isArray(result.rows) ? result.rows : [];
+        if (!columns.length) {
+          const empty = document.createElement("div");
+          empty.className = "database-empty-result";
+          empty.textContent = result.changes
+            ? `${result.changes} row${result.changes === 1 ? "" : "s"} changed successfully.`
+            : "Query completed without a result set.";
+          host.appendChild(empty);
+          return;
+        }
+        const table = document.createElement("table");
+        table.className = "database-result-table";
+        const head = document.createElement("thead");
+        const headRow = document.createElement("tr");
+        for (const column of columns) {
+          const cell = document.createElement("th");
+          cell.textContent = String(column);
+          headRow.appendChild(cell);
+        }
+        head.appendChild(headRow);
+        const body = document.createElement("tbody");
+        for (const row of rows) {
+          const tableRow = document.createElement("tr");
+          for (let index = 0; index < columns.length; index += 1) {
+            const cell = document.createElement("td");
+            const value = displayDatabaseValue(row[index]);
+            cell.textContent = value.text;
+            cell.title = value.title;
+            tableRow.appendChild(cell);
+          }
+          body.appendChild(tableRow);
+        }
+        table.append(head, body);
+        host.appendChild(table);
+      }
+
+      function renderDatabaseSchema() {
+        const host = $id("databaseTableList");
+        if (!host) return;
+        host.innerHTML = "";
+        if (!databaseState.schema.length) {
+          const empty = document.createElement("div");
+          empty.className = "database-empty-small";
+          empty.textContent = "This database has no user tables or views.";
+          host.appendChild(empty);
+          return;
+        }
+        for (const item of databaseState.schema) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "database-table-button";
+          button.classList.toggle("active", item.name === databaseState.activeTable);
+          button.dataset.databaseTable = item.name;
+          button.innerHTML = `<i data-lucide="${item.type === "view" ? "panel-top" : "table-2"}"></i>`;
+          const label = document.createElement("span");
+          label.textContent = item.name;
+          const kind = document.createElement("small");
+          kind.textContent = item.type;
+          button.append(label, kind);
+          host.appendChild(button);
+        }
+        window.lucide?.createIcons();
+      }
+
+      async function refreshDatabaseSchema(options = {}) {
+        if (databaseState.engine === "mysql" && !mysqlConnectionSettings().database) return;
+        if (databaseState.engine === "sqlite" && !databaseState.path) return;
+        const result = databaseState.engine === "mysql"
+          ? await runMysqlDatabaseAction("schema")
+          : await runDatabasePython({ operation: "schema", path: databaseState.path });
+        databaseState.schema = Array.isArray(result.schema) ? result.schema : [];
+        renderDatabaseSchema();
+        if (options.renderResults) renderDatabaseResults(result);
+        return result;
+      }
+
+      async function openDatabase(path = "") {
+        const target = normalizePath(String(path || $id("databasePath")?.value || "").trim());
+        const exists = WORKER_SHELL_ENABLED ? await workerFsIsFile(target) : !!target && fsPathExists(target) && fsIsFile(target);
+        if (!target || !exists) {
+          throw new Error(`Database file not found: ${target}`);
+        }
+        setDatabaseBusy(true);
+        setDatabaseStatus(`Opening ${target}...`);
+        try {
+          databaseState.path = target;
+          databaseState.activeTable = "";
+          $id("databasePath").value = target;
+          $id("databaseActiveName").textContent = databaseFileName(target);
+          const schemaResult = await refreshDatabaseSchema({ renderResults: true });
+          setDatabaseStatus(
+            `Opened ${target} · ${databaseState.schema.length} object${databaseState.schema.length === 1 ? "" : "s"}`,
+            `${schemaResult.durationMs} ms`
+          );
+        } finally {
+          setDatabaseBusy(false);
+        }
+      }
+
+      async function executeDatabaseQuery(query = "") {
+        if (databaseState.engine === "sqlite" && !databaseState.path) throw new Error("Open a database before running SQL.");
+        if (databaseState.engine === "mysql" && !mysqlConnectionSettings().database) throw new Error("Select a MySQL database before running SQL.");
+        const statement = String(query || $id("databaseQuery")?.value || "").trim();
+        if (!statement) throw new Error("Enter a SQL statement first.");
+        setDatabaseBusy(true);
+        setDatabaseStatus("Running SQL...");
+        try {
+          const result = databaseState.engine === "mysql"
+            ? await runMysqlDatabaseAction("query", { query: statement })
+            : await runDatabasePython({ operation: "query", path: databaseState.path, query: statement });
+          rememberDatabaseQuery(statement);
+          renderDatabaseResults(result);
+          const rowLabel = result.columns?.length
+            ? `${result.rows.length}${result.truncated ? "+" : ""} row${result.rows.length === 1 ? "" : "s"}`
+            : `${result.changes || 0} row${result.changes === 1 ? "" : "s"} changed`;
+          setDatabaseStatus(`Query completed · ${rowLabel}`, `${result.durationMs} ms`);
+          await refreshDatabaseSchema();
+          if (databaseState.engine === "sqlite") schedulePersistActiveWorkspace(250);
+          return result;
+        } catch (err) {
+          const host = $id("databaseResults");
+          if (host) {
+            host.innerHTML = "";
+            const error = document.createElement("div");
+            error.className = "database-error";
+            error.textContent = err?.message || String(err);
+            host.appendChild(error);
+          }
+          setDatabaseStatus("Query failed.");
+          throw err;
+        } finally {
+          setDatabaseBusy(false);
+        }
+      }
+
+      async function openDatabaseTable(name) {
+        const tableName = String(name || "");
+        if (!tableName) return;
+        databaseState.activeTable = tableName;
+        renderDatabaseSchema();
+        if (databaseState.engine === "mysql") {
+          databaseState.pageOffset = 0;
+          const result = await runMysqlDatabaseAction("browse", { table: tableName, limit: databaseState.pageLimit, offset: 0 });
+          databaseState.pageTotal = Number(result.total || 0);
+          renderDatabaseResults(result);
+          $id("databaseQuery").value = `SELECT * FROM \`${tableName.replaceAll("`", "``")}\` LIMIT ${databaseState.pageLimit};`;
+          $id("databaseQueryLabel").textContent = tableName;
+          renderDatabasePagination();
+          setDatabaseStatus(`Browsing ${tableName} · ${result.rows.length} of ${result.total} rows`, `${result.durationMs} ms`);
+          return;
+        }
+        const escaped = tableName.replaceAll('"', '""');
+        const statement = `SELECT rowid AS __rowid__, * FROM "${escaped}" LIMIT 100;`;
+        $id("databaseQuery").value = statement;
+        $id("databaseQueryLabel").textContent = tableName;
+        try {
+          await executeDatabaseQuery(statement);
+        } catch (err) {
+          if (/no such column: rowid/i.test(err?.message || "")) {
+            const fallback = `SELECT * FROM "${escaped}" LIMIT 100;`;
+            $id("databaseQuery").value = fallback;
+            await executeDatabaseQuery(fallback);
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      async function openDatabaseShortcut(kind) {
+        if (!databaseState.databases.length) await refreshDatabaseDiscovery();
+        const matcher = kind === "wordpress"
+          ? (path) => /\/wp-content\/database\/|wordpress.*\.(?:db|sqlite|sqlite3)$/i.test(path)
+          : (path) => /\/db\.sqlite3$/i.test(path) && !/wp-content/i.test(path);
+        const target = databaseState.databases.find(matcher);
+        if (!target) throw new Error(`No ${kind === "wordpress" ? "WordPress" : "Django"} SQLite database was found.`);
+        await openDatabase(target);
+      }
+
+      async function importDatabaseFile(file) {
+        if (!file) return;
+        const defaultPath = normalizePath(`/home/${activeUser()}/${file.name || "imported.sqlite"}`);
+        const target = await askText("Import SQLite Database", "Destination path", defaultPath, { confirmLabel: "Import" });
+        if (!target) return;
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        if (WORKER_SHELL_ENABLED) {
+          await workerFs("writeFile", { path: normalizePath(target), data: bytesToBase64(bytes), encoding: "base64" });
+        } else {
+          await writeRuntimeFileAndMirror(normalizePath(target), bytes);
+        }
+        await persistActiveWorkspace();
+        await refreshDatabaseDiscovery();
+        await openDatabase(target);
+        showNotice(`Imported ${databaseFileName(target)}`);
+      }
+
+      async function exportCurrentDatabase() {
+        if (databaseState.engine === "mysql") {
+          await exportMysqlDatabase();
+          return;
+        }
+        const exists = WORKER_SHELL_ENABLED
+          ? await workerFsIsFile(databaseState.path)
+          : !!databaseState.path && fsPathExists(databaseState.path);
+        if (!exists) {
+          showNotice("Open a database before exporting it.");
+          return;
+        }
+        const bytes = WORKER_SHELL_ENABLED
+          ? decodeBase64Bytes(await workerReadBase64(databaseState.path))
+          : pyodide.FS.readFile(databaseState.path);
+        const url = URL.createObjectURL(new Blob([bytes], { type: "application/vnd.sqlite3" }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = databaseFileName();
+        link.click();
+        URL.revokeObjectURL(url);
+        showNotice(`Exported ${databaseFileName()}`);
+      }
+
+      async function exportMysqlDatabase() {
+        setDatabaseBusy(true);
+        setDatabaseStatus("Exporting MySQL database...");
+        try {
+          const result = await runMysqlDatabaseAction("export");
+          const url = URL.createObjectURL(new Blob([result.sql || ""], { type: "application/sql;charset=utf-8" }));
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = result.fileName || "database.sql";
+          link.click();
+          URL.revokeObjectURL(url);
+          setDatabaseStatus(`Exported ${result.tableCount || 0} tables`, `${result.durationMs} ms`);
+        } finally {
+          setDatabaseBusy(false);
+        }
+      }
+
+      async function showMysqlStatus() {
+        const result = await runMysqlDatabaseAction("status");
+        renderDatabaseResults(result);
+        setDatabaseStatus(`MySQL ${result.status?.version || "server"}`, `${result.durationMs} ms`);
+      }
+
+      async function showDatabaseStructure() {
+        if (!databaseState.activeTable) throw new Error("Select a table first.");
+        if (databaseState.engine === "mysql") {
+          const result = await runMysqlDatabaseAction("structure", { table: databaseState.activeTable });
+          renderDatabaseResults(result);
+          $id("databaseQuery").value = result.createSql || $id("databaseQuery").value;
+          setDatabaseStatus(`Structure for ${databaseState.activeTable}`, `${result.durationMs} ms`);
+          return;
+        }
+        const item = databaseState.schema.find((entry) => entry.name === databaseState.activeTable);
+        $id("databaseQuery").value = item?.sql || `PRAGMA table_info("${databaseState.activeTable.replaceAll('"', '""')}");`;
+        await executeDatabaseQuery(`PRAGMA table_info("${databaseState.activeTable.replaceAll('"', '""')}");`);
+      }
+
+      function renderDatabasePagination() {
+        const panel = $id("databasePagination");
+        if (databaseState.engine !== "mysql" || !databaseState.activeTable) return panel?.classList.add("hidden");
+        panel.classList.remove("hidden");
+        const start = databaseState.pageTotal ? databaseState.pageOffset + 1 : 0;
+        const end = Math.min(databaseState.pageOffset + databaseState.pageLimit, databaseState.pageTotal);
+        $id("databasePageStatus").textContent = `${start}–${end} of ${databaseState.pageTotal}`;
+        $id("databasePreviousPage").disabled = databaseState.pageOffset <= 0;
+        $id("databaseNextPage").disabled = end >= databaseState.pageTotal;
+      }
+
+      async function changeDatabasePage(direction) {
+        if (!databaseState.activeTable) return;
+        databaseState.pageOffset = Math.max(0, databaseState.pageOffset + direction * databaseState.pageLimit);
+        const result = await runMysqlDatabaseAction("browse", { table: databaseState.activeTable, limit: databaseState.pageLimit, offset: databaseState.pageOffset });
+        databaseState.pageTotal = Number(result.total || 0);
+        renderDatabaseResults(result);
+        renderDatabasePagination();
+        setDatabaseStatus(`Browsing ${databaseState.activeTable}`, `${result.durationMs} ms`);
+      }
+
+      async function showDatabaseHistory() {
+        const choices = databaseState.history.filter((item) => item.engine === databaseState.engine);
+        if (!choices.length) return showNotice("No SQL history yet.");
+        const selected = await askText("SQL History", "Paste or edit a recent query", choices[0].sql, { confirmLabel: "Use query" });
+        if (selected) $id("databaseQuery").value = selected;
+      }
+
+      async function importMysqlSql(file) {
+        if (!file) return;
+        const sql = await file.text();
+        $id("databaseQuery").value = sql;
+        const confirmed = await askConfirm("Import SQL", `Run ${file.name} against ${mysqlConnectionSettings().database}?`, { confirmLabel: "Run import", danger: true });
+        if (confirmed) await executeDatabaseQuery(sql);
+      }
+
+      function developerProjectRoot() {
+        return normalizePath(String($id("developerProjectRoot")?.value || `/home/${activeUser()}`).trim());
+      }
+
+      function setDeveloperStatus(id, message, kind = "") {
+        const target = $id(id);
+        if (!target) return;
+        target.textContent = String(message || "");
+        if (kind) target.dataset.kind = kind;
+        else delete target.dataset.kind;
+      }
+
+      function setDeveloperBusy(busy) {
+        developerState.busy = !!busy;
+        document.querySelectorAll("#developerView button").forEach((button) => {
+          button.disabled = !!busy;
+        });
+      }
+
+      function selectDeveloperPanel(name) {
+        developerState.activePanel = String(name || "git");
+        document.querySelectorAll("[data-developer-panel]").forEach((button) => {
+          button.classList.toggle("active", button.dataset.developerPanel === developerState.activePanel);
+        });
+        document.querySelectorAll("[data-developer-panel-content]").forEach((panel) => {
+          panel.classList.toggle("active", panel.dataset.developerPanelContent === developerState.activePanel);
+        });
+        if (developerState.activePanel === "logs") renderDeveloperLogs();
+        if (developerState.activePanel === "snapshots") renderLocalSnapshots();
+        if (developerState.activePanel === "templates") renderTemplateMarketplace();
+        window.lucide?.createIcons();
+      }
+
+      async function runGitPython(operation, options = {}) {
+        const requestedRoot = assertBridgeWorkspacePath(
+          options.root || developerProjectRoot(),
+        );
+        const requestedPaths = Array.isArray(options.paths)
+          ? options.paths.map((path) => String(path || "").trim()).filter(Boolean)
+          : [];
+        if (WORKER_SHELL_ENABLED) {
+          return await workerFs("developerGit", {
+            operation,
+            root: requestedRoot,
+            message: options.message || "Update project",
+            paths: requestedPaths,
+          });
+        }
+        if (!options.skipMount) await ensureActiveWorkspaceMounted("Loading project files...");
+        await pyodide.loadPackage("micropip");
+        pyodide.globals.set("__edgeterm_git_payload", JSON.stringify({
+          operation,
+          root: requestedRoot,
+          message: options.message || "Update project",
+          paths: requestedPaths,
+        }));
+        const raw = await pyodide.runPythonAsync(`
+import difflib
+import json
+import os
+import subprocess
+import time
+
+payload = json.loads(__edgeterm_git_payload)
+root = os.path.abspath(payload.get("root") or "/home/user")
+operation = payload.get("operation") or "status"
+
+if not hasattr(subprocess.Popen, "__class_getitem__"):
+    subprocess.Popen.__class_getitem__ = classmethod(lambda cls, item: cls)
+
+try:
+    from dulwich import porcelain
+    from dulwich.repo import Repo
+except ImportError:
+    import micropip
+    await micropip.install("dulwich")
+    from dulwich import porcelain
+    from dulwich.repo import Repo
+
+os.makedirs(root, exist_ok=True)
+
+if operation == "init" and not os.path.isdir(os.path.join(root, ".git")):
+    Repo.init(root)
+
+if not os.path.isdir(os.path.join(root, ".git")):
+    result = {"initialized": False, "root": root, "branch": "", "staged": [], "unstaged": [], "untracked": [], "history": []}
+else:
+    repo = Repo(root)
+
+    if operation == "commit":
+        paths = [str(path) for path in payload.get("paths", []) if str(path).strip()]
+        if not paths:
+            current_status = porcelain.status(repo)
+            paths = sorted({
+                path.decode("utf-8", "replace") if isinstance(path, bytes) else str(path)
+                for changed_paths in current_status.staged.values()
+                for path in changed_paths
+            } | {
+                path.decode("utf-8", "replace") if isinstance(path, bytes) else str(path)
+                for path in current_status.unstaged
+            } | {
+                path.decode("utf-8", "replace") if isinstance(path, bytes) else str(path)
+                for path in current_status.untracked
+            })
+        if not paths:
+            raise ValueError("There are no changes to commit")
+        porcelain.add(repo, paths=paths)
+        commit_id = porcelain.commit(
+            repo,
+            message=(payload.get("message") or "Update project").encode("utf-8"),
+            author=b"EdgeTerm User <user@edgeterm.local>",
+            committer=b"EdgeTerm User <user@edgeterm.local>",
+            no_verify=True,
+        )
+    else:
+        commit_id = b""
+
+    def clean_path(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8", "replace")
+        return str(value)
+
+    status = porcelain.status(repo)
+    staged = []
+    for change_type, paths in status.staged.items():
+        for path in paths:
+            staged.append({"path": clean_path(path), "state": clean_path(change_type)})
+    unstaged = [{"path": clean_path(path), "state": "modified"} for path in status.unstaged]
+    untracked = [{"path": clean_path(path), "state": "untracked"} for path in status.untracked]
+    try:
+        branch = porcelain.active_branch(repo).decode("utf-8", "replace")
+    except Exception:
+        branch = "HEAD"
+    history = []
+    try:
+        for entry in repo.get_walker(max_entries=12):
+            commit = entry.commit
+            history.append({
+                "id": commit.id.decode("ascii", "replace")[:10],
+                "message": commit.message.decode("utf-8", "replace").strip(),
+                "author": commit.author.decode("utf-8", "replace"),
+                "time": int(commit.commit_time),
+            })
+    except Exception:
+        pass
+    diff_text = ""
+    if operation == "diff":
+        head_files = {}
+        try:
+            from dulwich.object_store import iter_tree_contents
+            commit = repo[repo.head()]
+            for tree_entry in iter_tree_contents(repo.object_store, commit.tree):
+                entry_path = clean_path(tree_entry.path)
+                blob = repo[tree_entry.sha]
+                head_files[entry_path] = bytes(blob.data)
+        except Exception:
+            head_files = {}
+        changed_paths = {
+            clean_path(path)
+            for paths in status.staged.values()
+            for path in paths
+        }
+        changed_paths.update(clean_path(path) for path in status.unstaged)
+        changed_paths.update(clean_path(path) for path in status.untracked)
+        rendered = []
+        for changed_path in sorted(changed_paths):
+            before_bytes = head_files.get(changed_path, b"")
+            absolute_path = os.path.join(root, changed_path)
+            try:
+                with open(absolute_path, "rb") as handle:
+                    after_bytes = handle.read()
+            except FileNotFoundError:
+                after_bytes = b""
+            if before_bytes == after_bytes:
+                continue
+            before_text = before_bytes.decode("utf-8", "replace").splitlines(True)
+            after_text = after_bytes.decode("utf-8", "replace").splitlines(True)
+            rendered.extend(difflib.unified_diff(
+                before_text,
+                after_text,
+                fromfile=f"a/{changed_path}",
+                tofile=f"b/{changed_path}",
+            ))
+        diff_text = "".join(rendered)
+    result = {
+        "initialized": True,
+        "root": root,
+        "branch": branch,
+        "staged": staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+        "history": history,
+        "commit": clean_path(commit_id)[:10] if commit_id else "",
+        "diff": diff_text,
+        "diff_available": operation == "diff",
+    }
+
+json.dumps(result)
+`);
+        return JSON.parse(String(raw));
+      }
+
+      function renderGitResults(result) {
+        const host = $id("gitResults");
+        if (!host) return;
+        host.innerHTML = "";
+        if (!result?.initialized) {
+          host.innerHTML = '<div class="developer-result-card"><div><strong>Not initialized</strong><span>Create a Git repository in this project root.</span></div></div>';
+          return;
+        }
+        const changes = [...(result.staged || []), ...(result.unstaged || []), ...(result.untracked || [])];
+        const summary = document.createElement("div");
+        summary.className = "developer-result-card";
+        const copy = document.createElement("div");
+        const badge = document.createElement("span");
+        badge.className = `developer-badge ${changes.length ? "warn" : "good"}`;
+        badge.textContent = changes.length ? `${changes.length} changed` : "Clean";
+        const title = document.createElement("strong");
+        title.textContent = `Branch ${result.branch || "HEAD"}`;
+        const detail = document.createElement("span");
+        detail.textContent = result.root || developerProjectRoot();
+        copy.append(badge, title, detail);
+        summary.appendChild(copy);
+        host.appendChild(summary);
+        for (const change of changes.slice(0, 80)) {
+          const row = document.createElement("div");
+          row.className = "developer-list-row";
+          const rowCopy = document.createElement("div");
+          const rowBadge = document.createElement("span");
+          rowBadge.className = `developer-badge ${change.state === "untracked" ? "warn" : ""}`;
+          rowBadge.textContent = change.state || "changed";
+          const path = document.createElement("strong");
+          path.textContent = change.path;
+          rowCopy.append(rowBadge, path);
+          row.appendChild(rowCopy);
+          host.appendChild(row);
+        }
+        for (const commit of result.history || []) {
+          const row = document.createElement("div");
+          row.className = "developer-list-row";
+          const copy = document.createElement("div");
+          const badge = document.createElement("span");
+          badge.className = "developer-badge good";
+          badge.textContent = commit.id;
+          const message = document.createElement("strong");
+          message.textContent = commit.message || "Commit";
+          const detail = document.createElement("span");
+          detail.textContent = `${commit.author} · ${new Date(commit.time * 1000).toLocaleString()}`;
+          copy.append(badge, message, detail);
+          row.appendChild(copy);
+          host.appendChild(row);
+        }
+      }
+
+      async function refreshGitStatus(operation = "status") {
+        setDeveloperBusy(true);
+        setDeveloperStatus("gitStatus", operation === "init" ? "Preparing Git support and initializing repository..." : "Reading Git status...");
+        try {
+          const result = await runGitPython(operation);
+          renderGitResults(result);
+          setDeveloperStatus("gitStatus", result.initialized
+            ? `${result.branch || "HEAD"} · ${(result.staged?.length || 0) + (result.unstaged?.length || 0) + (result.untracked?.length || 0)} changed file(s)`
+            : "This directory is not a Git repository.");
+          await persistActiveWorkspace();
+          return result;
+        } finally {
+          setDeveloperBusy(false);
+        }
+      }
+
+      async function commitGitChanges() {
+        const message = String($id("gitCommitMessage")?.value || "").trim();
+        if (!message) throw new Error("Enter a commit message first.");
+        setDeveloperBusy(true);
+        setDeveloperStatus("gitStatus", "Staging and committing project files...");
+        try {
+          const result = await runGitPython("commit", { message });
+          renderGitResults(result);
+          setDeveloperStatus("gitStatus", result.commit ? `Created commit ${result.commit}.` : "Nothing to commit.");
+          await persistActiveWorkspace();
+        } finally {
+          setDeveloperBusy(false);
+        }
+      }
+
+      function githubRepositoryParts(value) {
+        const text = String(value || "").trim().replace(/\.git$/i, "");
+        const match = text.match(/^(?:https?:\/\/github\.com\/|git@github\.com:)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/i);
+        if (!match) throw new Error("Enter a public GitHub repository URL such as https://github.com/owner/repository.");
+        return { owner: match[1], repo: match[2] };
+      }
+
+      async function fetchDeveloperResource(url) {
+        try {
+          const response = await fetch(url);
+          if (response.ok) return { status: response.status, bytes: new Uint8Array(await response.arrayBuffer()) };
+        } catch {}
+        const proxyResponse = await fetch("/__edgeterm_http_proxy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url, method: "GET", headers: {} }),
+        });
+        if (!proxyResponse.ok) throw new Error(`Download proxy failed with HTTP ${proxyResponse.status}.`);
+        const payload = await proxyResponse.json();
+        if (!payload.ok || Number(payload.status || 0) >= 400) {
+          throw new Error(`Download failed with HTTP ${payload.status || proxyResponse.status}.`);
+        }
+        const binary = atob(payload.body_base64 || "");
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+        return { status: Number(payload.status || 200), bytes };
+      }
+
+      async function importGithubRepository() {
+        const { owner, repo } = githubRepositoryParts($id("githubRepositoryUrl")?.value);
+        const defaultTarget = normalizePath(`${developerProjectRoot()}/${repo}`);
+        const target = await askText("Import GitHub Repository", "Destination path", defaultTarget, { confirmLabel: "Import" });
+        if (!target) return;
+        setDeveloperBusy(true);
+        setDeveloperStatus("gitStatus", `Reading ${owner}/${repo} metadata...`);
+        try {
+          await ensureActiveWorkspaceMounted("Loading project files before import...");
+          let branch = "main";
+          try {
+            const metadata = await fetchDeveloperResource(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`);
+            branch = JSON.parse(new TextDecoder().decode(metadata.bytes)).default_branch || branch;
+          } catch {}
+          const archive = await fetchDeveloperResource(`https://codeload.github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/zip/refs/heads/${encodeURIComponent(branch)}`);
+          const zip = await JSZip.loadAsync(archive.bytes);
+          const prefix = normalizeZipEntries(zip)[0]?.split("/")[0] || "";
+          const targetExists = WORKER_SHELL_ENABLED ? (await workerFsStat(target)).exists : fsPathExists(target);
+          if (targetExists) {
+            const replace = await askConfirm("Replace destination", `${target} already exists. Replace it?`, { confirmLabel: "Replace", danger: true });
+            if (!replace) return;
+            if (WORKER_SHELL_ENABLED) await workerFs("removeTree", { path: target });
+            else removeTree(target);
+          }
+          const archiveEntries = collectZipEntries(zip, prefix);
+          const fileEntries = archiveEntries.filter(({ entry }) => !entry.dir);
+          if (!fileEntries.length) throw new Error("The GitHub archive did not contain any project files.");
+          if (WORKER_SHELL_ENABLED) await workerFs("mkdir", { path: normalizePath(target) });
+          else ensureDir(normalizePath(target));
+          for (const { relative, entry } of archiveEntries) {
+            const destination = normalizePath(`${target}/${relative}`);
+            if (entry.dir) {
+              if (WORKER_SHELL_ENABLED) await workerFs("mkdir", { path: destination });
+              else ensureDir(destination);
+            } else {
+              const bytes = await entry.async("uint8array");
+              if (WORKER_SHELL_ENABLED) {
+                await workerFs("writeFile", { path: destination, data: bytesToBase64(bytes), encoding: "base64" });
+              } else {
+                await writeRuntimeFileAndMirror(destination, bytes);
+              }
+            }
+          }
+          let importedFiles = 0;
+          for (const { relative } of fileEntries) {
+            const importedPath = normalizePath(`${target}/${relative}`);
+            if (WORKER_SHELL_ENABLED ? await workerFsIsFile(importedPath) : fsPathExists(importedPath)) importedFiles += 1;
+          }
+          if (importedFiles !== fileEntries.length) {
+            throw new Error(`GitHub import verification failed: ${importedFiles} of ${fileEntries.length} files were written.`);
+          }
+          $id("developerProjectRoot").value = normalizePath(target);
+          const gitResult = await runGitPython("init", { skipMount: true });
+          renderGitResults(gitResult);
+          await persistActiveWorkspace();
+          setDeveloperStatus("gitStatus", `Imported ${owner}/${repo} (${branch}) · ${importedFiles} file(s).`);
+        } finally {
+          setDeveloperBusy(false);
+        }
+      }
+
+      async function downloadDeveloperProject() {
+        const root = developerProjectRoot();
+        if (WORKER_SHELL_ENABLED) {
+          if (!(await workerFsIsDir(root))) throw new Error(`Project root not found: ${root}`);
+          await downloadWorkerSelectedPaths([root]);
+          return;
+        }
+        if (!fsPathExists(root)) throw new Error(`Project root not found: ${root}`);
+        await downloadPath(root);
+      }
+
+      function parsePythonRequirements(text) {
+        return String(text || "").split(/\r?\n/)
+          .map((line) => line.replace(/#.*$/, "").trim())
+          .filter((line) => line && !line.startsWith("-") && !/^https?:/i.test(line))
+          .map((line) => line.split(";", 1)[0].split("[", 1)[0].split(/[<>=!~ ]/, 1)[0].trim())
+          .filter(Boolean);
+      }
+
+      async function installedPythonPackages() {
+        if (WORKER_SHELL_ENABLED) return await workerFs("installedPythonPackages");
+        pyodide.globals.set("__edgeterm_dependency_probe", "1");
+        const raw = await pyodide.runPythonAsync(`
+import importlib.metadata
+import json
+import re
+
+def normalized(value):
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+packages = {}
+for distribution in importlib.metadata.distributions():
+    name = distribution.metadata.get("Name") or ""
+    if name:
+        packages[normalized(name)] = distribution.version
+json.dumps(packages)
+`);
+        return JSON.parse(String(raw));
+      }
+
+      function renderDependencyResults(items) {
+        const host = $id("dependencyResults");
+        if (!host) return;
+        host.innerHTML = "";
+        if (!items.length) {
+          host.innerHTML = '<div class="developer-result-card"><div><strong>No dependency files found</strong><span>Add requirements.txt or package.json to this project.</span></div></div>';
+          return;
+        }
+        for (const item of items) {
+          const row = document.createElement("div");
+          row.className = "developer-list-row";
+          const copy = document.createElement("div");
+          const badge = document.createElement("span");
+          badge.className = `developer-badge ${item.state === "installed" ? "good" : item.state === "missing" ? "bad" : "warn"}`;
+          badge.textContent = item.state;
+          const title = document.createElement("strong");
+          title.textContent = `${item.ecosystem} · ${item.name}`;
+          const detail = document.createElement("span");
+          detail.textContent = item.detail || item.source || "";
+          copy.append(badge, title, detail);
+          row.appendChild(copy);
+          host.appendChild(row);
+        }
+      }
+
+      async function scanDependencies() {
+        setDeveloperBusy(true);
+        setDeveloperStatus("dependencyStatus", "Scanning dependency declarations...");
+        try {
+          await ensureActiveWorkspaceMounted("Loading project files...");
+          const root = developerProjectRoot();
+          const items = [];
+          const installed = await installedPythonPackages();
+          const pathExists = async (path) => WORKER_SHELL_ENABLED ? (await workerFsStat(path)).exists : fsPathExists(path);
+          const readText = async (path) => WORKER_SHELL_ENABLED ? await workerReadText(path) : readFsText(path);
+          const requirementsPath = `${root}/requirements.txt`;
+          if (await pathExists(requirementsPath)) {
+            for (const name of parsePythonRequirements(await readText(requirementsPath))) {
+              const normalized = name.toLowerCase().replace(/[-_.]+/g, "-");
+              items.push({ ecosystem: "Python", name, state: installed[normalized] ? "installed" : "missing", detail: installed[normalized] ? `Version ${installed[normalized]}` : requirementsPath, source: requirementsPath });
+            }
+          }
+          const packageJsonPath = `${root}/package.json`;
+          if (await pathExists(packageJsonPath)) {
+            const manifest = JSON.parse(await readText(packageJsonPath));
+            for (const [name, version] of Object.entries({ ...(manifest.dependencies || {}), ...(manifest.devDependencies || {}) })) {
+              const installedPath = `${root}/node_modules/${name}/package.json`;
+              items.push({ ecosystem: "Node", name, state: (await pathExists(installedPath)) ? "installed" : "declared", detail: `${version} · ${packageJsonPath}`, source: packageJsonPath });
+            }
+          }
+          if ((await pathExists(`${root}/wp-settings.php`)) || (await pathExists(`${root}/composer.json`))) {
+            const phpReady = (await pathExists(packageManifestPath("php")))
+              || (await pathExists(persistedPackageRootPath("php")))
+              || (await pathExists(installedRuntimePackageManifestPath("php")));
+            items.push({ ecosystem: "PHP", name: "php", state: phpReady ? "installed" : "missing", detail: phpReady ? "EdgeTerm PHP runtime package" : "Run Repair missing to install the runtime", source: root });
+          }
+          developerState.dependencyItems = items;
+          renderDependencyResults(items);
+          const missing = items.filter((item) => item.state === "missing").length;
+          setDeveloperStatus("dependencyStatus", `${items.length} dependency item(s) · ${missing} missing.`);
+          return items;
+        } finally {
+          setDeveloperBusy(false);
+        }
+      }
+
+      async function repairDependencies() {
+        if (!developerState.dependencyItems.length) await scanDependencies();
+        const missingPython = developerState.dependencyItems.filter((item) => item.ecosystem === "Python" && item.state === "missing").map((item) => item.name);
+        const missingPhp = developerState.dependencyItems.some((item) => item.ecosystem === "PHP" && item.state === "missing");
+        if (!missingPython.length && !missingPhp) {
+          showNotice("No repairable dependencies are missing.");
+          return;
+        }
+        setDeveloperBusy(true);
+        setDeveloperStatus("dependencyStatus", "Installing missing dependencies...");
+        try {
+          if (missingPython.length) await runProjectShellCommand(`cd ${developerProjectRoot()} && pip install ${missingPython.join(" ")}`);
+          if (missingPhp) await runProjectShellCommand("apt install -y php");
+          await persistActiveWorkspace();
+        } finally {
+          setDeveloperBusy(false);
+        }
+        await scanDependencies();
+      }
+
+      function metricCard(label, value) {
+        const card = document.createElement("div");
+        card.className = "developer-metric";
+        const name = document.createElement("span");
+        name.textContent = label;
+        const amount = document.createElement("strong");
+        amount.textContent = String(value);
+        card.append(name, amount);
+        return card;
+      }
+
+      function renderDeveloperLogs() {
+        const entries = (window.EdgeTermServeLogs || []).slice(-250);
+        const failures = entries.filter((entry) => Number(entry.status || 0) >= 400 || entry.event === "failed");
+        const responses = entries.filter((entry) => entry.event === "response" || entry.event === "fetch");
+        const timings = responses.map((entry) => Number(entry.durationMs || 0)).filter(Number.isFinite);
+        const average = timings.length ? Math.round(timings.reduce((sum, value) => sum + value, 0) / timings.length) : 0;
+        const metrics = $id("developerLogSummary");
+        if (metrics) {
+          metrics.innerHTML = "";
+          metrics.append(metricCard("Events", entries.length), metricCard("Responses", responses.length), metricCard("Errors", failures.length), metricCard("Average", `${average} ms`));
+        }
+        const output = $id("developerLogOutput");
+        if (output) output.textContent = entries.length ? entries.map(edgeServeLogLine).join("\n") : "No EdgeServe requests recorded yet.";
+      }
+
+      function exportDeveloperLogs() {
+        const entries = window.EdgeTermServeLogs || [];
+        const blob = new Blob([JSON.stringify(entries, null, 2)], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `edgeterm-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+      }
+
+      function findWordPressSites(root = developerProjectRoot()) {
+        if (!fsPathExists(root)) return [];
+        const sites = [];
+        for (const target of collectTreeTargets(root)) {
+          if (!target.endsWith("/wp-settings.php")) continue;
+          const siteRoot = target.slice(0, -"/wp-settings.php".length) || "/";
+          const versionPath = `${siteRoot}/wp-includes/version.php`;
+          let version = "Unknown";
+          if (fsPathExists(versionPath)) {
+            const match = readFsText(versionPath).match(/\$wp_version\s*=\s*['\"]([^'\"]+)/);
+            if (match) version = match[1];
+          }
+          const database = collectTreeTargets(`${siteRoot}/wp-content`).find((path) => /\.(?:db|sqlite|sqlite3)$/i.test(path)) || "";
+          const pluginsPath = `${siteRoot}/wp-content/plugins`;
+          const plugins = fsPathExists(pluginsPath) ? pyodide.FS.readdir(pluginsPath).filter((name) => name !== "." && name !== ".." && name !== "index.php").length : 0;
+          sites.push({ root: siteRoot, version, database, plugins });
+        }
+        return sites;
+      }
+
+      function renderWordPressSites(sites) {
+        const host = $id("wordpressResults");
+        if (!host) return;
+        host.innerHTML = "";
+        if (!sites.length) {
+          host.innerHTML = '<div class="developer-result-card"><div><strong>No WordPress sites found</strong><span>Point Project root at a directory containing wp-settings.php.</span></div></div>';
+          return;
+        }
+        for (const site of sites) {
+          const row = document.createElement("div");
+          row.className = "developer-list-row";
+          const copy = document.createElement("div");
+          const badge = document.createElement("span");
+          badge.className = `developer-badge ${site.database ? "good" : "warn"}`;
+          badge.textContent = site.database ? "SQLite ready" : "Database not found";
+          const title = document.createElement("strong");
+          title.textContent = `WordPress ${site.version}`;
+          const detail = document.createElement("span");
+          detail.textContent = `${site.root} · ${site.plugins} plugin(s)`;
+          copy.append(badge, title, detail);
+          const actions = document.createElement("div");
+          actions.className = "developer-row-actions";
+          for (const [action, label] of [["open", "Open site"], ["database", "Database"], ["repair", "Repair PHP"]]) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "icon-button button-ghost";
+            button.dataset.wordpressAction = action;
+            button.dataset.wordpressRoot = site.root;
+            button.textContent = label;
+            actions.appendChild(button);
+          }
+          row.append(copy, actions);
+          host.appendChild(row);
+        }
+      }
+
+      async function scanWordPressSites() {
+        setDeveloperBusy(true);
+        setDeveloperStatus("wordpressStatus", "Scanning for WordPress installations...");
+        try {
+          await ensureActiveWorkspaceMounted("Loading WordPress files...");
+          developerState.wordpressSites = WORKER_SHELL_ENABLED
+            ? (await workerFs("developerWordPressScan", { root: developerProjectRoot() })).sites || []
+            : findWordPressSites();
+          renderWordPressSites(developerState.wordpressSites);
+          setDeveloperStatus("wordpressStatus", `Found ${developerState.wordpressSites.length} WordPress site(s).`);
+        } finally {
+          setDeveloperBusy(false);
+        }
+      }
+
+      async function handleWordPressAction(event) {
+        const button = event.target.closest("[data-wordpress-action]");
+        if (!button) return;
+        const site = developerState.wordpressSites.find((item) => item.root === button.dataset.wordpressRoot);
+        if (!site) return;
+        button.disabled = true;
+        try {
+          if (button.dataset.wordpressAction === "open") {
+            const instance = await launchProject({ id: "wordpress", ...PROJECT_TEMPLATES.wordpress }, site.root);
+            await openRunCenterEntry(instance);
+          } else if (button.dataset.wordpressAction === "database") {
+            if (!site.database) throw new Error("No SQLite database was found for this WordPress site.");
+            await openDatabase(site.database);
+            setView("databaseView");
+          } else if (button.dataset.wordpressAction === "repair") {
+            setDeveloperStatus("wordpressStatus", "Reinstalling and verifying the PHP runtime...");
+            await runProjectShellCommand("apt install -y php");
+            await persistActiveWorkspace();
+            setDeveloperStatus("wordpressStatus", "PHP runtime repair completed.");
+          }
+        } finally {
+          button.disabled = false;
+        }
+      }
+
+      function localSnapshotKey() {
+        return `edgeterm.localSnapshots.${activeWorkspaceId || "default"}`;
+      }
+
+      function localSnapshotMetadata() {
+        try {
+          const value = JSON.parse(localStorage.getItem(localSnapshotKey()) || "[]");
+          return Array.isArray(value) ? value : [];
+        } catch {
+          return [];
+        }
+      }
+
+      function saveLocalSnapshotMetadata(items) {
+        localStorage.setItem(localSnapshotKey(), JSON.stringify(items.slice(0, 30)));
+      }
+
+      function localSnapshotPath(id) {
+        if (WORKER_SHELL_ENABLED) {
+          return `/home/${activeUser()}/.local/share/edgeterm/snapshots/${id}.zip`;
+        }
+        return workspacePath(activeWorkspaceId, `/snapshots/${id}.zip`);
+      }
+
+      async function addProjectToZip(zip, root, source = root) {
+        if (WORKER_SHELL_ENABLED) {
+          const listing = await workerFs("list", { path: source });
+          for (const entry of listing.entries || []) {
+            const relative = entry.path.slice(root.length).replace(/^\/+/, "");
+            if (
+              relative === ".git" ||
+              relative.startsWith(".git/") ||
+              relative === "node_modules" ||
+              relative.startsWith("node_modules/") ||
+              relative === ".venv" ||
+              relative.startsWith(".venv/") ||
+              relative === "venv" ||
+              relative.startsWith("venv/") ||
+              relative === "__pycache__" ||
+              relative.startsWith("__pycache__/") ||
+              relative.startsWith(".local/share/edgeterm/snapshots/")
+            ) {
+              continue;
+            }
+            if (entry.isDir) {
+              zip.folder(relative);
+              await addProjectToZip(zip, root, entry.path);
+            } else if (entry.isFile) {
+              zip.file(relative, base64ToBytes(await workerReadBase64(entry.path)));
+            }
+          }
+          return;
+        }
+        for (const entry of pyodide.FS.readdir(source)) {
+          if (entry === "." || entry === "..") continue;
+          const path = `${source}/${entry}`;
+          const relative = path.slice(root.length).replace(/^\/+/, "");
+          if (
+            relative === ".git" ||
+            relative.startsWith(".git/") ||
+            relative === "node_modules" ||
+            relative.startsWith("node_modules/") ||
+            relative === ".venv" ||
+            relative.startsWith(".venv/") ||
+              relative === "venv" ||
+              relative.startsWith("venv/") ||
+              relative === "__pycache__" ||
+              relative.startsWith("__pycache__/") ||
+              relative.startsWith(".local/share/edgeterm/snapshots/")
+            ) {
+            continue;
+          }
+          const stat = pyodide.FS.lstat(path);
+          if (pyodide.FS.isDir(stat.mode) && !pyodide.FS.isLink(stat.mode)) {
+            zip.folder(relative);
+            await addProjectToZip(zip, root, path);
+          } else if (pyodide.FS.isFile(stat.mode)) {
+            zip.file(relative, pyodide.FS.readFile(path));
+          }
+        }
+      }
+
+      async function createLocalSnapshot() {
+        const root = developerProjectRoot();
+        const rootExists = WORKER_SHELL_ENABLED ? await workerFsIsDir(root) : fsPathExists(root) && fsIsDir(root);
+        if (!rootExists) throw new Error(`Project root not found: ${root}`);
+        setDeveloperBusy(true);
+        setDeveloperStatus("snapshotStatus", "Compressing project files...");
+        try {
+          const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+          const zip = new JSZip();
+          await addProjectToZip(zip, root);
+          const bytes = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE", compressionOptions: { level: 6 } });
+          const path = localSnapshotPath(id);
+          if (WORKER_SHELL_ENABLED) {
+            await workerFs("writeFile", { path, data: bytesToBase64(bytes), encoding: "base64" });
+          } else {
+            ensureDir(path.split("/").slice(0, -1).join("/"));
+            pyodide.FS.writeFile(path, bytes);
+          }
+          const metadata = localSnapshotMetadata();
+          metadata.unshift({ id, label: String($id("snapshotLabel")?.value || "Snapshot").trim() || "Snapshot", root, createdAt: Date.now(), bytes: bytes.byteLength });
+          saveLocalSnapshotMetadata(metadata);
+          await persistActiveWorkspace();
+          renderLocalSnapshots();
+          setDeveloperStatus("snapshotStatus", `Snapshot created · ${formatBytes(bytes.byteLength)}.`);
+        } finally {
+          setDeveloperBusy(false);
+        }
+      }
+
+      function renderLocalSnapshots() {
+        const host = $id("snapshotResults");
+        if (!host) return;
+        host.innerHTML = "";
+        const items = localSnapshotMetadata();
+        if (!items.length) {
+          host.innerHTML = '<div class="developer-result-card"><div><strong>No restore points yet</strong><span>Create one before a dependency upgrade, migration, or major edit.</span></div></div>';
+          return;
+        }
+        for (const item of items) {
+          const row = document.createElement("div");
+          row.className = "developer-list-row";
+          const copy = document.createElement("div");
+          const title = document.createElement("strong");
+          title.textContent = item.label;
+          const detail = document.createElement("span");
+          detail.textContent = `${new Date(item.createdAt).toLocaleString()} · ${formatBytes(item.bytes || 0)} · ${item.root}`;
+          copy.append(title, detail);
+          const actions = document.createElement("div");
+          actions.className = "developer-row-actions";
+          for (const [action, label] of [["restore", "Restore"], ["download", "Download"], ["delete", "Delete"]]) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = `icon-button ${action === "delete" ? "button-danger" : "button-ghost"}`;
+            button.dataset.snapshotAction = action;
+            button.dataset.snapshotId = item.id;
+            button.textContent = label;
+            actions.appendChild(button);
+          }
+          row.append(copy, actions);
+          host.appendChild(row);
+        }
+      }
+
+      async function handleSnapshotAction(event) {
+        const button = event.target.closest("[data-snapshot-action]");
+        if (!button) return;
+        const items = localSnapshotMetadata();
+        const item = items.find((entry) => entry.id === button.dataset.snapshotId);
+        if (!item) return;
+        const path = localSnapshotPath(item.id);
+        const archiveExists = WORKER_SHELL_ENABLED ? await workerFsIsFile(path) : fsPathExists(path);
+        if (button.dataset.snapshotAction === "download") {
+          if (!archiveExists) throw new Error("Snapshot archive is missing from workspace storage.");
+          const bytes = WORKER_SHELL_ENABLED ? base64ToBytes(await workerReadBase64(path)) : pyodide.FS.readFile(path);
+          const blob = new Blob([bytes], { type: "application/zip" });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = `${safeName(item.label)}.snapshot.zip`;
+          link.click();
+          URL.revokeObjectURL(url);
+          return;
+        }
+        if (button.dataset.snapshotAction === "delete") {
+          const confirmed = await askConfirm("Delete snapshot", `Delete ${item.label}?`, { confirmLabel: "Delete", danger: true });
+          if (!confirmed) return;
+          if (archiveExists) {
+            if (WORKER_SHELL_ENABLED) await workerFs("unlink", { path });
+            else pyodide.FS.unlink(path);
+          }
+          saveLocalSnapshotMetadata(items.filter((entry) => entry.id !== item.id));
+          await persistActiveWorkspace();
+          renderLocalSnapshots();
+          return;
+        }
+        if (!archiveExists) throw new Error("Snapshot archive is missing from workspace storage.");
+        const confirmed = await askConfirm("Restore snapshot", `Replace ${item.root} with ${item.label}? Current files in that directory will be removed.`, { confirmLabel: "Restore", danger: true });
+        if (!confirmed) return;
+        setDeveloperBusy(true);
+        setDeveloperStatus("snapshotStatus", "Restoring snapshot...");
+        try {
+          const archiveBytes = WORKER_SHELL_ENABLED ? base64ToBytes(await workerReadBase64(path)) : pyodide.FS.readFile(path);
+          const archive = await JSZip.loadAsync(archiveBytes);
+          if (WORKER_SHELL_ENABLED) {
+            await workerFs("removeTree", { path: item.root });
+            await workerFs("mkdir", { path: item.root });
+            for (const entry of Object.values(archive.files)) {
+              const relative = normalizePath(entry.name).replace(/^\/+/, "");
+              if (!relative || relative.includes("..")) continue;
+              const target = normalizePath(`${item.root}/${relative}`);
+              if (entry.dir) await workerFs("mkdir", { path: target });
+              else await workerFs("writeFile", { path: target, data: bytesToBase64(await entry.async("uint8array")), encoding: "base64" });
+            }
+          } else {
+            removeTree(item.root);
+            ensureDir(item.root);
+            await extractZipTo(archive, item.root, { phase: "Restoring local snapshot..." });
+          }
+          await persistActiveWorkspace();
+          refreshFilesIfVisible(item.root);
+          setDeveloperStatus("snapshotStatus", `Restored ${item.label}.`);
+        } finally {
+          setDeveloperBusy(false);
+        }
+      }
+
+      function renderTemplateMarketplace() {
+        const host = $id("templateMarketplace");
+        if (!host) return;
+        host.innerHTML = "";
+        const descriptions = {
+          flask: "Small WSGI starter with a JSON status endpoint.",
+          django: "Django project, migrations, and SQLite ready to run.",
+          fastapi: "ASGI API starter with HTML and JSON routes.",
+          wordpress: "Official WordPress source with SQLite integration.",
+          static: "Zero-dependency HTML, CSS, and JavaScript site.",
+          pygame: "SDL canvas animation built for EdgeTerm Display.",
+        };
+        for (const [id, template] of Object.entries(PROJECT_TEMPLATES)) {
+          const card = document.createElement("article");
+          card.className = "template-card";
+          card.innerHTML = `<i data-lucide="${template.icon}"></i><h3></h3><p></p>`;
+          card.querySelector("h3").textContent = template.label;
+          card.querySelector("p").textContent = descriptions[id] || "EdgeTerm starter project.";
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "icon-button";
+          button.dataset.templateUse = id;
+          button.textContent = "Use template";
+          card.appendChild(button);
+          host.appendChild(card);
+        }
+        window.lucide?.createIcons({ root: host });
+      }
+
+      function useMarketplaceTemplate(id) {
+        const template = PROJECT_TEMPLATES[id];
+        if (!template) return;
+        $id("projectTemplate").value = id;
+        $id("projectName").value = template.defaultName;
+        $id("projectLocation").value = developerProjectRoot();
+        setProjectWizardStatus(`Ready to create ${template.label}.`);
+        setView("projectsView");
+      }
+
+      async function runPerformanceAudit() {
+        setDeveloperBusy(true);
+        try {
+          await ensureActiveWorkspaceMounted("Loading workspace files for audit...");
+          const root = developerProjectRoot();
+          const workerStats = WORKER_SHELL_ENABLED ? await workerFs("developerTreeStats", { root }) : null;
+          if (WORKER_SHELL_ENABLED ? !workerStats?.exists : !fsPathExists(root)) {
+            throw new Error(`Project root not found: ${root}`);
+          }
+          const stats = WORKER_SHELL_ENABLED ? workerStats : countTreeStats(root);
+          const resources = performance.getEntriesByType("resource");
+          const transferBytes = resources.reduce((sum, entry) => sum + Number(entry.transferSize || entry.encodedBodySize || 0), 0);
+          const metrics = $id("performanceMetrics");
+          metrics.innerHTML = "";
+          metrics.append(
+            metricCard("Project files", stats.files),
+            metricCard("Project size", formatBytes(stats.bytes)),
+            metricCard("Running apps", runCenterEntries().filter((entry) => entry.state !== "completed").length),
+            metricCard("Page resources", resources.length),
+            metricCard("Transferred", formatBytes(transferBytes)),
+            metricCard("Session time", `${Math.round(performance.now() / 1000)} s`),
+            metricCard("Pending saves", persistInFlight || workspaceFlushInFlight ? "Active" : "Clear"),
+            metricCard("Request logs", (window.EdgeTermServeLogs || []).length),
+          );
+          const files = WORKER_SHELL_ENABLED
+            ? workerStats.largestFiles || []
+            : collectTreeTargets(root)
+              .filter((path) => fsIsFile(path))
+              .map((path) => ({ path, size: Number(pyodide.FS.stat(path).size || 0) }))
+              .sort((a, b) => b.size - a.size)
+              .slice(0, 12);
+          const host = $id("performanceResults");
+          host.innerHTML = "";
+          for (const file of files) {
+            const row = document.createElement("div");
+            row.className = "developer-list-row";
+            const copy = document.createElement("div");
+            const title = document.createElement("strong");
+            title.textContent = file.path;
+            const detail = document.createElement("span");
+            detail.textContent = formatBytes(file.size);
+            copy.append(title, detail);
+            row.appendChild(copy);
+            host.appendChild(row);
+          }
+        } finally {
+          setDeveloperBusy(false);
+        }
+      }
+
+      async function flushPerformanceSaves() {
+        setDeveloperBusy(true);
+        try {
+          await persistActiveWorkspace();
+          showNotice("Workspace saves flushed successfully.");
+          await runPerformanceAudit();
+        } finally {
+          setDeveloperBusy(false);
+        }
+      }
+
+      function selectedProjectTemplate() {
+        const id = String($id("projectTemplate")?.value || "flask");
+        return { id, ...(PROJECT_TEMPLATES[id] || PROJECT_TEMPLATES.flask) };
+      }
+
+      function setProjectWizardStatus(message, kind = "") {
+        const status = $id("projectWizardStatus");
+        if (!status) return;
+        status.textContent = String(message || "");
+        if (kind) status.dataset.kind = kind;
+        else delete status.dataset.kind;
+      }
+
+      function projectTargetPath() {
+        const name = String($id("projectName")?.value || "").trim();
+        const locationPath = normalizePath(String($id("projectLocation")?.value || `/home/${activeUser()}`).trim());
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+          throw new Error("Project names may contain letters, numbers, dots, underscores, and hyphens.");
+        }
+        if (!/^\/[A-Za-z0-9._/-]*$/.test(locationPath)) {
+          throw new Error("The project location contains unsupported characters.");
+        }
+        return normalizePath(`${locationPath}/${name}`);
+      }
+
+      async function runProjectShellCommand(command) {
+        term?.echo?.(`$ ${command}`);
+        if (WORKER_SHELL_ENABLED) return await runWorkerCommand(command);
+        return await runCommand(command);
+      }
+
+      async function writeProjectFile(path, content) {
+        const target = normalizePath(path);
+        if (WORKER_SHELL_ENABLED) {
+          await workerFs("writeFile", { path: target, data: String(content) });
+          return;
+        }
+        await writeRuntimeFileAndMirror(target, String(content));
+      }
+
+      async function writeProjectBytes(path, bytes) {
+        const target = normalizePath(path);
+        const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || 0);
+        if (WORKER_SHELL_ENABLED) {
+          await workerFs("writeFile", { path: target, data: bytesToBase64(data), encoding: "base64" });
+          return;
+        }
+        await writeRuntimeFileAndMirror(target, data);
+      }
+
+      async function copyProjectFile(source, target) {
+        const sourcePath = normalizePath(source);
+        const bytes = WORKER_SHELL_ENABLED
+          ? base64ToBytes(await workerReadBase64(sourcePath))
+          : pyodide.FS.readFile(sourcePath);
+        await writeProjectBytes(target, bytes);
+      }
+
+      async function extractRemoteProjectArchive(url, target, { stripTopLevel = true, status = "Extracting project files..." } = {}) {
+        const archive = await fetchDeveloperResource(url);
+        const zip = await JSZip.loadAsync(archive.bytes);
+        const normalized = normalizeZipEntries(zip);
+        let prefix = "";
+        if (stripTopLevel && normalized.length) {
+          const candidate = normalized[0].split("/")[0] || "";
+          if (candidate && normalized.every((entry) => entry === candidate || entry.startsWith(`${candidate}/`))) prefix = candidate;
+        }
+        const entries = collectZipEntries(zip, prefix);
+        if (!entries.some(({ entry }) => !entry.dir)) throw new Error("The downloaded archive did not contain project files.");
+        if (WORKER_SHELL_ENABLED) await workerFs("mkdir", { path: normalizePath(target) });
+        else ensureDir(normalizePath(target));
+        let completed = 0;
+        for (const { relative, entry } of entries) {
+          const destination = normalizePath(`${target}/${relative}`);
+          if (entry.dir) {
+            if (WORKER_SHELL_ENABLED) await workerFs("mkdir", { path: destination });
+            else ensureDir(destination);
+          } else {
+            await writeProjectBytes(destination, await entry.async("uint8array"));
+          }
+          completed += 1;
+          if (completed === entries.length || completed % 50 === 0) {
+            setProjectWizardStatus(`${status} ${completed} of ${entries.length}`);
+          }
+        }
+        return { files: entries.filter(({ entry }) => !entry.dir).length };
+      }
+
+      async function projectPathExists(path) {
+        const target = normalizePath(path);
+        if (WORKER_SHELL_ENABLED) {
+          try {
+            const info = await workerFs("stat", { path: target });
+            return !!info?.exists;
+          } catch {
+            return false;
+          }
+        }
+        return fsPathExists(target);
+      }
+
+      async function projectPhpRuntimeReady() {
+        return (await projectPathExists(packageManifestPath("php")))
+          || (await projectPathExists(persistedPackageRootPath("php")))
+          || (await projectPathExists(installedRuntimePackageManifestPath("php")));
+      }
+
+      async function scaffoldStaticProject(root) {
+        await writeProjectFile(`${root}/index.html`, `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EdgeTerm Starter</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main>
+      <span class="eyebrow">EDGETERM STARTER</span>
+      <h1>Your browser-native site is running.</h1>
+      <p>Edit this project, save, and refresh the preview.</p>
+      <button id="action">Test interaction</button>
+      <output id="status">Ready</output>
+    </main>
+    <script src="app.js"><\/script>
+  </body>
+</html>
+`);
+        await writeProjectFile(`${root}/styles.css`, `:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  background: #07111f;
+  color: #e5eefc;
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  display: grid;
+  place-items: center;
+  background: radial-gradient(circle at 20% 10%, #173c73, transparent 34%), #07111f;
+}
+
+main { width: min(680px, calc(100% - 48px)); }
+.eyebrow { color: #60a5fa; font-size: 12px; font-weight: 800; letter-spacing: .14em; }
+h1 { margin: 14px 0; font-size: clamp(40px, 8vw, 76px); line-height: .98; letter-spacing: -.05em; }
+p { color: #9fb2cc; font-size: 18px; }
+button { border: 0; border-radius: 12px; padding: 12px 16px; background: #3b82f6; color: white; font-weight: 700; cursor: pointer; }
+output { margin-left: 12px; color: #86efac; }
+`);
+        await writeProjectFile(`${root}/app.js`, `const button = document.querySelector("#action");
+const status = document.querySelector("#status");
+
+button.addEventListener("click", () => {
+  status.textContent = "Interaction works";
+});
+`);
+      }
+
+      async function scaffoldFlaskProject(root) {
+        await writeProjectFile(`${root}/app.py`, `from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+
+@app.get("/")
+def index():
+    return """
+    <main style="font-family:system-ui;max-width:720px;margin:12vh auto;padding:24px">
+      <p style="color:#2563eb;font-weight:700">FLASK + EDGETERM</p>
+      <h1 style="font-size:52px;line-height:1">Your Flask app is running.</h1>
+      <p>Edit <code>app.py</code>, then restart this run from the Run Center.</p>
+    </main>
+    """
+
+
+@app.get("/api/status")
+def status():
+    return jsonify(framework="Flask", status="ok")
+`);
+        await writeProjectFile(`${root}/requirements.txt`, "Flask\n");
+      }
+
+      async function scaffoldFastApiProject(root) {
+        await writeProjectFile(`${root}/app.py`, `from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+
+app = FastAPI(title="EdgeTerm FastAPI Starter")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return """
+    <main style="font-family:system-ui;max-width:720px;margin:12vh auto;padding:24px">
+      <p style="color:#059669;font-weight:700">FASTAPI + EDGETERM</p>
+      <h1 style="font-size:52px;line-height:1">Your FastAPI app is running.</h1>
+      <p>Open <a href="api/status">the status endpoint</a> to test routing.</p>
+    </main>
+    """
+
+
+@app.get("/api/status")
+async def status():
+    return {"framework": "FastAPI", "status": "ok"}
+`);
+        await writeProjectFile(`${root}/requirements.txt`, "fastapi==0.109.0\nJinja2\n");
+      }
+
+      async function scaffoldDjangoProject(root) {
+        await writeProjectFile(`${root}/manage.py`, `#!/usr/bin/env python3
+import os
+import sys
+
+
+def main():
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+    from django.core.management import execute_from_command_line
+    execute_from_command_line(sys.argv)
+
+
+if __name__ == "__main__":
+    main()
+`);
+        await writeProjectFile(`${root}/config/__init__.py`, "");
+        await writeProjectFile(`${root}/config/settings.py`, `from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+SECRET_KEY = "edgeterm-local-development-key"
+DEBUG = True
+ALLOWED_HOSTS = ["*"]
+ROOT_URLCONF = "config.urls"
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "django.middleware.common.CommonMiddleware",
+]
+INSTALLED_APPS = [
+    "django.contrib.contenttypes",
+    "django.contrib.auth",
+    "django.contrib.sessions",
+]
+DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": BASE_DIR / "db.sqlite3"}}
+USE_TZ = True
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+`);
+        await writeProjectFile(`${root}/config/urls.py`, `from django.http import JsonResponse
+from django.urls import path
+
+
+def index(request):
+    return JsonResponse({"framework": "Django", "status": "ok", "message": "Your Django app is running."})
+
+
+urlpatterns = [path("", index)]
+`);
+        await writeProjectFile(`${root}/config/wsgi.py`, `import os
+
+from django.core.wsgi import get_wsgi_application
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+application = get_wsgi_application()
+`);
+        await writeProjectFile(`${root}/requirements.txt`, "Django\n");
+      }
+
+      async function scaffoldPygameProject(root) {
+        await writeProjectFile(`${root}/main.py`, `import asyncio
+
+import pygame
+
+
+async def main():
+    pygame.init()
+    screen = pygame.display.set_mode((800, 500))
+    pygame.display.set_caption("EdgeTerm pygame Starter")
+    clock = pygame.time.Clock()
+    font = pygame.font.Font(None, 52)
+    running = True
+    frame = 0
+
+    while running and frame < 600:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+        screen.fill((7, 17, 31))
+        pygame.draw.circle(screen, (59, 130, 246), (160 + (frame % 460), 260), 54)
+        label = font.render("pygame is running", True, (229, 238, 252))
+        screen.blit(label, (210, 70))
+        pygame.display.flip()
+        frame += 1
+        clock.tick(60)
+        await asyncio.sleep(0)
+
+    pygame.quit()
+
+
+asyncio.run(main())
+`);
+        await writeProjectFile(`${root}/requirements.txt`, "pygame-ce\n");
+      }
+
+      async function scaffoldWordPressProject(root) {
+        setProjectWizardStatus("Downloading the official WordPress source...");
+        await extractRemoteProjectArchive("https://wordpress.org/latest.zip", root, {
+          stripTopLevel: true,
+          status: "Extracting WordPress...",
+        });
+        if (!(await projectPathExists(`${root}/wp-settings.php`))) {
+          throw new Error("WordPress could not be extracted. Check the terminal download log.");
+        }
+        setProjectWizardStatus("Adding the WordPress SQLite integration...");
+        await extractRemoteProjectArchive(
+          "https://downloads.wordpress.org/plugin/sqlite-database-integration.latest-stable.zip",
+          `${root}/wp-content/plugins`,
+          { stripTopLevel: false, status: "Extracting the SQLite integration..." },
+        );
+        await copyProjectFile(`${root}/wp-content/plugins/sqlite-database-integration/db.copy`, `${root}/wp-content/db.php`);
+        await writeProjectFile(`${root}/wp-config.php`, `<?php
+define('DB_ENGINE', 'sqlite');
+define('DB_DIR', __DIR__ . '/wp-content/database');
+define('DB_FILE', 'wordpress.sqlite');
+define('DB_NAME', 'wordpress');
+define('DB_USER', '');
+define('DB_PASSWORD', '');
+define('DB_HOST', 'localhost');
+define('DB_CHARSET', 'utf8');
+define('DB_COLLATE', '');
+define('AUTH_KEY', 'edgeterm-local-auth-key');
+define('SECURE_AUTH_KEY', 'edgeterm-local-secure-auth-key');
+define('LOGGED_IN_KEY', 'edgeterm-local-logged-in-key');
+define('NONCE_KEY', 'edgeterm-local-nonce-key');
+define('AUTH_SALT', 'edgeterm-local-auth-salt');
+define('SECURE_AUTH_SALT', 'edgeterm-local-secure-auth-salt');
+define('LOGGED_IN_SALT', 'edgeterm-local-logged-in-salt');
+define('NONCE_SALT', 'edgeterm-local-nonce-salt');
+$table_prefix = 'wp_';
+define('WP_DEBUG', true);
+if (!defined('ABSPATH')) define('ABSPATH', __DIR__ . '/');
+require_once ABSPATH . 'wp-settings.php';
+`);
+      }
+
+      async function installProjectDependencies(template, root) {
+        if (template.id === "static") return;
+        if (template.id === "wordpress") {
+          setProjectWizardStatus("Installing the PHP browser runtime...");
+          await runProjectShellCommand("apt install -y php");
+          if (!(await projectPhpRuntimeReady())) {
+            throw new Error(
+              "The WordPress files were created, but the PHP browser runtime is not available. Install a valid PHP runtime package before starting this project.",
+            );
+          }
+          return;
+        }
+        const packageName = template.id === "pygame"
+          ? "pygame"
+          : template.id === "fastapi"
+            ? "fastapi Jinja2"
+            : template.id;
+        setProjectWizardStatus(`Installing ${template.label} dependencies...`);
+        await runProjectShellCommand(`cd ${root} && pip install ${packageName}`);
+        if (template.id === "django") {
+          setProjectWizardStatus("Preparing the Django database...");
+          await runProjectShellCommand(`cd ${root} && python manage.py migrate --noinput`);
+        }
+      }
+
+      async function createProjectFromWizard(event) {
+        event?.preventDefault?.();
+        if (projectWizardBusy) return;
+        projectWizardBusy = true;
+        const button = $id("createProject");
+        if (button) button.disabled = true;
+        try {
+          await ensureActiveWorkspaceMounted("Loading workspace files...");
+          const template = selectedProjectTemplate();
+          const root = projectTargetPath();
+          if (await projectPathExists(root)) {
+            const overwrite = await askConfirm("Replace project", `${root} already exists. Replace it with a new ${template.label} project?`, {
+              confirmLabel: "Replace",
+              danger: true,
+            });
+            if (!overwrite) {
+              setProjectWizardStatus("Project creation cancelled.");
+              return;
+            }
+            if (WORKER_SHELL_ENABLED) await runProjectShellCommand(`rm -rf ${root}`);
+            else removeTree(root);
+          }
+          setProjectWizardStatus(`Creating ${template.label} files...`);
+          const createRoot = template.id === "wordpress"
+            ? normalizePath(root.split("/").slice(0, -1).join("/") || "/")
+            : root;
+          await runProjectShellCommand(`mkdir -p ${createRoot}`);
+          if (template.id === "static") await scaffoldStaticProject(root);
+          else if (template.id === "flask") await scaffoldFlaskProject(root);
+          else if (template.id === "fastapi") await scaffoldFastApiProject(root);
+          else if (template.id === "django") await scaffoldDjangoProject(root);
+          else if (template.id === "pygame") await scaffoldPygameProject(root);
+          else if (template.id === "wordpress") await scaffoldWordPressProject(root);
+          await installProjectDependencies(template, root);
+          await bridgeSaveGeneratedProjectConfiguration(root);
+          if (!WORKER_SHELL_ENABLED) await persistActiveWorkspace();
+          refreshFilesIfVisible(root);
+          setProjectWizardStatus(`${template.label} created at ${root}.`, "success");
+          if ($id("projectRunAfterCreate")?.checked) await launchProject(template, root);
+          renderRunCenter();
+        } catch (err) {
+          console.error("[PROJECT] Creation failed:", err);
+          setProjectWizardStatus(err?.message || String(err), "error");
+          showNotice(`Project creation failed: ${err?.message || err}`);
+        } finally {
+          projectWizardBusy = false;
+          if (button) button.disabled = false;
+        }
+      }
+
+      async function launchProject(template, root) {
+        setProjectWizardStatus(`Starting ${template.label}...`);
+        if (template.id === "pygame") {
+          const id = `pygame-${Date.now().toString(36)}`;
+          const run = {
+            id,
+            mode: "pygame",
+            label: template.label,
+            target: template.target,
+            workingDirectory: root,
+            projectTemplate: template.id,
+            projectRoot: root,
+            state: "running",
+            startedAt: Date.now(),
+          };
+          projectRunRegistry.set(id, run);
+          renderRunCenter();
+          setView("displayView");
+          await runProjectShellCommand(`cd ${root} && python ${template.target}`);
+          run.state = "completed";
+          renderRunCenter();
+          setProjectWizardStatus(`${template.label} completed successfully.`, "success");
+          return run;
+        }
+        const instance = await window.EdgeTermServe.start(template.mode, template.target, root);
+        Object.assign(instance, {
+          label: template.label,
+          projectTemplate: template.id,
+          projectRoot: root,
+          startedAt: Date.now(),
+          state: "running",
+        });
+        window.EdgeTermServe.instances.set(instance.id, instance);
+        setProjectWizardStatus(`${template.label} is running.`, "success");
+        renderRunCenter();
+        return instance;
+      }
+
+      function runCenterEntries() {
+        const entries = new Map(projectRunRegistry);
+        for (const instance of window.EdgeTermServe?.instances?.values?.() || []) {
+          if (!edgeServeInstanceIsInActiveWorkspace(instance)) continue;
+          entries.set(instance.id, { state: "running", startedAt: Date.now(), ...instance });
+        }
+        return [...entries.values()].sort((left, right) => Number(right.startedAt || 0) - Number(left.startedAt || 0));
+      }
+
+      function renderRunCenter() {
+        const list = $id("runCenterList");
+        if (!list) return;
+        list.innerHTML = "";
+        const entries = runCenterEntries();
+        if (!entries.length) {
+          const empty = document.createElement("div");
+          empty.className = "run-center-empty";
+          empty.innerHTML = '<div><i data-lucide="activity"></i><p>No runs yet.<br>Create a project or start EdgeServe from the terminal.</p></div>';
+          list.appendChild(empty);
+          window.lucide?.createIcons();
+          return;
+        }
+        for (const entry of entries) {
+          const template = PROJECT_TEMPLATES[entry.projectTemplate] || {
+            label: entry.label || `${entry.mode || "app"} app`,
+            icon: entry.mode === "php" ? "file-code-2" : "play",
+          };
+          const card = document.createElement("article");
+          card.className = "run-card";
+          card.dataset.runId = entry.id;
+          const icon = document.createElement("div");
+          icon.className = "run-card-icon";
+          icon.innerHTML = `<i data-lucide="${template.icon || "play"}"></i>`;
+          const copy = document.createElement("div");
+          copy.className = "run-card-copy";
+          const name = document.createElement("strong");
+          name.textContent = entry.label || template.label || entry.id;
+          const detail = document.createElement("span");
+          detail.textContent = `${entry.mode || "app"} · ${entry.workingDirectory || entry.projectRoot || "/"}`;
+          const status = document.createElement("em");
+          status.className = `run-status ${entry.state === "completed" ? "completed" : ""}`;
+          status.textContent = entry.state === "completed" ? "Completed" : "Running";
+          copy.append(name, detail, status);
+          const actions = document.createElement("div");
+          actions.className = "run-card-actions";
+          const actionSpecs = [
+            ["open", "Open", "external-link"],
+            ["restart", "Restart", "rotate-cw"],
+            ["logs", "Logs", "scroll-text"],
+            ["stop", "Stop", "square"],
+          ];
+          for (const [action, title, actionIcon] of actionSpecs) {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.dataset.runAction = action;
+            button.dataset.runId = entry.id;
+            button.title = title;
+            button.setAttribute("aria-label", title);
+            button.innerHTML = `<i data-lucide="${actionIcon}"></i>`;
+            actions.appendChild(button);
+          }
+          card.append(icon, copy, actions);
+          list.appendChild(card);
+        }
+        window.lucide?.createIcons();
+      }
+
+      async function openRunCenterEntry(entry) {
+        if (!entry) return;
+        if (entry.mode === "pygame") {
+          setView("displayView");
+          return;
+        }
+        const instance = window.EdgeTermServe?.instances?.get?.(entry.id) || entry;
+        if (!edgeServeInstanceIsInActiveWorkspace(instance)) {
+          throw bridgeError(
+            "bridge_app_workspace_mismatch",
+            "This app belongs to another EdgeTerm workspace. Open that workspace before using the preview.",
+          );
+        }
+        const instanceConfig = edgeServeConfigForInstance(instance);
+        if (instanceConfig) appModeState.config = instanceConfig;
+        const target = normalizeDisplayBrowserUrl(instance.routePrefix || "/");
+        createOrActivateDisplayBrowserTab(instance, target);
+        appModeState.renderTarget = "display";
+        appModeState.active = true;
+        await navigateAppMode(target, { updateHistory: false, replaceDisplayHistory: true });
+        setView("browserView");
+      }
+
+      function stopRunCenterEntry(entry, { cancelNodeRuntime = true } = {}) {
+        if (!entry) return;
+        if (cancelNodeRuntime && nodeRuntime?.status?.().preview?.id === entry.id) {
+          nodeRuntime.cancel();
+          return;
+        }
+        projectRunRegistry.delete(entry.id);
+        window.EdgeTermServe?.instances?.delete?.(entry.id);
+        const tabIds = [...appModeState.browserTabs.values()]
+          .filter((tab) => tab.instanceId === entry.id)
+          .map((tab) => tab.id);
+        for (const tabId of tabIds) closeDisplayBrowserTab(tabId);
+        renderRunCenter();
+        setProjectWizardStatus(`${entry.label || entry.id} stopped.`);
+        showNotice(`Stopped ${entry.label || entry.id}`);
+      }
+
+      async function restartRunCenterEntry(entry) {
+        if (!entry) return;
+        const template = PROJECT_TEMPLATES[entry.projectTemplate] || {
+          id: entry.projectTemplate || entry.mode,
+          label: entry.label || `${entry.mode || "app"} app`,
+          icon: "play",
+          mode: entry.requestedMode || entry.mode,
+          target: entry.target,
+        };
+        const root = entry.projectRoot || entry.workingDirectory || `/home/${activeUser()}`;
+        stopRunCenterEntry(entry);
+        const restarted = await launchProject(template, root);
+        restarted.virtualPort = Number(entry.virtualPort || entry.port || 8000);
+        return restarted;
+      }
+
+      function showRunCenterLogs(entry) {
+        if (entry?.mode === "pygame") {
+          setView("terminalView");
+          return;
+        }
+        setView("browserView");
+        const handle = $id("edgeServeLiveLogHandle");
+        if (handle) handle.click();
+        else showNotice("Open the app once to initialize its request log.");
+      }
+
+      async function handleRunCenterAction(event) {
+        const button = event.target.closest("[data-run-action]");
+        if (!button) return;
+        const id = button.dataset.runId || "";
+        const entry = runCenterEntries().find((item) => item.id === id);
+        if (!entry) return renderRunCenter();
+        button.disabled = true;
+        try {
+          if (button.dataset.runAction === "open") await openRunCenterEntry(entry);
+          else if (button.dataset.runAction === "restart") await restartRunCenterEntry(entry);
+          else if (button.dataset.runAction === "logs") showRunCenterLogs(entry);
+          else if (button.dataset.runAction === "stop") stopRunCenterEntry(entry);
+        } catch (err) {
+          showNotice(`Run action failed: ${err?.message || err}`);
+        } finally {
+          button.disabled = false;
+        }
+      }
+
+      function developmentProjectRoot() {
+        return assertBridgeWorkspacePath($id("developmentProjectRoot")?.value || `/home/${activeUser()}`);
+      }
+
+      function renderDevelopmentRows(host, entries, createRow) {
+        if (!host) return;
+        host.innerHTML = "";
+        if (!entries.length) {
+          const empty = document.createElement("span");
+          empty.textContent = "Nothing found.";
+          host.appendChild(empty);
+          return;
+        }
+        for (const entry of entries) host.appendChild(createRow(entry));
+      }
+
+      async function refreshDevelopmentEnvironment() {
+        const summary = $id("developmentEnvironmentSummary");
+        if (summary) summary.textContent = "Inspecting project configuration...";
+        const result = await bridgeInspectProjectEnvironment({ root: developmentProjectRoot() });
+        const missing = result.estimated_install_count;
+        const missingSecrets = result.secret_references.filter((entry) => !entry.available).length;
+        if (summary) {
+          summary.textContent = `${result.configuration.project.framework} · ${result.generated ? "draft configuration" : "edgeterm.toml"} · ${missing} dependency change(s)${missingSecrets ? ` · ${missingSecrets} missing vault reference(s)` : ""}`;
+        }
+        return result;
+      }
+
+      async function applyDevelopmentEnvironment() {
+        const inspection = await refreshDevelopmentEnvironment();
+        const approved = await askConfirm(
+          "Restore project environment",
+          `Apply ${inspection.estimated_install_count} dependency change(s) and save the generated configuration when needed? A local checkpoint will be created first.`,
+          { confirmLabel: "Restore" },
+        );
+        if (!approved) return;
+        const result = await bridgeApplyProjectEnvironment({ root: developmentProjectRoot(), write_config: true });
+        showNotice(`Environment restored with ${result.applied.length} package manager transaction(s).`);
+        await refreshDevelopmentWorkspace();
+      }
+
+      async function manageDevelopmentVault() {
+        const entries = await getSecretVault().list();
+        const result = await askFields("Local project vault", [
+          {
+            name: "action",
+            label: "Action",
+            type: "select",
+            value: "store",
+            options: [
+              { value: "store", label: "Store or replace a value" },
+              ...(entries.length ? [{ value: "remove", label: "Remove a value" }] : []),
+            ],
+          },
+          {
+            name: "name",
+            label: "Vault name",
+            value: entries[0]?.id || "",
+            placeholder: "project-api-key",
+          },
+          {
+            name: "value",
+            label: "Secret value",
+            type: "password",
+            required: false,
+            placeholder: "Stored only in this browser",
+          },
+        ], {
+          message: entries.length
+            ? `Stored names: ${entries.map((entry) => entry.id).join(", ")}. Values are never displayed or written to edgeterm.toml.`
+            : "Values are encrypted in this browser. edgeterm.toml stores only vault:name references.",
+          confirmLabel: "Save",
+        });
+        if (!result) return;
+        if (result.action === "remove") {
+          await getSecretVault().remove(result.name);
+          showNotice(`Removed vault entry ${result.name}.`);
+        } else {
+          if (!result.value) throw bridgeError("vault_value_required", "Enter a secret value to store.");
+          await getSecretVault().put(result.name, result.value);
+          showNotice(`Stored vault entry ${result.name} on this device.`);
+        }
+        await refreshDevelopmentEnvironment();
+      }
+
+      async function refreshDevelopmentTasks() {
+        const result = await bridgeListProjectTasks({ root: developmentProjectRoot() });
+        renderDevelopmentRows($id("developmentTaskList"), result.tasks, (task) => {
+          const row = document.createElement("div");
+          row.className = "development-compact-row";
+          const label = document.createElement("span");
+          label.textContent = task.label;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = "Run";
+          button.addEventListener("click", async () => {
+            button.disabled = true;
+            try {
+              const started = await bridgeRunProjectTask({ root: result.root, task_id: task.id });
+              showNotice(`${task.label} started as ${started.process.id.slice(0, 8)}.`);
+            } catch (error) {
+              showNotice(error?.message || String(error));
+            } finally {
+              button.disabled = false;
+            }
+          });
+          row.append(label, button);
+          return row;
+        });
+        return result;
+      }
+
+      async function refreshDevelopmentTests() {
+        const result = await bridgeDiscoverTests({ root: developmentProjectRoot() });
+        renderDevelopmentRows($id("developmentTestList"), result.suites, (suite) => {
+          const row = document.createElement("div");
+          row.className = "development-compact-row";
+          const label = document.createElement("span");
+          label.textContent = suite.label;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = "Run";
+          button.addEventListener("click", async () => {
+            button.disabled = true;
+            const resultPanel = $id("developmentTestResult");
+            resultPanel?.classList.remove("hidden");
+            if (resultPanel) resultPanel.open = true;
+            if ($id("developmentTestResultSummary")) $id("developmentTestResultSummary").textContent = `${suite.label} is running...`;
+            if ($id("developmentTestFailures")) $id("developmentTestFailures").replaceChildren();
+            if ($id("developmentTestOutput")) $id("developmentTestOutput").textContent = "";
+            try {
+              const run = await bridgeRunTests({ root: result.root, suite_id: suite.id });
+              renderDevelopmentTestResult(run, result.root);
+              showNotice(`${suite.label}: ${run.result.status} (${run.result.exit_code}).`);
+            } catch (error) {
+              if ($id("developmentTestResultSummary")) $id("developmentTestResultSummary").textContent = `${suite.label} could not run: ${error?.message || String(error)}`;
+              showNotice(error?.message || String(error));
+            } finally {
+              button.disabled = false;
+            }
+          });
+          row.append(label, button);
+          return row;
+        });
+        return result;
+      }
+
+      function renderDevelopmentTestResult(run, root) {
+        const panel = $id("developmentTestResult");
+        const summary = $id("developmentTestResultSummary");
+        const failures = $id("developmentTestFailures");
+        const output = $id("developmentTestOutput");
+        if (!panel || !summary || !failures || !output) return;
+        const result = run?.result || {};
+        panel.classList.remove("hidden");
+        panel.open = result.status !== "passed";
+        const knownCases = Number(result.passed || 0) + Number(result.failed || 0) + Number(result.skipped || 0);
+        summary.textContent = [
+          result.status === "passed" ? "Passed" : "Failed",
+          `${Number(result.duration_ms || 0)} ms`,
+          knownCases ? `${result.passed || 0} passed, ${result.failed || 0} failed, ${result.skipped || 0} skipped` : "No structured cases reported",
+        ].join(" · ");
+        failures.replaceChildren();
+        for (const failure of result.failures || []) {
+          const location = failure.location;
+          if (!location?.path) continue;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "development-compact-row";
+          button.textContent = `${location.path}:${location.line || 1}`;
+          button.addEventListener("click", () => {
+            const path = String(location.path).startsWith("/")
+              ? location.path
+              : `${root}/${location.path}`.replace(/\/+/g, "/");
+            void openEditorInTarget(path, { quiet: true }).then(() => {
+              editor?.setPosition?.({ lineNumber: Number(location.line || 1), column: Number(location.column || 1) });
+              editor?.revealLineInCenter?.(Number(location.line || 1));
+            });
+          });
+          failures.appendChild(button);
+        }
+        output.textContent = result.output || "No command output.";
+        output.classList.toggle("hidden", !result.output);
+      }
+
+      function refreshDevelopmentDebug() {
+        const capabilities = getDebugController().capabilities();
+        const summary = $id("developmentDebugSummary");
+        if (summary) {
+          const session = developmentDebugSessionId
+            ? (() => {
+                try { return getDebugController().describe(developmentDebugSessionId); } catch { return null; }
+              })()
+            : null;
+          summary.textContent = session
+            ? `${session.type} · ${session.state}${session.line ? ` · line ${session.line}` : ""}${session.error ? ` · ${session.error.trim().split(/\r?\n/).filter(Boolean).at(-1)}` : ""}`
+            : capabilities.length
+              ? capabilities.map((entry) => `${entry.type} (${entry.scope || "runtime"})`).join(", ")
+            : "No compatible debugger is active for this project yet. EdgeTerm will not pretend that breakpoints are available.";
+        }
+        return capabilities;
+      }
+
+      async function developmentPythonDebugTarget() {
+        const root = developmentProjectRoot();
+        const editorPath = currentEditorPath("main");
+        if (editorPath?.endsWith(".py") && (editorPath === root || editorPath.startsWith(`${root}/`))) return editorPath;
+        for (const name of ["main.py", "app.py", "manage.py"]) {
+          const path = `${root}/${name}`;
+          const stat = await bridgeStat(path);
+          if (stat.exists && stat.is_file) return path;
+        }
+        throw bridgeError("debug_python_path_required", "Open a Python file or choose a project with main.py, app.py, or manage.py.");
+      }
+
+      async function startDevelopmentDebug() {
+        if (developmentDebugSessionId) {
+          try { await getDebugController().stop(developmentDebugSessionId); } catch {}
+          developmentDebugSessionId = "";
+        }
+        const path = await developmentPythonDebugTarget();
+        const source = (await bridgeReadText(path)).content;
+        const requirementsPath = `${developmentProjectRoot()}/requirements.txt`;
+        const requirementsStat = await bridgeStat(requirementsPath);
+        const packages = requirementsStat.exists
+          ? (await bridgeReadText(requirementsPath)).content
+              .split(/\r?\n/)
+              .map((line) => line.trim())
+              .filter((line) => line && !line.startsWith("#") && /^[A-Za-z0-9_.-]+(?:[<>=!~]=?[A-Za-z0-9_.-]+)?$/.test(line))
+          : [];
+        const firstExecutableLine = Math.max(1, source.split(/\r?\n/).findIndex((line) => line.trim() && !line.trim().startsWith("#")) + 1);
+        const editorLine = path === currentEditorPath("main") ? Number(editor?.getPosition?.()?.lineNumber || firstExecutableLine) : firstExecutableLine;
+        const session = await getDebugController().start({
+          type: "python",
+          path,
+          name: path.split("/").pop(),
+          breakpoints: [Math.max(1, editorLine)],
+          packages,
+        });
+        developmentDebugSessionId = session.id;
+        refreshDevelopmentDebug();
+        showNotice(`Python debugger started for ${path}.`);
+        return session;
+      }
+
+      async function commandDevelopmentDebug(command) {
+        if (!developmentDebugSessionId) throw bridgeError("debug_session_not_found", "Start a debug session first.");
+        if (command === "stop") {
+          await getDebugController().stop(developmentDebugSessionId);
+        } else {
+          await getDebugController().command(developmentDebugSessionId, command);
+        }
+        setTimeout(refreshDevelopmentDebug, 50);
+        return refreshDevelopmentDebug();
+      }
+
+      async function refreshDevelopmentCheckpoints() {
+        const result = await bridgeListDevelopmentCheckpoints();
+        renderDevelopmentRows($id("developmentCheckpointList"), result.checkpoints.slice(0, 5), (checkpoint) => {
+          const row = document.createElement("div");
+          row.className = "development-compact-row";
+          const label = document.createElement("span");
+          label.textContent = `${checkpoint.pinned ? "Pinned · " : ""}${checkpoint.label}`;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = "Restore";
+          button.addEventListener("click", async () => {
+            const approved = await askConfirm("Restore checkpoint", `Replace ${checkpoint.root} with ${checkpoint.label}? A recovery checkpoint will be created first.`, { confirmLabel: "Restore", danger: true });
+            if (!approved) return;
+            button.disabled = true;
+            try {
+              await bridgeRestoreDevelopmentCheckpoint({ checkpoint_id: checkpoint.id });
+              showNotice("Checkpoint restored successfully.");
+              await refreshDevelopmentWorkspace();
+            } catch (error) {
+              showNotice(error?.message || String(error));
+            } finally {
+              button.disabled = false;
+            }
+          });
+          row.append(label, button);
+          return row;
+        });
+        return result;
+      }
+
+      async function createDevelopmentCheckpoint() {
+        const list = $id("developmentCheckpointList");
+        if (list) list.textContent = "Creating checkpoint...";
+        try {
+          const checkpoint = await bridgeCreateDevelopmentCheckpoint({ root: developmentProjectRoot(), label: "Manual checkpoint", pinned: true });
+          showNotice(`Checkpoint ${checkpoint.label} created.`);
+          await refreshDevelopmentCheckpoints();
+        } catch (error) {
+          if (list) list.textContent = `Checkpoint failed: ${error?.message || String(error)}`;
+          throw error;
+        }
+      }
+
+      async function refreshDevelopmentWorkspace() {
+        const rootInput = $id("developmentProjectRoot");
+        if (rootInput && (!rootInput.value || rootInput.value === "/home/user")) rootInput.value = `/home/${activeUser()}`;
+        await ensureActiveWorkspaceMounted("Loading development workspace...");
+        const results = await Promise.allSettled([
+          refreshDevelopmentEnvironment(),
+          refreshDevelopmentTasks(),
+          refreshDevelopmentTests(),
+          refreshDevelopmentCheckpoints(),
+        ]);
+        refreshDevelopmentDebug();
+        const rejected = results.filter((entry) => entry.status === "rejected");
+        if (rejected.length === results.length) throw rejected[0].reason;
+      }
+
+      function setupDevelopmentWorkspaceEvents() {
+        const bind = (id, listener) => {
+          const element = $id(id);
+          if (!element || element.dataset.developmentEventBound === "true") return;
+          element.addEventListener("click", listener);
+          element.dataset.developmentEventBound = "true";
+        };
+        bind("developmentInspectEnvironment", () => void refreshDevelopmentEnvironment().catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentApplyEnvironment", () => void applyDevelopmentEnvironment().catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentManageVault", () => void manageDevelopmentVault().catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentRefreshTasks", () => void refreshDevelopmentTasks().catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentDiscoverTests", () => void refreshDevelopmentTests().catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentRefreshDebug", refreshDevelopmentDebug);
+        bind("developmentStartDebug", () => void startDevelopmentDebug().catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentContinueDebug", () => void commandDevelopmentDebug("continue").catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentStepDebug", () => void commandDevelopmentDebug("step").catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentStopDebug", () => void commandDevelopmentDebug("stop").catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentCreateCheckpoint", () => void createDevelopmentCheckpoint().catch((error) => showNotice(error?.message || String(error))));
+        bind("developmentRefreshCheckpoints", () => void refreshDevelopmentCheckpoints().catch((error) => showNotice(error?.message || String(error))));
+      }
+
       function setupEvents() {
         window.EdgeTermAppModeBridge = {
           navigate: async (url, options = {}) => navigateAppMode(url, options),
@@ -15254,6 +20058,109 @@ shell
           },
         };
         document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => setView(tab.dataset.view)));
+        $id("projectWizard")?.addEventListener("submit", createProjectFromWizard);
+        $id("projectTemplate")?.addEventListener("change", () => {
+          const template = selectedProjectTemplate();
+          $id("projectName").value = template.defaultName;
+          setProjectWizardStatus(`Ready to create ${template.label}.`);
+        });
+        $id("refreshRunCenter")?.addEventListener("click", renderRunCenter);
+        $id("runCenterList")?.addEventListener("click", (event) => void handleRunCenterAction(event));
+        setupDevelopmentWorkspaceEvents();
+        renderRunCenter();
+        loadMysqlConnectionPreferences();
+        document.querySelectorAll("[data-database-engine]").forEach((button) => {
+          button.addEventListener("click", () => setDatabaseEngine(button.dataset.databaseEngine));
+        });
+        $id("databaseRefresh")?.addEventListener("click", () => void refreshDatabaseDiscovery().catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseOpen")?.addEventListener("click", () => void openDatabase().catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseDiscovered")?.addEventListener("change", (event) => {
+          if (event.target.value) $id("databasePath").value = event.target.value;
+        });
+        $id("databaseRefreshSchema")?.addEventListener("click", () => void refreshDatabaseSchema({ renderResults: true }).catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseRunQuery")?.addEventListener("click", () => void executeDatabaseQuery().catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseExplain")?.addEventListener("click", () => {
+          const query = String($id("databaseQuery")?.value || "").trim();
+          if (!query) return showNotice("Enter a SQL statement first.");
+          const explain = /^EXPLAIN\b/i.test(query) ? query : databaseState.engine === "mysql"
+            ? `EXPLAIN ${query.replace(/;+\s*$/, "")};`
+            : `EXPLAIN QUERY PLAN ${query.replace(/;+\s*$/, "")};`;
+          void executeDatabaseQuery(explain).catch((err) => showNotice(err?.message || String(err)));
+        });
+        $id("databaseTableList")?.addEventListener("click", (event) => {
+          const button = event.target.closest("[data-database-table]");
+          if (button) void openDatabaseTable(button.dataset.databaseTable).catch((err) => showNotice(err?.message || String(err)));
+        });
+        $id("databaseQuery")?.addEventListener("keydown", (event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+            event.preventDefault();
+            void executeDatabaseQuery().catch((err) => showNotice(err?.message || String(err)));
+          }
+        });
+        $id("databaseWordPressShortcut")?.addEventListener("click", () => void openDatabaseShortcut("wordpress").catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseDjangoShortcut")?.addEventListener("click", () => void openDatabaseShortcut("django").catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseImport")?.addEventListener("click", () => $id("databaseImportPicker")?.click());
+        $id("databaseImportPicker")?.addEventListener("change", async (event) => {
+          try {
+            await importDatabaseFile(event.target.files?.[0]);
+          } catch (err) {
+            showNotice(`Database import failed: ${err?.message || err}`);
+          } finally {
+            event.target.value = "";
+          }
+        });
+        $id("databaseExport")?.addEventListener("click", exportCurrentDatabase);
+        $id("databaseMysqlConnect")?.addEventListener("click", () => void connectMysqlDatabase().catch((err) => {
+          setDatabaseStatus("MySQL connection failed.");
+          showNotice(err?.message || String(err));
+        }));
+        $id("databaseMysqlDatabase")?.addEventListener("change", () => {
+          saveMysqlConnectionPreferences();
+          databaseState.activeTable = "";
+          $id("databaseActiveName").textContent = mysqlConnectionSettings().database || "MySQL server";
+          void refreshDatabaseSchema({ renderResults: true }).catch((err) => showNotice(err?.message || String(err)));
+        });
+        $id("databaseMysqlStatus")?.addEventListener("click", () => void showMysqlStatus().catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseMysqlImport")?.addEventListener("click", () => $id("databaseMysqlImportPicker")?.click());
+        $id("databaseMysqlImportPicker")?.addEventListener("change", async (event) => {
+          try { await importMysqlSql(event.target.files?.[0]); }
+          catch (err) { showNotice(`SQL import failed: ${err?.message || err}`); }
+          finally { event.target.value = ""; }
+        });
+        $id("databaseMysqlExport")?.addEventListener("click", () => void exportMysqlDatabase().catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseStructure")?.addEventListener("click", () => void showDatabaseStructure().catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseHistory")?.addEventListener("click", () => void showDatabaseHistory());
+        $id("databasePreviousPage")?.addEventListener("click", () => void changeDatabasePage(-1).catch((err) => showNotice(err?.message || String(err))));
+        $id("databaseNextPage")?.addEventListener("click", () => void changeDatabasePage(1).catch((err) => showNotice(err?.message || String(err))));
+        $id("developerView")?.addEventListener("click", (event) => {
+          const panelButton = event.target.closest("[data-developer-panel]");
+          if (panelButton) selectDeveloperPanel(panelButton.dataset.developerPanel);
+          const templateButton = event.target.closest("[data-template-use]");
+          if (templateButton) useMarketplaceTemplate(templateButton.dataset.templateUse);
+        });
+        $id("gitInitialize")?.addEventListener("click", () => void refreshGitStatus("init").catch((err) => showNotice(err?.message || String(err))));
+        $id("gitRefresh")?.addEventListener("click", () => void refreshGitStatus().catch((err) => showNotice(err?.message || String(err))));
+        $id("gitCommit")?.addEventListener("click", () => void commitGitChanges().catch((err) => showNotice(err?.message || String(err))));
+        $id("githubImport")?.addEventListener("click", () => void importGithubRepository().catch((err) => showNotice(err?.message || String(err))));
+        $id("gitDownload")?.addEventListener("click", () => void downloadDeveloperProject().catch((err) => showNotice(err?.message || String(err))));
+        $id("dependencyScan")?.addEventListener("click", () => void scanDependencies().catch((err) => showNotice(err?.message || String(err))));
+        $id("dependencyRepair")?.addEventListener("click", () => void repairDependencies().catch((err) => showNotice(err?.message || String(err))));
+        $id("developerLogsRefresh")?.addEventListener("click", renderDeveloperLogs);
+        $id("developerLogsClear")?.addEventListener("click", () => {
+          window.EdgeTermServeLogs = [];
+          window.EdgeTermServePageInfo = null;
+          renderDeveloperLogs();
+        });
+        $id("developerLogsDownload")?.addEventListener("click", exportDeveloperLogs);
+        $id("wordpressScan")?.addEventListener("click", () => void scanWordPressSites().catch((err) => showNotice(err?.message || String(err))));
+        $id("wordpressResults")?.addEventListener("click", (event) => void handleWordPressAction(event).catch((err) => showNotice(err?.message || String(err))));
+        $id("snapshotCreate")?.addEventListener("click", () => void createLocalSnapshot().catch((err) => showNotice(err?.message || String(err))));
+        $id("snapshotResults")?.addEventListener("click", (event) => void handleSnapshotAction(event).catch((err) => showNotice(err?.message || String(err))));
+        $id("performanceAudit")?.addEventListener("click", () => void runPerformanceAudit().catch((err) => showNotice(err?.message || String(err))));
+        $id("performanceFlush")?.addEventListener("click", () => void flushPerformanceSaves().catch((err) => showNotice(err?.message || String(err))));
+        renderTemplateMarketplace();
+        renderLocalSnapshots();
+        renderDeveloperLogs();
         $id("toggleSidebar").addEventListener("click", () => {
           const app = $id("app");
           if (window.innerWidth <= 820) {
@@ -15642,12 +20549,18 @@ shell
             showNotice(`Save failed: ${err.message || err}`);
           });
         }, true);
-        $id("editorPath").addEventListener("keydown", (event) => {
-          if (event.key === "Enter") openEditorInTarget($id("editorPath").value, { target: "main" });
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape" && $id("editorView")?.classList.contains("editor-fullscreen")) {
+            event.preventDefault();
+            toggleEditorFullscreen();
+            return;
+          }
+          if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key === "F11" && $id("editorView")?.classList.contains("active")) {
+            event.preventDefault();
+            toggleEditorFullscreen();
+          }
         });
-        $id("editorSplitPath").addEventListener("keydown", (event) => {
-          if (event.key === "Enter") openEditorInTarget($id("editorSplitPath").value, { target: "split" });
-        });
+        setupEditorWorkspaceEvents();
         $id("editorUploader").addEventListener("change", async (event) => {
         const file = event.target.files?.[0];
         if (!file) return;
@@ -15665,9 +20578,6 @@ shell
         await openEditor(target);
         event.target.value = "";
       });
-        $id("openSplitEditorButton").addEventListener("click", openSplitEditorPrompt);
-        $id("saveSplitEditorButton").addEventListener("click", saveSplitEditor);
-        $id("useSplitAsPrimaryButton").addEventListener("click", promoteSplitEditorToPrimary);
         $id("closePreview").addEventListener("click", closePreview);
         $id("previewOpenEditor").addEventListener("click", async () => {
           if (!previewPath) return;
@@ -15678,34 +20588,6 @@ shell
         $id("previewDownload").addEventListener("click", async () => {
           if (!previewPath) return;
           await downloadPath(previewPath);
-        });
-        $id("commandPaletteInput").addEventListener("input", () => {
-          editorPaletteSelection = 0;
-          renderCommandPalette();
-        });
-        $id("commandPaletteInput").addEventListener("keydown", (event) => {
-          const items = Array.from($id("commandPaletteList").querySelectorAll(".palette-item"));
-          if (event.key === "Escape") {
-            event.preventDefault();
-            closeCommandPalette();
-            return;
-          }
-          if (event.key === "ArrowDown") {
-            event.preventDefault();
-            editorPaletteSelection = Math.min(editorPaletteSelection + 1, Math.max(items.length - 1, 0));
-            renderCommandPalette();
-            return;
-          }
-          if (event.key === "ArrowUp") {
-            event.preventDefault();
-            editorPaletteSelection = Math.max(editorPaletteSelection - 1, 0);
-            renderCommandPalette();
-            return;
-          }
-          if (event.key === "Enter") {
-            event.preventDefault();
-            items[editorPaletteSelection]?.click();
-          }
         });
         $id("clearDisplay").addEventListener("click", () => {
           clearDisplaySurface();
@@ -15856,6 +20738,14 @@ shell
             workerShellReady = false;
             workerShellRequests.clear();
             try {
+              externalShellRuntime?.cancel?.();
+            } catch {}
+            externalShellRuntime = null;
+            try {
+              nodeRuntime?.cancel?.();
+            } catch {}
+            nodeRuntime = null;
+            try {
               term?.disable?.();
               term?.destroy?.();
             } catch {}
@@ -15945,6 +20835,7 @@ shell
             readOnly: false,
             minimap: { enabled: false },
           });
+          registerEdgeTermLanguageProviders();
           applyEditorOptions();
           registerDefaultEditorCommands();
           renderEditorChrome();
@@ -15967,12 +20858,27 @@ shell
           });
           splitEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyP, () => openSplitEditorPrompt());
           editor.onDidChangeModelContent(() => {
+            if (!suppressEditorDirty && editorActiveTabPath) {
+              const tab = editorOpenTabs.get(editorActiveTabPath);
+              if (tab) tab.dirty = editor.getValue() !== tab.savedValue;
+              renderEditorTabs();
+            }
             setEditorStatus("Modified");
+            clearTimeout(editorDiagnosticTimer);
+            editorDiagnosticTimer = setTimeout(() => void updateEditorDiagnostics().catch((err) => console.warn("[EDITOR] diagnostics failed", err)), 450);
+          });
+          editor.onDidChangeCursorPosition(updateEditorStatusBar);
+          editor.onDidChangeModel(() => {
+            updateEditorStatusBar();
+            void updateEditorDiagnostics().catch((err) => console.warn("[EDITOR] diagnostics failed", err));
           });
           splitEditor.onDidChangeModelContent(() => {
             setSplitEditorStatus("Modified");
           });
           window.editor = editor;
+          editorWorkspaceRootPath = `/home/${activeUser()}`;
+          if ($id("editorWorkspaceRoot")) $id("editorWorkspaceRoot").value = editorWorkspaceRootPath;
+          void refreshEditorExplorer();
           console.info("[MONACO] setup ready");
           markRuntimePhase("root-idle");
         })().catch((err) => {
@@ -16011,6 +20917,3058 @@ shell
         }, 300);
       }
 
+      function bridgeError(code, message) {
+        const error = new Error(message);
+        error.code = code;
+        return error;
+      }
+
+      function assertBridgePathWithinRoot(path, root) {
+        const target = assertBridgeWorkspacePath(path);
+        const normalizedRoot = assertBridgeWorkspacePath(root);
+        if (target !== normalizedRoot && !target.startsWith(`${normalizedRoot}/`)) {
+          throw bridgeError(
+            "bridge_path_outside_change_root",
+            `The file is outside the requested change root: ${target}`,
+          );
+        }
+        return target;
+      }
+
+      function bridgeShellExitCode() {
+        if (!pyodide) return 0;
+        try {
+          return Number(
+            pyodide.runPython(`
+import builtins
+int(getattr(getattr(builtins, "EDGETERM_SHELL", None), "last_status", 0))
+`),
+          ) || 0;
+        } catch {
+          return 1;
+        }
+      }
+
+      function bridgeRuntimeReady() {
+        return WORKER_SHELL_ENABLED ? workerShellReady : Boolean(pyodide && edgeTermShell);
+      }
+
+      function bridgeCapabilities() {
+        const currentNodeStatus = nodeRuntime?.status?.() || null;
+        const currentExternalShellStatus = externalShellRuntime?.status?.() || null;
+        return {
+          protocol: EDGETERM_BRIDGE_PROTOCOL,
+          bridge_version: EDGETERM_BRIDGE_VERSION,
+          runtime_version: EDGETERM_BOOT_BUNDLE_VERSION,
+          local_only: true,
+          worker_shell: WORKER_SHELL_ENABLED,
+          methods: [
+            "runtime.status",
+            "runtime.node.prepare",
+            "runtime.node.status",
+            "runtime.node.reset",
+            "runtime.external_shell.prepare",
+            "runtime.external_shell.status",
+            "runtime.external_shell.reset",
+            "runtime.component.status",
+            "runtime.component.invoke",
+            "workspace.list",
+            "workspace.create",
+            "workspace.open",
+            "project.detect",
+            "project.scaffold",
+            "project.environment.inspect",
+            "project.environment.apply",
+            "task.list",
+            "task.run",
+            "task.cancel",
+            "fs.list",
+            "fs.search",
+            "fs.manifest",
+            "fs.read",
+            "fs.stat",
+            "fs.read_binary",
+            "fs.write",
+            "fs.write_new",
+            "fs.replace_text",
+            "fs.replace",
+            "fs.apply_patch",
+            "fs.write_binary",
+            "fs.apply_changes",
+            "fs.move",
+            "fs.diff",
+            "fs.snapshot.create",
+            "fs.snapshot.list",
+            "fs.snapshot.restore",
+            "checkpoint.create",
+            "checkpoint.list",
+            "checkpoint.diff",
+            "checkpoint.restore",
+            "checkpoint.pin",
+            "fs.mkdir",
+            "fs.delete",
+            "editor.open",
+            "terminal.start",
+            "terminal.status",
+            "terminal.output",
+            "terminal.run",
+            "terminal.cancel",
+            "process.start",
+            "process.status",
+            "process.output",
+            "process.input",
+            "process.signal",
+            "process.resize",
+            "process.wait",
+            "language.status",
+            "language.restart",
+            "language.diagnostics",
+            "test.discover",
+            "test.run",
+            "test.cancel",
+            "debug.status",
+            "debug.start",
+            "debug.command",
+            "debug.stop",
+            "packages.npm.install",
+            "packages.npm.ci",
+            "packages.npm.run",
+            "packages.npm.cancel",
+            "packages.npm.cache_status",
+            "packages.apt.update",
+            "packages.apt.install",
+            "packages.apt.remove",
+            "packages.apt.upgrade",
+            "packages.apt.status",
+            "packages.apt.cancel",
+            "app.start",
+            "app.status",
+            "app.restart",
+            "app.stop",
+            "preview.open",
+            "preview.refresh",
+            "preview.inspect",
+            "preview.console",
+            "preview.network",
+            "preview.capture",
+            "preview.request",
+            "artifact.read",
+            "git.status",
+            "git.diff",
+            "git.commit",
+            "git.log",
+            "backup.status",
+            "backup.attach_connection",
+            "backup.create",
+            "backup.list",
+            "backup.verify",
+            "backup.restore_preview",
+            "backup.restore",
+            "backup.cancel",
+            "ui.show",
+          ],
+          runtimes: {
+            static: { available: true },
+            flask: { available: true },
+            fastapi: { available: true },
+            django: { available: true },
+            php: { available: true },
+            npm_frontend: {
+              available: true,
+              frameworks: ["static", "react", "vite", "typescript", "nextjs-static"],
+              hmr: false,
+              ssr: false,
+            },
+            node_wasm: {
+              available: Boolean(currentNodeStatus?.ready),
+              experimental: true,
+              reason: currentNodeStatus?.ready
+                ? ""
+                : currentNodeStatus?.lastError?.message ||
+                  "Prepare and verify the optional Edge.js runtime before running Node programs.",
+              phase: currentNodeStatus?.phase || "idle",
+              runtime_version: currentNodeStatus?.runtimeVersion || "",
+            },
+            external_shell: {
+              available: Boolean(currentExternalShellStatus?.ready),
+              preferred: true,
+              fallback: "python-edgeterm-shell",
+              reason: currentExternalShellStatus?.ready
+                ? ""
+                : currentExternalShellStatus?.lastError?.message ||
+                  "BusyBox is loaded on demand. The Python shell remains available as a fallback.",
+              phase: currentExternalShellStatus?.phase || "idle",
+              runtime: currentExternalShellStatus?.runtime || "busybox-wasix",
+              runtime_version: currentExternalShellStatus?.version || "",
+              license: currentExternalShellStatus?.license || "",
+            },
+          },
+          process_host: processCapabilities({
+            stdin: Boolean(externalShellRuntime?.status?.().interactive || externalShellRuntime?.status?.().interactiveDormant),
+            resize: false,
+          }),
+          component_host: getComponentHost().manifest(),
+          limits: {
+            request_bytes: 1_048_576,
+            file_bytes: 524_288,
+            binary_chunk_bytes: 524_288,
+            manifest_files: 5_000,
+            manifest_bytes: 52_428_800,
+            output_bytes: 1_048_576,
+            changes_per_request: 50,
+            command_characters: 8_000,
+          },
+        };
+      }
+
+      function installBridgeTerminalCapture(terminal) {
+        if (!terminal || terminal.__edgeTermBridgeCaptureInstalled) return;
+        const originalEcho = terminal.echo.bind(terminal);
+        const originalError = terminal.error.bind(terminal);
+        let renderingError = false;
+        terminal.echo = (value, ...args) => {
+          if (!renderingError) recordBridgeTerminalOutput("stdout", value);
+          return originalEcho(value, ...args);
+        };
+        terminal.error = (value, ...args) => {
+          recordBridgeTerminalOutput("stderr", value);
+          renderingError = true;
+          try {
+            return originalError(value, ...args);
+          } finally {
+            renderingError = false;
+          }
+        };
+        Object.defineProperty(terminal, "__edgeTermBridgeCaptureInstalled", {
+          configurable: false,
+          enumerable: false,
+          value: true,
+        });
+      }
+
+      function recordBridgeTerminalOutput(stream, value) {
+        const execution = activeBridgeExecution;
+        if (!execution || execution.captureSuppressed) return;
+        const text = String(value ?? "");
+        if (!text) return;
+        const remaining = Math.max(0, execution.outputLimit - execution.outputBytes);
+        if (!remaining) {
+          execution.truncated = true;
+          return;
+        }
+        let accepted = text;
+        let bytes = new TextEncoder().encode(accepted).byteLength;
+        if (bytes > remaining) {
+          accepted = accepted.slice(0, Math.max(0, remaining));
+          bytes = new TextEncoder().encode(accepted).byteLength;
+          execution.truncated = true;
+        }
+        execution.outputBytes += bytes;
+        execution[stream].push(accepted);
+        edgeTermBridgeServer?.emit("terminal.output", {
+          execution_id: execution.id,
+          stream,
+          text: accepted,
+          truncated: execution.truncated,
+        });
+      }
+
+      async function waitForBridgeRuntime(timeoutMs = 120_000) {
+        const startedAt = Date.now();
+        while (!bridgeRuntimeReady()) {
+          if (Date.now() - startedAt >= timeoutMs) {
+            throw bridgeError("runtime_not_ready", "EdgeTerm is still starting.");
+          }
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      }
+
+      function assertBridgeWorkspacePath(value) {
+        const path = normalizePath(String(value || `/home/${activeUser()}`));
+        const root = `/home/${activeUser()}`;
+        if (path !== root && !path.startsWith(`${root}/`)) {
+          throw bridgeError(
+            "bridge_path_outside_workspace",
+            `Bridge file access is limited to ${root}.`,
+          );
+        }
+        return path;
+      }
+
+      function mainBridgeStat(path) {
+        if (!pyodide?.FS?.analyzePath(path).exists) return { path, exists: false };
+        const stat = pyodide.FS.stat(path);
+        return {
+          path,
+          exists: true,
+          is_dir: pyodide.FS.isDir(stat.mode),
+          is_file: pyodide.FS.isFile(stat.mode),
+          size: Number(stat.size || 0),
+          modified_at: Number(stat.mtime?.getTime?.() || 0),
+        };
+      }
+
+      async function bridgeStat(path) {
+        if (WORKER_SHELL_ENABLED) {
+          const stat = await workerFs("stat", { path });
+          return {
+            path,
+            exists: Boolean(stat.exists),
+            is_dir: Boolean(stat.isDir),
+            is_file: Boolean(stat.isFile),
+            size: Number(stat.size || 0),
+            modified_at: Number(stat.mtime || 0),
+          };
+        }
+        return mainBridgeStat(path);
+      }
+
+      async function bridgeReadText(path, maxBytes = 524_288) {
+        const target = assertBridgeWorkspacePath(path);
+        const stat = await bridgeStat(target);
+        if (!stat.exists || !stat.is_file) {
+          throw bridgeError("bridge_file_not_found", `File not found: ${target}`);
+        }
+        if (stat.size > maxBytes) {
+          throw bridgeError("bridge_file_too_large", `File exceeds the ${maxBytes} byte limit.`);
+        }
+        const content = WORKER_SHELL_ENABLED
+          ? await workerReadText(target)
+          : pyodide.FS.readFile(target, { encoding: "utf8" });
+        if (content.includes("\0")) {
+          throw bridgeError("bridge_binary_file", "Binary files cannot be read through this Bridge method.");
+        }
+        return { path: target, content, size: new TextEncoder().encode(content).byteLength };
+      }
+
+      async function bridgeSha256(value) {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value || "")));
+        return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      }
+
+      async function bridgeSha256Bytes(value) {
+        const digest = await crypto.subtle.digest("SHA-256", value);
+        return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      }
+
+      function bridgeBase64ToBytes(value) {
+        const binary = atob(String(value || ""));
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes;
+      }
+
+      function bridgeBytesToBase64(value) {
+        let binary = "";
+        const bytes = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
+        for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+          binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+        }
+        return btoa(binary);
+      }
+
+      async function bridgeNotifyExternalShellWorkspaceChanged() {
+        markWorkspaceMutation();
+        if (!externalShellRuntime) return;
+        try {
+          await externalShellRuntime.notifyWorkspaceChanged();
+        } catch (error) {
+          console.warn(
+            "[BRIDGE] Could not retire the stale external shell session:",
+            error,
+          );
+        }
+      }
+
+      async function bridgeWriteText(path, content, { persist = true } = {}) {
+        const target = assertBridgeWorkspacePath(path);
+        const text = String(content ?? "");
+        const size = new TextEncoder().encode(text).byteLength;
+        if (size > 524_288) {
+          throw bridgeError("bridge_file_too_large", "Bridge writes are limited to 524,288 bytes per file.");
+        }
+        if (WORKER_SHELL_ENABLED) {
+          await workerFs("writeFile", { path: target, data: text });
+          if (filesViewIsActive()) await refreshWorkerFiles(currentPath);
+        } else {
+          await writeRuntimeFileAndMirror(target, text);
+          if (persist) await persistActiveWorkspace();
+          refreshFilesIfVisible(currentPath);
+        }
+        await bridgeNotifyExternalShellWorkspaceChanged();
+        return {
+          path: target,
+          size,
+          sha256: await bridgeSha256(text),
+        };
+      }
+
+      async function bridgeListFiles(params) {
+        await waitForBridgeRuntime();
+        const path = assertBridgeWorkspacePath(params.path || `/home/${activeUser()}`);
+        if (WORKER_SHELL_ENABLED) {
+          const result = await workerFs("list", { path });
+          return {
+            path,
+            entries: (result.entries || []).map((entry) => ({
+              name: String(entry.name || ""),
+              path: normalizePath(`${path}/${entry.name || ""}`),
+              is_dir: Boolean(entry.isDir),
+              is_file: Boolean(entry.isFile),
+              size: Number(entry.size || 0),
+              modified_at: Number(entry.mtime || 0),
+            })),
+          };
+        }
+        const stat = mainBridgeStat(path);
+        if (!stat.exists || !stat.is_dir) {
+          throw bridgeError("bridge_directory_not_found", `Directory not found: ${path}`);
+        }
+        return {
+          path,
+          entries: pyodide.FS.readdir(path)
+            .filter((name) => name !== "." && name !== "..")
+            .sort()
+            .map((name) => {
+              const child = normalizePath(`${path}/${name}`);
+              return { name, ...mainBridgeStat(child) };
+            }),
+        };
+      }
+
+      async function bridgeReadBinary(params) {
+        await waitForBridgeRuntime();
+        const path = assertBridgeWorkspacePath(params.path);
+        const stat = await bridgeStat(path);
+        if (!stat.exists || !stat.is_file) {
+          throw bridgeError("bridge_file_not_found", `File not found: ${path}`);
+        }
+        const offset = Math.max(0, Number(params.offset || 0));
+        const length = Math.max(1, Math.min(Number(params.length || 524_288), 524_288));
+        const base64 = WORKER_SHELL_ENABLED
+          ? await workerReadBase64(path)
+          : bridgeBytesToBase64(pyodide.FS.readFile(path));
+        const bytes = bridgeBase64ToBytes(base64);
+        const chunk = bytes.subarray(offset, Math.min(bytes.length, offset + length));
+        return {
+          path,
+          offset,
+          size: bytes.length,
+          eof: offset + chunk.length >= bytes.length,
+          data: bridgeBytesToBase64(chunk),
+          encoding: "base64",
+          sha256: await bridgeSha256Bytes(bytes),
+        };
+      }
+
+      async function bridgeWriteBinary(params) {
+        await waitForBridgeRuntime();
+        const path = assertBridgeWorkspacePath(params.path);
+        const bytes = bridgeBase64ToBytes(params.data);
+        if (bytes.byteLength > 524_288) {
+          throw bridgeError("bridge_binary_chunk_too_large", "Binary chunks are limited to 524,288 bytes.");
+        }
+        const offset = Math.max(0, Number(params.offset || 0));
+        const stat = await bridgeStat(path);
+        let current = new Uint8Array();
+        if (stat.exists) {
+          const currentBase64 = WORKER_SHELL_ENABLED
+            ? await workerReadBase64(path)
+            : bridgeBytesToBase64(pyodide.FS.readFile(path));
+          current = bridgeBase64ToBytes(currentBase64);
+        }
+        if (offset > current.byteLength) {
+          throw bridgeError("bridge_binary_offset_invalid", "The binary write offset is beyond the current file.");
+        }
+        const next = new Uint8Array(Math.max(current.byteLength, offset + bytes.byteLength));
+        next.set(current);
+        next.set(bytes, offset);
+        if (WORKER_SHELL_ENABLED) {
+          await workerFs("writeFile", { path, data: bridgeBytesToBase64(next), encoding: "base64" });
+        } else {
+          pyodide.FS.writeFile(path, next);
+          await persistActiveWorkspace();
+        }
+        await bridgeNotifyExternalShellWorkspaceChanged();
+        edgeTermBridgeServer?.emit("fs.changed", { changes: [{ path }] });
+        return {
+          path,
+          offset,
+          size: next.byteLength,
+          sha256: await bridgeSha256Bytes(next),
+        };
+      }
+
+      async function bridgeFileManifest(params) {
+        await waitForBridgeRuntime();
+        const root = assertBridgeWorkspacePath(params.path || `/home/${activeUser()}`);
+        const ignoredNames = new Set([
+          ".git", ".edgeterm-agent", "node_modules", ".next", "__pycache__", ".pytest_cache",
+          ".venv", "venv", "dist", "build",
+        ]);
+        const ignoredPrefixes = [".env", "id_rsa", "id_ed25519"];
+        const files = [];
+        const queue = [root];
+        let totalBytes = 0;
+        while (queue.length) {
+          const directory = queue.shift();
+          const listing = await bridgeListFiles({ path: directory });
+          for (const entry of listing.entries) {
+            if (
+              ignoredNames.has(entry.name) ||
+              ignoredPrefixes.some((prefix) => entry.name === prefix || entry.name.startsWith(`${prefix}.`))
+            ) continue;
+            if (entry.is_dir) {
+              queue.push(entry.path);
+              continue;
+            }
+            if (!entry.is_file) continue;
+            files.push({
+              path: entry.path.slice(root.length).replace(/^\/+/, ""),
+              size: entry.size,
+              modified_at: entry.modified_at,
+            });
+            totalBytes += entry.size;
+            if (files.length > 5_000 || totalBytes > 52_428_800) {
+              throw bridgeError(
+                "bridge_manifest_limit_exceeded",
+                "The project exceeds the 5,000 file or 50 MiB manifest limit.",
+              );
+            }
+          }
+        }
+        return { root, files, file_count: files.length, total_bytes: totalBytes };
+      }
+
+      async function bridgeSearchFiles(params) {
+        await waitForBridgeRuntime();
+        const root = assertBridgeWorkspacePath(params.path || `/home/${activeUser()}`);
+        const query = String(params.query || "");
+        if (!query) {
+          throw bridgeError("bridge_search_query_required", "Enter text to search for.");
+        }
+        const scope = String(params.scope || "both").trim().toLowerCase();
+        if (!["names", "content", "both"].includes(scope)) {
+          throw bridgeError("bridge_search_scope_invalid", "Choose names, content, or both.");
+        }
+        const caseSensitive = Boolean(params.case_sensitive);
+        const needle = caseSensitive ? query : query.toLocaleLowerCase();
+        const extensions = new Set(
+          (Array.isArray(params.extensions) ? params.extensions : [])
+            .map((value) => String(value || "").trim().toLocaleLowerCase().replace(/^\./, ""))
+            .filter(Boolean),
+        );
+        const maxResults = Math.max(1, Math.min(Number(params.max_results || 100), 200));
+        const manifest = await bridgeFileManifest({ path: root });
+        const candidates = manifest.files.filter((file) => {
+          if (!extensions.size) return true;
+          const name = String(file.path || "");
+          const extension = name.includes(".") ? name.split(".").pop().toLocaleLowerCase() : "";
+          return extensions.has(extension);
+        });
+        const matches = [];
+        let scannedFiles = 0;
+        let scannedBytes = 0;
+        for (const file of candidates) {
+          if (scannedFiles >= 1_000 || scannedBytes >= 8_388_608 || matches.length >= maxResults) break;
+          const relativePath = String(file.path || "");
+          const comparablePath = caseSensitive ? relativePath : relativePath.toLocaleLowerCase();
+          if ((scope === "names" || scope === "both") && comparablePath.includes(needle)) {
+            matches.push({
+              path: `${root}/${relativePath}`.replace(/\/+/g, "/"),
+              relative_path: relativePath,
+              match_type: "name",
+            });
+            if (matches.length >= maxResults) break;
+          }
+          if (scope === "names" || Number(file.size || 0) > 262_144) continue;
+          const path = `${root}/${relativePath}`.replace(/\/+/g, "/");
+          let source;
+          try {
+            source = await bridgeReadText(path, 262_144);
+          } catch (error) {
+            if (["bridge_binary_file", "bridge_file_too_large"].includes(String(error?.code || ""))) continue;
+            throw error;
+          }
+          scannedFiles += 1;
+          scannedBytes += Number(source.size || 0);
+          const lines = String(source.content || "").split("\n");
+          for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+            const line = lines[lineIndex];
+            const comparableLine = caseSensitive ? line : line.toLocaleLowerCase();
+            let column = comparableLine.indexOf(needle);
+            while (column >= 0) {
+              matches.push({
+                path,
+                relative_path: relativePath,
+                match_type: "content",
+                line: lineIndex + 1,
+                column: column + 1,
+                excerpt: line.slice(Math.max(0, column - 80), column + query.length + 160),
+              });
+              if (matches.length >= maxResults) break;
+              column = comparableLine.indexOf(needle, column + Math.max(1, needle.length));
+            }
+            if (matches.length >= maxResults) break;
+          }
+        }
+        return {
+          root,
+          query,
+          scope,
+          matches,
+          match_count: matches.length,
+          scanned_files: scannedFiles,
+          scanned_bytes: scannedBytes,
+          truncated: matches.length >= maxResults || scannedFiles < candidates.length,
+        };
+      }
+
+      async function bridgeReplaceText(params) {
+        await waitForBridgeRuntime();
+        const path = assertBridgeWorkspacePath(params.path);
+        const current = await bridgeReadText(path);
+        const beforeSha256 = await bridgeSha256(current.content);
+        if (!params.expected_sha256) {
+          throw bridgeError(
+            "bridge_expected_hash_required",
+            "Read the latest file hash before updating text.",
+          );
+        }
+        if (beforeSha256 !== String(params.expected_sha256)) {
+          throw bridgeError("bridge_file_changed", "The file changed before the update was applied.");
+        }
+        const oldText = String(params.old_text || "");
+        if (!oldText) {
+          throw bridgeError("bridge_search_text_required", "Enter the exact text to replace.");
+        }
+        const newText = String(params.new_text ?? "");
+        const occurrences = current.content.split(oldText).length - 1;
+        if (!occurrences) {
+          throw bridgeError("bridge_text_not_found", "The exact text was not found in the file.");
+        }
+        if (occurrences > 1 && !params.replace_all) {
+          throw bridgeError(
+            "bridge_text_match_ambiguous",
+            "The text appears more than once. Provide a larger exact fragment or enable replace_all.",
+          );
+        }
+        const nextContent = params.replace_all
+          ? current.content.split(oldText).join(newText)
+          : current.content.replace(oldText, newText);
+        const result = await bridgeWriteText(path, nextContent);
+        edgeTermBridgeServer?.emit("fs.changed", { changes: [{ path: result.path }] });
+        return {
+          ...result,
+          replacements: params.replace_all ? occurrences : 1,
+          before_sha256: beforeSha256,
+        };
+      }
+
+      function bridgeProjectPath(root, relativePath = ".") {
+        const normalizedRoot = assertBridgeWorkspacePath(root || `/home/${activeUser()}`);
+        const relative = String(relativePath || ".").replaceAll("\\", "/").replace(/^\.\//, "");
+        return relative === "." ? normalizedRoot : assertBridgeWorkspacePath(`${normalizedRoot}/${relative}`);
+      }
+
+      async function bridgeProjectSourceMap(root, manifest = null) {
+        const listing = manifest || await bridgeFileManifest({ path: root });
+        const sourcePaths = new Set([
+          "package.json",
+          "requirements.txt",
+          "pyproject.toml",
+          "manage.py",
+          "app.py",
+          "main.py",
+          "index.php",
+          "phpunit.xml",
+          "phpunit.xml.dist",
+        ]);
+        const files = new Map();
+        for (const entry of listing.files) {
+          const relative = String(entry.path || "");
+          const relevant = sourcePaths.has(relative)
+            || /(^|\/)test[^/]*\.(?:py|php)$/.test(relative)
+            || /(^|\/)tests\/.*\.(?:py|php|[cm]?[jt]sx?)$/.test(relative);
+          if (!relevant || Number(entry.size || 0) > 262_144) {
+            files.set(relative, "");
+            continue;
+          }
+          try {
+            files.set(relative, (await bridgeReadText(`${root}/${relative}`, 262_144)).content);
+          } catch {
+            files.set(relative, "");
+          }
+        }
+        return files;
+      }
+
+      async function bridgeLoadProjectEnvironment(params = {}) {
+        await waitForBridgeRuntime();
+        const root = assertBridgeWorkspacePath(params.root || params.path || `/home/${activeUser()}`);
+        const configPath = `${root}/edgeterm.toml`;
+        const configStat = await bridgeStat(configPath);
+        const manifest = await bridgeFileManifest({ path: root });
+        let configuration;
+        let generated = false;
+        if (configStat.exists && configStat.is_file) {
+          configuration = parseProjectConfiguration((await bridgeReadText(configPath)).content);
+        } else {
+          configuration = detectProjectConfiguration(
+            await bridgeProjectSourceMap(root, manifest),
+            { name: root.split("/").filter(Boolean).pop() || activeWorkspace()?.name || "EdgeTerm project" },
+          );
+          generated = true;
+        }
+        return { root, config_path: configPath, configuration, generated, manifest };
+      }
+
+      async function bridgeSaveGeneratedProjectConfiguration(root) {
+        const loaded = await bridgeLoadProjectEnvironment({ root });
+        if (!loaded.generated) return { path: loaded.config_path, written: false };
+        const result = await bridgeWriteText(
+          loaded.config_path,
+          serializeProjectConfiguration(loaded.configuration),
+          { persist: false },
+        );
+        return { ...result, written: true };
+      }
+
+      async function bridgeInspectProjectEnvironment(params = {}) {
+        const loaded = await bridgeLoadProjectEnvironment(params);
+        const installed = { apt: [], npm: [], pip: [] };
+        if (loaded.configuration.packages.apt.length) {
+          installed.apt = (await getExternalShellRuntime().installedPackages()).map((entry) => entry.name);
+        }
+        for (const packageName of loaded.configuration.packages.npm) {
+          const packagePath = `${loaded.root}/node_modules/${packageName}/package.json`;
+          if ((await bridgeStat(packagePath)).exists) installed.npm.push(packageName);
+        }
+        if (loaded.configuration.packages.pip.length) {
+          const sitePath = `/home/${activeUser()}/.local/lib/python3.12/site-packages`;
+          const siteStat = await bridgeStat(sitePath);
+          if (siteStat.exists && siteStat.is_dir) {
+            const listing = await bridgeListFiles({ path: sitePath });
+            installed.pip = listing.entries
+              .map((entry) => String(entry.name || "").replace(/-(?:[0-9].*)?\.dist-info$/i, "").replace(/\.dist-info$/i, ""))
+              .filter(Boolean);
+          }
+        }
+        const inspection = inspectProjectEnvironment(loaded.configuration, installed);
+        const vaultEntries = new Set((await getSecretVault().list()).map((entry) => entry.id));
+        return {
+          root: loaded.root,
+          config_path: loaded.config_path,
+          generated: loaded.generated,
+          config_source: serializeProjectConfiguration(loaded.configuration),
+          ...inspection,
+          secret_references: inspection.secret_references.map((entry) => ({
+            ...entry,
+            available: vaultEntries.has(String(entry.reference).replace(/^vault:/, "")),
+          })),
+        };
+      }
+
+      async function bridgeResolveProjectEnvironment(configuration) {
+        const resolved = { ...configuration.env };
+        for (const [key, reference] of Object.entries(configuration.secrets)) {
+          resolved[key] = await getSecretVault().get(reference);
+        }
+        return resolved;
+      }
+
+      async function bridgeApplyProjectEnvironment(params = {}) {
+        const loaded = await bridgeLoadProjectEnvironment(params);
+        const inspection = await bridgeInspectProjectEnvironment({ root: loaded.root });
+        for (const entry of inspection.secret_references) {
+          if (!entry.available) {
+            throw bridgeError(
+              "project_vault_entry_missing",
+              `The local vault entry is missing for ${entry.key}: ${entry.reference}`,
+            );
+          }
+        }
+        const checkpoint = await bridgeCreateDevelopmentCheckpoint({
+          root: loaded.root,
+          label: "Before environment restore",
+          evidence: { operation: "project.environment.apply" },
+        });
+        const applied = [];
+        if (inspection.missing.apt.length) {
+          const result = await bridgeRunApt("packages.apt.install", { packages: inspection.missing.apt });
+          if (result.exit_code !== 0) throw bridgeError("project_apt_restore_failed", "APT could not restore the project environment.");
+          applied.push({ manager: "apt", packages: inspection.missing.apt });
+        }
+        if (inspection.missing.npm.length) {
+          const result = await getNodeRuntime().executeNpm(loaded.root, ["install", ...inspection.missing.npm]);
+          if (Number(result?.exitCode || 0) !== 0) throw bridgeError("project_npm_restore_failed", "npm could not restore the project environment.");
+          applied.push({ manager: "npm", packages: inspection.missing.npm });
+        }
+        if (inspection.missing.pip.length) {
+          if (inspection.missing.pip.some((name) => !/^[A-Za-z0-9_.\-[\],<>=!~]+$/.test(name))) {
+            throw bridgeError("project_pip_spec_invalid", "A pip dependency contains unsupported characters.");
+          }
+          const result = await bridgeRunTerminal({
+            command: `python -m pip install ${inspection.missing.pip.join(" ")}`,
+            cwd: loaded.root,
+          });
+          if (result.exit_code !== 0) throw bridgeError("project_pip_restore_failed", "pip could not restore the project environment.");
+          applied.push({ manager: "pip", packages: inspection.missing.pip });
+        }
+        if (loaded.generated && params.write_config !== false) {
+          await bridgeWriteText(loaded.config_path, serializeProjectConfiguration(loaded.configuration));
+        }
+        return {
+          root: loaded.root,
+          applied,
+          checkpoint,
+          configuration_written: loaded.generated && params.write_config !== false,
+        };
+      }
+
+      async function bridgeListProjectTasks(params = {}) {
+        const loaded = await bridgeLoadProjectEnvironment(params);
+        return { root: loaded.root, tasks: loaded.configuration.tasks, preview: loaded.configuration.preview };
+      }
+
+      async function bridgeRunProjectTask(params = {}) {
+        const loaded = await bridgeLoadProjectEnvironment(params);
+        const taskId = String(params.task_id || "");
+        const task = loaded.configuration.tasks.find((entry) => entry.id === taskId);
+        if (!task) throw bridgeError("project_task_not_found", `Project task not found: ${taskId}`);
+        const cwd = bridgeProjectPath(loaded.root, task.cwd);
+        const env = await bridgeResolveProjectEnvironment(loaded.configuration);
+        const process = await getProcessHost().start({
+          command: task.command,
+          cwd,
+          env,
+          foreground: !task.background,
+          pty: true,
+        });
+        projectTaskRuns.set(process.id, { task, root: loaded.root, process_id: process.id });
+        return { task, process };
+      }
+
+      async function bridgeCancelProjectTask(params = {}) {
+        const processId = String(params.process_id || "");
+        if (!projectTaskRuns.has(processId)) throw bridgeError("project_task_run_not_found", "The project task run was not found.");
+        return await getProcessHost().signal(processId, "SIGINT");
+      }
+
+      async function bridgeDiscoverTests(params = {}) {
+        const loaded = await bridgeLoadProjectEnvironment(params);
+        const suites = discoverTestSuites(await bridgeProjectSourceMap(loaded.root, loaded.manifest));
+        for (const suite of suites) testSuiteCache.set(`${loaded.root}:${suite.id}`, suite);
+        return { root: loaded.root, suites };
+      }
+
+      async function bridgeRunTests(params = {}) {
+        const discovered = await bridgeDiscoverTests(params);
+        const suiteId = String(params.suite_id || discovered.suites[0]?.id || "");
+        const suite = testSuiteCache.get(`${discovered.root}:${suiteId}`);
+        if (!suite) throw bridgeError("test_suite_not_found", `Test suite not found: ${suiteId}`);
+        const loaded = await bridgeLoadProjectEnvironment({ root: discovered.root });
+        return await getTestController().run(suite, {
+          cwd: discovered.root,
+          env: await bridgeResolveProjectEnvironment(loaded.configuration),
+        });
+      }
+
+      async function bridgeDetectProject(params) {
+        const root = assertBridgeWorkspacePath(params.path || `/home/${activeUser()}`);
+        const listing = await bridgeFileManifest({ path: root });
+        const paths = new Set(listing.files.map((file) => file.path));
+        let framework = "blank";
+        let entry = "";
+        if (paths.has("manage.py")) {
+          framework = "django";
+          entry = "manage.py";
+        } else if (paths.has("package.json")) {
+          framework = "node";
+          entry = "package.json";
+        } else if (paths.has("index.php")) {
+          framework = "php";
+          entry = "index.php";
+        } else if (paths.has("app.py") || paths.has("main.py")) {
+          const target = paths.has("app.py") ? "app.py" : "main.py";
+          const source = await bridgeReadText(`${root}/${target}`);
+          framework = source.content.includes("FastAPI(") ? "fastapi" : "flask";
+          entry = target;
+        } else if (paths.has("index.html")) {
+          framework = "static";
+          entry = "index.html";
+        }
+        return {
+          root,
+          framework,
+          entry,
+          file_count: listing.file_count,
+          total_bytes: listing.total_bytes,
+          node_wasm_available: Boolean(nodeRuntime?.status?.().ready),
+          busybox_wasix_available: Boolean(externalShellRuntime?.status?.().ready),
+          busybox_wasix_status: externalShellRuntime?.status?.().phase || "idle",
+        };
+      }
+
+      async function bridgeScaffoldProject(params) {
+        await waitForBridgeRuntime();
+        const template = String(params.template || "blank").trim().toLowerCase();
+        const allowed = new Set(["blank", "static", "flask", "fastapi", "django", "php", "react-vite", "node"]);
+        if (!allowed.has(template)) {
+          throw bridgeError("bridge_template_invalid", "Choose a supported Website Builder template.");
+        }
+        const name = String(params.name || "website")
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9_-]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 64) || "website";
+        const parent = assertBridgeWorkspacePath(params.parent || `/home/${activeUser()}`);
+        const root = assertBridgeWorkspacePath(`${parent}/${name}`);
+        const stat = await bridgeStat(root);
+        if (stat.exists) {
+          throw bridgeError("bridge_project_exists", `The project already exists: ${root}`);
+        }
+        const files = {
+          blank: {},
+          static: {
+            "index.html": "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>New website</title><link rel=\"stylesheet\" href=\"styles.css\"></head><body><main><h1>New website</h1><p>Start building here.</p></main><script src=\"app.js\"></script></body></html>\n",
+            "styles.css": "body{margin:0;font-family:system-ui,sans-serif;background:#f7f8fb;color:#151923}main{max-width:72rem;margin:auto;padding:6rem 2rem}h1{font-size:clamp(3rem,8vw,7rem);margin:0 0 1rem}\n",
+            "app.js": "\"use strict\";\n",
+          },
+          flask: {
+            "app.py": "from flask import Flask\n\napp = Flask(__name__)\n\n@app.get(\"/\")\ndef index():\n    return \"<h1>New Flask website</h1>\"\n",
+            "requirements.txt": "Flask>=3.0,<4\n",
+          },
+          fastapi: {
+            "main.py": "from fastapi import FastAPI\nfrom fastapi.responses import HTMLResponse\n\napp = FastAPI()\n\n@app.get(\"/\", response_class=HTMLResponse)\nasync def index():\n    return \"<h1>New FastAPI website</h1>\"\n",
+            "requirements.txt": "fastapi==0.109.0\nJinja2\n",
+          },
+          django: {
+            "manage.py": "import os\nimport sys\n\nif __name__ == \"__main__\":\n    os.environ.setdefault(\"DJANGO_SETTINGS_MODULE\", \"siteapp.settings\")\n    from django.core.management import execute_from_command_line\n    execute_from_command_line(sys.argv)\n",
+            "siteapp/__init__.py": "",
+            "siteapp/settings.py": "SECRET_KEY = \"edgeterm-local-development\"\nDEBUG = True\nROOT_URLCONF = \"siteapp.urls\"\nALLOWED_HOSTS = [\"*\"]\nMIDDLEWARE = []\nINSTALLED_APPS = []\n",
+            "siteapp/urls.py": "from django.http import HttpResponse\nfrom django.urls import path\n\nurlpatterns = [path(\"\", lambda request: HttpResponse(\"<h1>New Django website</h1>\"))]\n",
+            "siteapp/wsgi.py": "import os\nfrom django.core.wsgi import get_wsgi_application\nos.environ.setdefault(\"DJANGO_SETTINGS_MODULE\", \"siteapp.settings\")\napplication = get_wsgi_application()\n",
+            "requirements.txt": "Django>=5.1,<6\n",
+          },
+          php: {
+            "index.php": "<?php\nheader('Content-Type: text/html; charset=utf-8');\necho '<h1>New PHP website</h1>';\n",
+          },
+          "react-vite": {
+            "package.json": "{\"private\":true,\"scripts\":{\"dev\":\"vite\",\"build\":\"vite build\",\"preview\":\"vite preview\"},\"dependencies\":{\"@vitejs/plugin-react\":\"latest\",\"vite\":\"latest\",\"react\":\"latest\",\"react-dom\":\"latest\"},\"devDependencies\":{}}\n",
+            "index.html": "<!doctype html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>React website</title></head><body><div id=\"root\"></div><script type=\"module\" src=\"/src/main.jsx\"></script></body></html>\n",
+            "src/main.jsx": "import React from 'react';\nimport { createRoot } from 'react-dom/client';\nimport './style.css';\ncreateRoot(document.getElementById('root')).render(<main><h1>New React website</h1></main>);\n",
+            "src/style.css": "body{margin:0;font-family:system-ui,sans-serif}main{padding:5rem}\n",
+          },
+          node: {
+            "package.json": "{\"private\":true,\"scripts\":{\"start\":\"node server.js\"}}\n",
+            "server.js": "const http = require('node:http');\nhttp.createServer((request,response)=>{response.writeHead(200,{'content-type':'text/html'});response.end('<h1>New Node website</h1>');}).listen(3000);\n",
+          },
+        }[template];
+        if (WORKER_SHELL_ENABLED) await workerFs("mkdir", { path: root });
+        else ensureDir(root);
+        const changes = [];
+        for (const [relativePath, content] of Object.entries(files)) {
+          const target = `${root}/${relativePath}`;
+          const parentPath = target.slice(0, target.lastIndexOf("/"));
+          if (WORKER_SHELL_ENABLED) await workerFs("mkdir", { path: parentPath });
+          else ensureDir(parentPath);
+          const result = await bridgeWriteText(target, content, { persist: false });
+          changes.push(result);
+        }
+        const configuration = await bridgeSaveGeneratedProjectConfiguration(root);
+        if (configuration.written) changes.push(configuration);
+        if (!WORKER_SHELL_ENABLED) await persistActiveWorkspace();
+        edgeTermBridgeServer?.emit("fs.changed", { changes });
+        return { root, template, files: changes, experimental: ["react-vite", "node"].includes(template) };
+      }
+
+      function bridgeAppSummary(entry) {
+        return {
+          id: entry.id,
+          label: entry.label || entry.id,
+          framework: entry.requestedMode || entry.mode || "app",
+          mode: entry.mode || "app",
+          target: entry.target || "",
+          root: entry.projectRoot || entry.workingDirectory || "",
+          route_prefix: entry.routePrefix || "",
+          virtual_port: Number(entry.virtualPort || entry.port || 8000),
+          state: entry.state || "running",
+          started_at: entry.startedAt || null,
+        };
+      }
+
+      async function bridgeStartApp(params) {
+        const requestedFramework = String(params.framework || "").trim().toLowerCase();
+        const root = assertBridgeWorkspacePath(params.root || `/home/${activeUser()}`);
+        let framework = requestedFramework;
+        let target = String(params.target || "").trim();
+        if (!framework) {
+          const detected = await bridgeDetectProject({ path: root });
+          framework = detected.framework;
+          target ||= detected.entry;
+        }
+        if (framework === "node") {
+          const runtime = getNodeRuntime();
+          const packageMetadata = JSON.parse(
+            await createNodeRuntimeFsAdapter().readText(`${root}/package.json`),
+          );
+          const scripts = packageMetadata.scripts || {};
+          const script = String(
+            params.script ||
+              (scripts.dev ? "dev" : scripts.preview ? "preview" : scripts.start ? "start" : ""),
+          );
+          if (!script) {
+            throw bridgeError(
+              "bridge_node_script_missing",
+              "Add a dev, preview, or start script to package.json before starting the app.",
+            );
+          }
+          const result = await runtime.executeNpm(root, ["run", script]);
+          if (Number(result?.exitCode || 0) !== 0) {
+            throw bridgeError(
+              result?.errorCode || "bridge_node_app_failed",
+              result?.error || `npm run ${script} failed.`,
+            );
+          }
+          const preview = runtime.status().preview;
+          if (preview?.id) {
+            preview.virtualPort = Math.max(
+              1,
+              Math.min(Number(params.virtual_port || params.port || 3000), 65535),
+            );
+            const summary = bridgeAppSummary(preview);
+            edgeTermBridgeServer?.emit("app.status", summary);
+            return summary;
+          }
+          const staticCandidate = await bridgeStat(`${root}/dist`);
+          if (!staticCandidate.exists || !staticCandidate.is_dir) {
+            throw bridgeError(
+              "bridge_node_request_dispatch_unavailable",
+              "This Node script did not produce a static preview. Generic Node HTTP and SSR remain experimental.",
+            );
+          }
+          framework = "static";
+          target = "dist";
+        }
+        if (framework === "php") {
+          const manifestPath = packageManifestPath("php");
+          const persistedRoot = persistedPackageRootPath("php");
+          const installedManifest = installedRuntimePackageManifestPath("php");
+          const manifestReady = WORKER_SHELL_ENABLED
+            ? (await workerFsStat(manifestPath)).exists
+            : fsPathExists(manifestPath);
+          const persistedReady = WORKER_SHELL_ENABLED
+            ? (await workerFsStat(persistedRoot)).exists
+            : fsPathExists(persistedRoot);
+          const installedReady = WORKER_SHELL_ENABLED
+            ? (await workerFsStat(installedManifest)).exists
+            : fsPathExists(installedManifest);
+          if (!manifestReady && !persistedReady && !installedReady) {
+            throw bridgeError(
+              "bridge_php_runtime_missing",
+              "The PHP WebAssembly runtime is not installed. Run `apt update && apt install php`, then retry the app start.",
+            );
+          }
+        }
+        target = normalizeAppTarget(framework, target, root);
+        const mappings = {
+          static: { mode: "static", target: target || "." },
+          flask: { mode: "flask", target: target || "app:app" },
+          fastapi: { mode: "asgi", target: target || "main:app" },
+          django: { mode: "django", target: target || "siteapp.wsgi:application" },
+          php: { mode: "php", target: target || "index.php" },
+        };
+        const mapped = mappings[framework];
+        if (!mapped) {
+          throw bridgeError(
+            "bridge_runtime_unavailable",
+            "This application runtime is not available in EdgeTerm.",
+          );
+        }
+        const template = {
+          id: framework,
+          label: String(params.label || `${framework} app`),
+          icon: "globe-2",
+          mode: mappings[framework]?.mode || "static",
+          target: target || mappings[framework]?.target || "dist",
+        };
+        const instance = await launchProject(template, root);
+        instance.virtualPort = Math.max(
+          1,
+          Math.min(Number(params.virtual_port || params.port || 8000), 65535),
+        );
+        edgeTermBridgeServer?.emit("app.status", bridgeAppSummary(instance));
+        return bridgeAppSummary(instance);
+      }
+
+      async function bridgeAppAction(method, params) {
+        const entries = runCenterEntries();
+        if (method === "app.status") {
+          return { apps: entries.map(bridgeAppSummary) };
+        }
+        const id = String(params.app_id || entries[0]?.id || "");
+        const entry = entries.find((item) => item.id === id);
+        if (!entry) throw bridgeError("bridge_app_not_found", "The EdgeTerm app was not found.");
+        if (method === "app.stop") {
+          if (nodeRuntime?.status?.().preview?.id === id) nodeRuntime.cancel();
+          else stopRunCenterEntry(entry);
+          const result = { ...bridgeAppSummary(entry), state: "stopped" };
+          edgeTermBridgeServer?.emit("app.status", result);
+          return result;
+        }
+        if (method === "app.restart") {
+          const next = await restartRunCenterEntry(entry);
+          const result = bridgeAppSummary(next || runCenterEntries()[0]);
+          edgeTermBridgeServer?.emit("app.status", result);
+          return result;
+        }
+        await openRunCenterEntry(entry);
+        const result = bridgeAppSummary(entry);
+        edgeTermBridgeServer?.emit("preview.updated", result);
+        return result;
+      }
+
+      async function bridgePreviewInspect(params) {
+        const entries = runCenterEntries();
+        const id = String(params.app_id || entries[0]?.id || "");
+        const entry = entries.find((item) => item.id === id);
+        if (!entry) throw bridgeError("bridge_app_not_found", "The EdgeTerm app was not found.");
+        await openRunCenterEntry(entry);
+        const recentLogs = Array.isArray(window.EdgeTermServeLogs)
+          ? window.EdgeTermServeLogs.slice(-100)
+          : [];
+        const networkEvents = new Set([
+          "request",
+          "response",
+          "fetch",
+          "document",
+          "browser",
+          "not-found",
+          "redirect-missing-location",
+        ]);
+        const consoleEvents = new Set([
+          "failed",
+          "parse-failed",
+          "runtime-missing",
+          "history-security-suppressed",
+        ]);
+        const activeTab = activeDisplayBrowserTab();
+        const previewFrame = activeTab
+          ? $id(displayBrowserFrameId(activeTab.id))
+          : null;
+        return {
+          app: bridgeAppSummary(entry),
+          active_view: document.querySelector(".view.active")?.id || "",
+          active_url: activeTab?.currentPath || appModeState.currentUrl || "",
+          console: recentLogs.filter((item) => consoleEvents.has(String(item?.event || ""))),
+          network: recentLogs.filter((item) => networkEvents.has(String(item?.event || ""))),
+          capture_supported: Boolean(previewFrame?.contentDocument?.documentElement),
+        };
+      }
+
+      function bridgeStoreArtifact(artifact) {
+        const id = crypto.randomUUID();
+        const entry = {
+          id,
+          created_at: new Date().toISOString(),
+          ...artifact,
+        };
+        bridgeArtifactStore.set(id, entry);
+        while (bridgeArtifactStore.size > 20) {
+          bridgeArtifactStore.delete(bridgeArtifactStore.keys().next().value);
+        }
+        return {
+          id,
+          media_type: entry.media_type,
+          bytes: Number(entry.bytes?.byteLength || entry.text?.length || 0),
+          created_at: entry.created_at,
+          temporary: true,
+        };
+      }
+
+      async function bridgeCapturePreview(params = {}) {
+        const inspected = await bridgePreviewInspect(params);
+        const activeTab = activeDisplayBrowserTab();
+        const frame = activeTab ? $id(displayBrowserFrameId(activeTab.id)) : null;
+        const documentElement = frame?.contentDocument?.documentElement;
+        if (!documentElement) {
+          throw bridgeError(
+            "bridge_preview_capture_unavailable",
+            "Open the selected preview before requesting a capture.",
+          );
+        }
+        const width = Math.max(
+          320,
+          Math.min(Number(params.width || frame.clientWidth || 1280), 1920),
+        );
+        const height = Math.max(
+          240,
+          Math.min(Number(params.height || frame.clientHeight || 900), 1600),
+        );
+        const html = documentElement.outerHTML
+          .replace(
+            /^<html(?![^>]*\sxmlns=)/i,
+            '<html xmlns="http://www.w3.org/1999/xhtml"',
+          )
+          .slice(0, 750_000);
+        const domArtifact = bridgeStoreArtifact({
+          kind: "preview-dom",
+          media_type: "text/html",
+          text: html,
+        });
+        let captureTimeout = null;
+        try {
+          const canvas = await Promise.race([
+            html2canvas(documentElement, {
+              allowTaint: false,
+              backgroundColor:
+                frame.contentDocument?.body
+                  ? getComputedStyle(frame.contentDocument.body).backgroundColor
+                  : "#ffffff",
+              foreignObjectRendering: false,
+              height,
+              logging: false,
+              removeContainer: true,
+              scale: 1,
+              scrollX: 0,
+              scrollY: 0,
+              useCORS: true,
+              width,
+              windowHeight: height,
+              windowWidth: width,
+            }),
+            new Promise((_, reject) => {
+              captureTimeout = setTimeout(
+                () => reject(
+                  bridgeError(
+                    "bridge_preview_capture_timeout",
+                    "The visual preview capture timed out.",
+                  ),
+                ),
+                8_000,
+              );
+            }),
+          ]);
+          if (captureTimeout !== null) clearTimeout(captureTimeout);
+          const blob = await new Promise((resolve, reject) => {
+            canvas.toBlob(
+              (value) => value
+                ? resolve(value)
+                : reject(
+                    bridgeError(
+                      "bridge_preview_capture_encode_failed",
+                      "The browser could not encode the preview capture.",
+                    ),
+                  ),
+              "image/webp",
+              0.82,
+            );
+          });
+          const bytes = new Uint8Array(await blob.arrayBuffer());
+          const imageArtifact = bridgeStoreArtifact({
+            kind: "preview-image",
+            media_type: "image/webp",
+            bytes,
+          });
+          return {
+            app: inspected.app,
+            capture_supported: true,
+            width,
+            height,
+            artifact_handles: [imageArtifact, domArtifact],
+            summary: `Captured the ${width}x${height} preview in this browser.`,
+          };
+        } catch (error) {
+          if (captureTimeout !== null) clearTimeout(captureTimeout);
+          return {
+            app: inspected.app,
+            capture_supported: false,
+            width,
+            height,
+            artifact_handles: [domArtifact],
+            reason: String(error?.message || error || "Preview capture failed"),
+            summary: "Saved the current preview DOM, but visual capture was unavailable.",
+          };
+        }
+      }
+
+      function bridgeReadArtifact(params = {}) {
+        const id = String(params.artifact_id || "");
+        const artifact = bridgeArtifactStore.get(id);
+        if (!artifact) {
+          throw bridgeError(
+            "bridge_artifact_not_found",
+            "The temporary browser artifact was not found.",
+          );
+        }
+        const offset = Math.max(0, Number(params.offset || 0));
+        const maxBytes = Math.max(
+          1_000,
+          Math.min(Number(params.max_bytes || 128_000), 256_000),
+        );
+        if (typeof artifact.text === "string") {
+          const content = artifact.text.slice(offset, offset + maxBytes);
+          return {
+            artifact_id: id,
+            media_type: artifact.media_type,
+            encoding: "utf-8",
+            content,
+            offset,
+            total_length: artifact.text.length,
+            has_more: offset + content.length < artifact.text.length,
+          };
+        }
+        const bytes = artifact.bytes instanceof Uint8Array
+          ? artifact.bytes
+          : new Uint8Array();
+        const chunk = bytes.slice(offset, offset + maxBytes);
+        return {
+          artifact_id: id,
+          media_type: artifact.media_type,
+          encoding: "base64",
+          content: bytesToBase64(chunk),
+          offset,
+          total_length: bytes.byteLength,
+          has_more: offset + chunk.byteLength < bytes.byteLength,
+        };
+      }
+
+      async function bridgePreviewRequest(params) {
+        const entries = runCenterEntries();
+        const id = String(params.app_id || entries[0]?.id || "");
+        const entry = entries.find((item) => item.id === id);
+        if (!entry) throw bridgeError("bridge_app_not_found", "The EdgeTerm app was not found.");
+
+        const method = String(params.method || "GET").trim().toUpperCase();
+        if (!["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].includes(method)) {
+          throw bridgeError("bridge_request_method_invalid", "Choose a supported HTTP method.");
+        }
+        const rawPath = String(params.path || "/").trim() || "/";
+        let parsedPath;
+        try {
+          parsedPath = new URL(rawPath, "https://edgeterm.local/");
+        } catch {
+          throw bridgeError("bridge_request_path_invalid", "Enter a valid preview path.");
+        }
+        if (parsedPath.origin !== "https://edgeterm.local") {
+          throw bridgeError("bridge_request_path_invalid", "Preview requests must stay inside the running app.");
+        }
+
+        const headers = {};
+        for (const [name, value] of Object.entries(params.headers || {}).slice(0, 50)) {
+          const normalizedName = String(name || "").trim().toLowerCase();
+          if (!/^[a-z0-9!#$%&'*+.^_`|~-]{1,128}$/.test(normalizedName)) continue;
+          headers[normalizedName] = String(value ?? "").slice(0, 8_192);
+        }
+        let body = String(params.body ?? "");
+        if (params.json_body !== undefined) {
+          body = JSON.stringify(params.json_body);
+          headers["content-type"] ||= "application/json";
+        }
+        if (new TextEncoder().encode(body).byteLength > 131_072) {
+          throw bridgeError("bridge_request_body_too_large", "The preview request body is too large.");
+        }
+
+        if (!edgeServeInstanceIsInActiveWorkspace(entry)) {
+          throw bridgeError(
+            "bridge_app_workspace_mismatch",
+            "This app belongs to another EdgeTerm workspace. Open that workspace before using the preview.",
+          );
+        }
+        const routePrefix = normalizePath(entry.routePrefix || "/");
+        const relativePath = normalizePath(parsedPath.pathname || "/");
+        const requestPath =
+          routePrefix !== "/" &&
+          (relativePath === routePrefix || relativePath.startsWith(`${routePrefix}/`))
+            ? relativePath.slice(routePrefix.length) || "/"
+            : relativePath;
+        const requestUrl = `${requestPath || "/"}${parsedPath.search || ""}`;
+        const response = await dispatchAppModeRequest(requestUrl, {
+          method,
+          headers,
+          body,
+          currentPath: routePrefix,
+        }, entry);
+        const contentType = String(
+          response.headers?.["content-type"] ||
+            response.headers?.["Content-Type"] ||
+            "",
+        );
+        const completeBody = responseBodyText(response);
+        const bodyText = completeBody.slice(0, 200_000);
+        let json = null;
+        if (/json/i.test(contentType) && bodyText) {
+          try {
+            json = JSON.parse(bodyText);
+          } catch {}
+        }
+        return {
+          app: bridgeAppSummary(entry),
+          method,
+          path: `${parsedPath.pathname || "/"}${parsedPath.search || ""}`,
+          status: Number(response.status || 0),
+          headers: response.headers || {},
+          body: bodyText,
+          json,
+          truncated: completeBody.length > bodyText.length,
+        };
+      }
+
+      async function bridgeApplyChanges(params) {
+        await waitForBridgeRuntime();
+        const changes = Array.isArray(params.changes) ? params.changes : [];
+        if (!changes.length || changes.length > 50) {
+          throw bridgeError(
+            "bridge_changes_invalid",
+            "Provide between 1 and 50 complete text file changes.",
+          );
+        }
+        const prepared = [];
+        let totalBytes = 0;
+        for (const change of changes) {
+          const path = assertBridgeWorkspacePath(change?.path);
+          const content = String(change?.content ?? "");
+          totalBytes += new TextEncoder().encode(content).byteLength;
+          if (totalBytes > 1_048_576) {
+            throw bridgeError("bridge_request_too_large", "The combined file changes are too large.");
+          }
+          const stat = await bridgeStat(path);
+          const before = stat.exists ? await bridgeReadText(path) : { content: "" };
+          const beforeHash = await bridgeSha256(before.content);
+          if (change?.expected_sha256 && String(change.expected_sha256) !== beforeHash) {
+            throw bridgeError(
+              "bridge_file_changed",
+              `The file changed before the update was applied: ${path}`,
+            );
+          }
+          prepared.push({
+            path,
+            content,
+            existed: stat.exists,
+            before: before.content,
+            beforeHash,
+          });
+        }
+        const checkpointRoot = params.root
+          ? assertBridgeWorkspacePath(params.root)
+          : (() => {
+              const parents = prepared.map((entry) => entry.path.split("/").slice(0, -1));
+              const common = [];
+              for (let index = 0; index < Math.min(...parents.map((entry) => entry.length)); index += 1) {
+                const segment = parents[0][index];
+                if (!parents.every((entry) => entry[index] === segment)) break;
+                common.push(segment);
+              }
+              return common.join("/") || `/home/${activeUser()}`;
+            })();
+        const checkpoint = params.create_snapshot === false
+          ? null
+          : await bridgeCreateDevelopmentCheckpoint({
+              root: checkpointRoot,
+              label: String(params.label || "Before batch file change"),
+              evidence: { operation: "fs.apply_changes", files: prepared.map((entry) => entry.path) },
+            });
+        const applied = [];
+        try {
+          for (const change of prepared) {
+            const result = await bridgeWriteText(change.path, change.content, { persist: false });
+            applied.push({
+              path: change.path,
+              created: !change.existed,
+              before_sha256: change.beforeHash,
+              after_sha256: result.sha256,
+              size: result.size,
+            });
+          }
+          if (!WORKER_SHELL_ENABLED) await persistActiveWorkspace();
+        } catch (error) {
+          for (const change of prepared.slice(0, applied.length).reverse()) {
+            try {
+              if (change.existed) {
+                await bridgeWriteText(change.path, change.before, { persist: false });
+              } else if (WORKER_SHELL_ENABLED) {
+                await workerFs("unlink", { path: change.path });
+              } else if (pyodide.FS.analyzePath(change.path).exists) {
+                pyodide.FS.unlink(change.path);
+              }
+            } catch (rollbackError) {
+              console.error("[BRIDGE] File rollback failed:", rollbackError);
+            }
+          }
+          if (!WORKER_SHELL_ENABLED) await persistActiveWorkspace();
+          throw error;
+        }
+        edgeTermBridgeServer?.emit("fs.changed", { changes: applied });
+        return { changes: applied, checkpoint_id: checkpoint?.id || null };
+      }
+
+      function bridgeAgentSnapshotMetadataKey() {
+        return `edgeterm.agentSnapshots.${activeWorkspaceId || "default"}`;
+      }
+
+      function bridgeAgentSnapshotMetadata() {
+        try {
+          const value = JSON.parse(localStorage.getItem(bridgeAgentSnapshotMetadataKey()) || "[]");
+          return Array.isArray(value) ? value : [];
+        } catch {
+          return [];
+        }
+      }
+
+      async function bridgeRemoveFile(path) {
+        const target = assertBridgeWorkspacePath(path);
+        const stat = await bridgeStat(target);
+        if (!stat.exists) return false;
+        if (!stat.is_file) {
+          throw bridgeError("bridge_path_not_file", `The target is not a file: ${target}`);
+        }
+        if (WORKER_SHELL_ENABLED) await workerFs("unlink", { path: target });
+        else pyodide.FS.unlink(target);
+        await bridgeNotifyExternalShellWorkspaceChanged();
+        return true;
+      }
+
+      async function bridgeRemoveSnapshotArchive(path) {
+        if (WORKER_SHELL_ENABLED) {
+          if (await workerFsIsFile(path)) {
+            await workerFs("unlink", { path });
+            return true;
+          }
+          return false;
+        }
+        if (!fsPathExists(path)) return false;
+        pyodide.FS.unlink(path);
+        return true;
+      }
+
+      async function bridgeCreateDevelopmentCheckpoint(params = {}) {
+        await waitForBridgeRuntime();
+        const root = assertBridgeWorkspacePath(params.root || `/home/${activeUser()}`);
+        const stat = await bridgeStat(root);
+        if (!stat.exists || !stat.is_dir) {
+          throw bridgeError("checkpoint_root_not_found", `Checkpoint root not found: ${root}`);
+        }
+        const manifest = await bridgeFileManifest({ path: root });
+        if (manifest.total_bytes > 50 * 1024 * 1024) {
+          throw bridgeError("checkpoint_too_large", "The project exceeds the 50 MiB checkpoint limit. Choose a project subdirectory.");
+        }
+        edgeTermBridgeServer?.emit("checkpoint.progress", {
+          phase: "archive",
+          root,
+          file_count: manifest.file_count,
+          total_bytes: manifest.total_bytes,
+        });
+        const zip = new JSZip();
+        await addProjectToZip(zip, root);
+        const bytes = await zip.generateAsync({
+          type: "uint8array",
+          compression: "DEFLATE",
+          compressionOptions: { level: 6 },
+        });
+        if (bytes.byteLength > 50 * 1024 * 1024) {
+          throw bridgeError("checkpoint_too_large", "The local checkpoint exceeds the 50 MiB safety limit.");
+        }
+        const checkpoint = await getCheckpointStore().create({
+          workspace_id: activeWorkspaceId || "default",
+          label: params.label || "Checkpoint",
+          root,
+          bytes,
+          generation: `${activeWorkspaceId}:${workspaceMutationGeneration}`,
+          evidence: { file_count: manifest.file_count, total_bytes: manifest.total_bytes, ...(params.evidence || {}) },
+          pinned: Boolean(params.pinned),
+        });
+        edgeTermBridgeServer?.emit("checkpoint.created", checkpoint);
+        return checkpoint;
+      }
+
+      async function bridgeCreateAptPackageCheckpoint(params = {}) {
+        await waitForBridgeRuntime();
+        await getExternalShellRuntime().prepare();
+        const packages = (await getExternalShellRuntime().installedPackages())
+          .map((entry) => ({ name: String(entry.name || ""), version: String(entry.version || "") }))
+          .filter((entry) => /^[a-z0-9][a-z0-9+.-]*$/.test(entry.name))
+          .sort((left, right) => left.name.localeCompare(right.name));
+        const zip = new JSZip();
+        zip.file("apt-state.json", `${JSON.stringify({ version: 1, packages }, null, 2)}\n`);
+        const bytes = await zip.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+        const checkpoint = await getCheckpointStore().create({
+          workspace_id: activeWorkspaceId || "default",
+          label: params.label || "APT package state",
+          root: `/home/${activeUser()}`,
+          bytes,
+          generation: `${activeWorkspaceId}:${workspaceMutationGeneration}`,
+          evidence: {
+            kind: "apt-package-state",
+            operation: params.operation || "packages.apt",
+            package_count: packages.length,
+          },
+          pinned: Boolean(params.pinned),
+        });
+        edgeTermBridgeServer?.emit("checkpoint.created", checkpoint);
+        return checkpoint;
+      }
+
+      async function bridgeReadAptCheckpointState(checkpoint) {
+        const archive = await JSZip.loadAsync(checkpoint.archive);
+        const entry = archive.file("apt-state.json");
+        if (!entry) throw bridgeError("checkpoint_package_state_missing", "The APT package checkpoint is incomplete.");
+        const state = JSON.parse(await entry.async("string"));
+        if (Number(state?.version) !== 1 || !Array.isArray(state?.packages)) {
+          throw bridgeError("checkpoint_package_state_invalid", "The APT package checkpoint is invalid.");
+        }
+        return state.packages
+          .map((item) => ({ name: String(item?.name || ""), version: String(item?.version || "") }))
+          .filter((item) => /^[a-z0-9][a-z0-9+.-]*$/.test(item.name));
+      }
+
+      async function bridgeListDevelopmentCheckpoints() {
+        await waitForBridgeRuntime();
+        return { checkpoints: await getCheckpointStore().list(activeWorkspaceId || "default") };
+      }
+
+      async function bridgePinDevelopmentCheckpoint(params = {}) {
+        const checkpoint = await getCheckpointStore().pin(params.checkpoint_id, params.pinned !== false);
+        edgeTermBridgeServer?.emit("checkpoint.updated", checkpoint);
+        return checkpoint;
+      }
+
+      async function bridgeDiffDevelopmentCheckpoint(params = {}) {
+        await waitForBridgeRuntime();
+        const checkpoint = await getCheckpointStore().get(params.checkpoint_id, { includeArchive: true });
+        if (checkpoint.evidence?.kind === "apt-package-state") {
+          const archivedPackages = await bridgeReadAptCheckpointState(checkpoint);
+          const currentPackages = await getExternalShellRuntime().installedPackages();
+          const archived = new Map(archivedPackages.map((entry) => [entry.name, entry.version]));
+          const current = new Map(currentPackages.map((entry) => [String(entry.name), String(entry.version)]));
+          const added = [...current.keys()].filter((name) => !archived.has(name));
+          const removed = [...archived.keys()].filter((name) => !current.has(name));
+          const modified = [...current.keys()].filter((name) => archived.has(name) && archived.get(name) !== current.get(name));
+          return { checkpoint: getCheckpointStore().publicItem(checkpoint), added, removed, modified, changed: added.length + removed.length + modified.length };
+        }
+        const archive = await JSZip.loadAsync(checkpoint.archive);
+        const archived = new Map();
+        for (const entry of Object.values(archive.files)) {
+          if (entry.dir) continue;
+          archived.set(normalizePath(entry.name).replace(/^\/+/, ""), await bridgeSha256Bytes(await entry.async("uint8array")));
+        }
+        const manifest = await bridgeFileManifest({ path: checkpoint.root });
+        const current = new Map();
+        for (const file of manifest.files) {
+          const target = `${checkpoint.root}/${file.path}`;
+          const data = WORKER_SHELL_ENABLED
+            ? base64ToBytes(await workerReadBase64(target))
+            : pyodide.FS.readFile(target);
+          current.set(file.path, await bridgeSha256Bytes(data));
+        }
+        const added = [...current.keys()].filter((path) => !archived.has(path));
+        const removed = [...archived.keys()].filter((path) => !current.has(path));
+        const modified = [...current.keys()].filter((path) => archived.has(path) && archived.get(path) !== current.get(path));
+        return { checkpoint: getCheckpointStore().publicItem(checkpoint), added, removed, modified, changed: added.length + removed.length + modified.length };
+      }
+
+      async function bridgeRestoreDevelopmentCheckpoint(params = {}) {
+        await waitForBridgeRuntime();
+        const checkpoint = await getCheckpointStore().get(params.checkpoint_id, { includeArchive: true });
+        if (checkpoint.evidence?.kind === "apt-package-state") {
+          const desiredPackages = await bridgeReadAptCheckpointState(checkpoint);
+          const currentPackages = await getExternalShellRuntime().installedPackages();
+          const desired = new Map(desiredPackages.map((entry) => [entry.name, entry.version]));
+          const current = new Map(currentPackages.map((entry) => [String(entry.name), String(entry.version)]));
+          const remove = [...current.keys()].filter((name) => !desired.has(name));
+          const install = [...desired.entries()]
+            .filter(([name, version]) => !current.has(name) || current.get(name) !== version)
+            .map(([name, version]) => version ? `${name}=${version}` : name);
+          const before = await bridgeCreateAptPackageCheckpoint({
+            label: "Before APT package restore",
+            operation: "checkpoint.restore",
+          });
+          for (let offset = 0; offset < remove.length; offset += 100) {
+            const result = await bridgeRunApt("packages.apt.remove", { packages: remove.slice(offset, offset + 100), skip_checkpoint: true });
+            if (result.exit_code !== 0) throw bridgeError("checkpoint_apt_remove_failed", "APT could not remove packages added after this checkpoint.");
+          }
+          for (let offset = 0; offset < install.length; offset += 100) {
+            const result = await bridgeRunApt("packages.apt.install", { packages: install.slice(offset, offset + 100), skip_checkpoint: true });
+            if (result.exit_code !== 0) throw bridgeError("checkpoint_apt_install_failed", "APT could not restore the requested package versions.");
+          }
+          return { checkpoint: getCheckpointStore().publicItem(checkpoint), restored: true, package_state: true, removed: remove, installed: install, rollback_checkpoint_id: before.id };
+        }
+        const archive = await JSZip.loadAsync(checkpoint.archive);
+        const root = assertBridgeWorkspacePath(checkpoint.root);
+        const restoreId = crypto.randomUUID();
+        const staging = `/tmp/edgeterm-checkpoint-stage-${restoreId}`;
+        const previous = `/tmp/edgeterm-checkpoint-previous-${restoreId}`;
+        await bridgeCreateDevelopmentCheckpoint({
+          root,
+          label: "Before checkpoint restore",
+          evidence: { operation: "checkpoint.restore", source: checkpoint.id },
+        });
+        const entries = Object.values(archive.files);
+        let totalBytes = 0;
+        for (const entry of entries) {
+          const relative = normalizePath(entry.name).replace(/^\/+/, "");
+          if (!relative || relative.split("/").includes("..")) {
+            throw bridgeError("checkpoint_path_invalid", "The checkpoint contains an invalid path.");
+          }
+          if (!entry.dir) totalBytes += (await entry.async("uint8array")).byteLength;
+          if (totalBytes > 100 * 1024 * 1024) throw bridgeError("checkpoint_extract_limit", "The checkpoint expands beyond the restore limit.");
+        }
+        if (WORKER_SHELL_ENABLED) {
+          await workerFs("removeTree", { path: staging });
+          await workerFs("removeTree", { path: previous });
+          await workerFs("mkdir", { path: staging });
+          for (const entry of entries) {
+            const relative = normalizePath(entry.name).replace(/^\/+/, "");
+            const target = `${staging}/${relative}`;
+            if (entry.dir) await workerFs("mkdir", { path: target });
+            else await workerFs("writeFile", { path: target, data: bytesToBase64(await entry.async("uint8array")), encoding: "base64" });
+          }
+          let movedPrevious = false;
+          try {
+            await workerFs("rename", { path: root, target: previous });
+            movedPrevious = true;
+            await workerFs("rename", { path: staging, target: root });
+            await workerFs("removeTree", { path: previous });
+          } catch (error) {
+            if (movedPrevious) {
+              try {
+                await workerFs("removeTree", { path: root });
+                await workerFs("rename", { path: previous, target: root });
+              } catch {}
+            }
+            throw error;
+          }
+        } else {
+          removeTree(staging);
+          ensureDir(staging);
+          await extractZipTo(archive, staging, { phase: "Preparing checkpoint restore..." });
+          let movedPrevious = false;
+          try {
+            if (fsPathExists(previous)) removeTree(previous);
+            pyodide.FS.rename(root, previous);
+            movedPrevious = true;
+            pyodide.FS.rename(staging, root);
+            removeTree(previous);
+          } catch (error) {
+            if (movedPrevious) {
+              try {
+                if (fsPathExists(root)) removeTree(root);
+                pyodide.FS.rename(previous, root);
+              } catch {}
+            }
+            throw error;
+          }
+        }
+        markWorkspaceMutation();
+        await persistActiveWorkspace();
+        refreshFilesIfVisible(root);
+        await bridgeNotifyExternalShellWorkspaceChanged();
+        const result = { checkpoint_id: checkpoint.id, root, restored: true, restored_at: new Date().toISOString() };
+        edgeTermBridgeServer?.emit("checkpoint.restored", result);
+        edgeTermBridgeServer?.emit("fs.changed", { root, restored: true });
+        return result;
+      }
+
+      async function bridgeCreateSnapshot(params = {}) {
+        const checkpoint = await bridgeCreateDevelopmentCheckpoint({
+          root: params.root,
+          label: params.label || "Digi AI checkpoint",
+          pinned: params.pinned,
+          evidence: { ...(params.evidence || {}), compatibility_api: "fs.snapshot" },
+        });
+        const snapshot = { ...checkpoint, snapshot_id: checkpoint.id };
+        edgeTermBridgeServer?.emit("snapshot.created", snapshot);
+        return snapshot;
+      }
+
+      async function bridgeListSnapshots() {
+        await waitForBridgeRuntime();
+        const snapshots = (await getCheckpointStore().list(activeWorkspaceId || "default"))
+          .map((checkpoint) => ({ ...checkpoint, snapshot_id: checkpoint.id }));
+        for (const item of bridgeAgentSnapshotMetadata()) {
+          const stat = await bridgeStat(localSnapshotPath(item.id));
+          if (stat.exists && stat.is_file && !snapshots.some((entry) => entry.id === item.id)) {
+            snapshots.push({ ...item, legacy: true, snapshot_id: item.id });
+          }
+        }
+        return { snapshots };
+      }
+
+      async function bridgeRestoreSnapshot(params = {}) {
+        await waitForBridgeRuntime();
+        const snapshotId = String(params.snapshot_id || "");
+        try {
+          await getCheckpointStore().get(snapshotId);
+          const restored = await bridgeRestoreDevelopmentCheckpoint({ checkpoint_id: snapshotId });
+          const result = { ...restored, snapshot_id: snapshotId };
+          edgeTermBridgeServer?.emit("snapshot.restored", result);
+          return result;
+        } catch (error) {
+          if (error?.code !== "checkpoint_not_found") throw error;
+        }
+        const item = bridgeAgentSnapshotMetadata().find((entry) => entry.id === snapshotId);
+        if (!item) {
+          throw bridgeError("bridge_snapshot_not_found", "The requested checkpoint was not found.");
+        }
+        const path = localSnapshotPath(item.id);
+        const archiveExists = WORKER_SHELL_ENABLED
+          ? await workerFsIsFile(path)
+          : fsPathExists(path);
+        if (!archiveExists) {
+          throw bridgeError("bridge_snapshot_missing", "The checkpoint archive is missing.");
+        }
+        const archiveBytes = WORKER_SHELL_ENABLED
+          ? base64ToBytes(await workerReadBase64(path))
+          : pyodide.FS.readFile(path);
+        const archive = await JSZip.loadAsync(archiveBytes);
+        const root = assertBridgeWorkspacePath(item.root);
+        if (WORKER_SHELL_ENABLED) {
+          const snapshotStore = `/home/${activeUser()}/.local/share/edgeterm/snapshots`;
+          const temporaryStore = `/tmp/edgeterm-agent-snapshots-${activeWorkspaceId || "default"}`;
+          const preserveSnapshotStore = await workerFsIsDir(snapshotStore);
+          try {
+            if (preserveSnapshotStore) {
+              await workerFs("removeTree", { path: temporaryStore });
+              await workerFs("rename", {
+                path: snapshotStore,
+                target: temporaryStore,
+              });
+            }
+            await workerFs("removeTree", { path: root });
+            await workerFs("mkdir", { path: root });
+            for (const entry of Object.values(archive.files)) {
+              const relative = normalizePath(entry.name).replace(/^\/+/, "");
+              if (!relative || relative.includes("..")) continue;
+              const target = normalizePath(`${root}/${relative}`);
+              if (entry.dir) await workerFs("mkdir", { path: target });
+              else {
+                await workerFs("writeFile", {
+                  path: target,
+                  data: bytesToBase64(await entry.async("uint8array")),
+                  encoding: "base64",
+                });
+              }
+            }
+          } finally {
+            if (
+              preserveSnapshotStore &&
+              await workerFsIsDir(temporaryStore)
+            ) {
+              await workerFs("mkdir", {
+                path: `/home/${activeUser()}/.local/share/edgeterm`,
+              });
+              await workerFs("rename", {
+                path: temporaryStore,
+                target: snapshotStore,
+              });
+            }
+          }
+        } else {
+          removeTree(root);
+          ensureDir(root);
+          await extractZipTo(archive, root, { phase: "Restoring Digi AI checkpoint..." });
+        }
+        await persistActiveWorkspace();
+        refreshFilesIfVisible(root);
+        await bridgeNotifyExternalShellWorkspaceChanged();
+        const result = {
+          snapshot_id: item.id,
+          root,
+          restored: true,
+          restored_at: new Date().toISOString(),
+        };
+        edgeTermBridgeServer?.emit("snapshot.restored", result);
+        edgeTermBridgeServer?.emit("fs.changed", { root, restored: true });
+        return result;
+      }
+
+      function bridgeUnifiedTextDiff(before, after, path) {
+        const beforeLines = String(before ?? "").split("\n");
+        const afterLines = String(after ?? "").split("\n");
+        let prefix = 0;
+        while (
+          prefix < beforeLines.length &&
+          prefix < afterLines.length &&
+          beforeLines[prefix] === afterLines[prefix]
+        ) {
+          prefix += 1;
+        }
+        let suffix = 0;
+        while (
+          suffix < beforeLines.length - prefix &&
+          suffix < afterLines.length - prefix &&
+          beforeLines[beforeLines.length - 1 - suffix] ===
+            afterLines[afterLines.length - 1 - suffix]
+        ) {
+          suffix += 1;
+        }
+        if (prefix === beforeLines.length && prefix === afterLines.length) return "";
+        const contextStart = Math.max(0, prefix - 3);
+        const beforeEnd = beforeLines.length - suffix;
+        const afterEnd = afterLines.length - suffix;
+        const contextEndBefore = Math.min(beforeLines.length, beforeEnd + 3);
+        const contextEndAfter = Math.min(afterLines.length, afterEnd + 3);
+        const lines = [
+          `--- a/${String(path || "file").replace(/^\/+/, "")}`,
+          `+++ b/${String(path || "file").replace(/^\/+/, "")}`,
+          `@@ -${contextStart + 1},${contextEndBefore - contextStart} +${contextStart + 1},${contextEndAfter - contextStart} @@`,
+        ];
+        for (const line of beforeLines.slice(contextStart, prefix)) lines.push(` ${line}`);
+        for (const line of beforeLines.slice(prefix, beforeEnd)) lines.push(`-${line}`);
+        for (const line of afterLines.slice(prefix, afterEnd)) lines.push(`+${line}`);
+        for (const line of afterLines.slice(afterEnd, contextEndAfter)) lines.push(` ${line}`);
+        return lines.join("\n");
+      }
+
+      function bridgeApplyTextHunks(source, hunks, path) {
+        let content = String(source ?? "");
+        for (const hunk of hunks) {
+          const oldText = String(hunk?.old_text ?? "");
+          const newText = String(hunk?.new_text ?? "");
+          if (!oldText) {
+            if (content && !hunk?.append) {
+              throw bridgeError(
+                "bridge_patch_anchor_required",
+                `A patch for an existing file requires old_text: ${path}`,
+              );
+            }
+            content = hunk?.append ? `${content}${newText}` : newText;
+            continue;
+          }
+          const first = content.indexOf(oldText);
+          if (first < 0) {
+            throw bridgeError("bridge_patch_context_missing", `Patch context was not found: ${path}`);
+          }
+          if (content.indexOf(oldText, first + oldText.length) >= 0) {
+            throw bridgeError("bridge_patch_context_ambiguous", `Patch context is not unique: ${path}`);
+          }
+          content = `${content.slice(0, first)}${newText}${content.slice(first + oldText.length)}`;
+        }
+        return content;
+      }
+
+      async function bridgeApplyPatch(params = {}) {
+        await waitForBridgeRuntime();
+        const patches = Array.isArray(params.patches) ? params.patches : [];
+        if (!patches.length || patches.length > 50) {
+          throw bridgeError("bridge_patches_invalid", "Provide between 1 and 50 file patches.");
+        }
+        const root = assertBridgeWorkspacePath(params.root || `/home/${activeUser()}`);
+        const prepared = [];
+        let totalBytes = 0;
+        for (const patch of patches) {
+          const path = assertBridgePathWithinRoot(patch?.path, root);
+          const stat = await bridgeStat(path);
+          if (stat.exists && !stat.is_file) {
+            throw bridgeError("bridge_path_not_file", `The patch target is not a file: ${path}`);
+          }
+          const before = stat.exists ? (await bridgeReadText(path)).content : "";
+          const beforeSha256 = await bridgeSha256(before);
+          const expected = String(patch?.base_sha256 || patch?.expected_sha256 || "");
+          if (stat.exists && !expected) {
+            throw bridgeError(
+              "bridge_expected_hash_required",
+              `Read the latest file hash before patching: ${path}`,
+            );
+          }
+          if (expected && expected !== beforeSha256) {
+            throw bridgeError("bridge_file_changed", `The file changed before patching: ${path}`);
+          }
+          const after =
+            typeof patch?.content === "string"
+              ? patch.content
+              : bridgeApplyTextHunks(before, Array.isArray(patch?.hunks) ? patch.hunks : [], path);
+          totalBytes += new TextEncoder().encode(after).byteLength;
+          if (totalBytes > 1_048_576) {
+            throw bridgeError("bridge_request_too_large", "The combined patched files are too large.");
+          }
+          prepared.push({
+            path,
+            existed: stat.exists,
+            before,
+            after,
+            beforeSha256,
+          });
+        }
+        const snapshot = params.create_snapshot === false
+          ? null
+          : await bridgeCreateSnapshot({
+              root,
+              label: String(params.label || "Before Digi AI change"),
+            });
+        const applied = [];
+        try {
+          for (const item of prepared) {
+            const result = await bridgeWriteText(item.path, item.after, { persist: false });
+            applied.push({
+              path: item.path,
+              created: !item.existed,
+              before_sha256: item.beforeSha256,
+              after_sha256: result.sha256,
+              size: result.size,
+              diff: bridgeUnifiedTextDiff(item.before, item.after, item.path),
+            });
+          }
+          if (!WORKER_SHELL_ENABLED) await persistActiveWorkspace();
+        } catch (error) {
+          for (const item of prepared.slice(0, applied.length).reverse()) {
+            try {
+              if (item.existed) await bridgeWriteText(item.path, item.before, { persist: false });
+              else await bridgeRemoveFile(item.path);
+            } catch (rollbackError) {
+              console.error("[BRIDGE] Patch rollback failed:", rollbackError);
+            }
+          }
+          if (!WORKER_SHELL_ENABLED) await persistActiveWorkspace();
+          throw error;
+        }
+        const result = {
+          changes: applied,
+          snapshot_id: snapshot?.id || null,
+          checkpoint_id: snapshot?.id || null,
+          changed_files: applied.map((item) => item.path),
+        };
+        edgeTermBridgeServer?.emit("fs.changed", result);
+        return result;
+      }
+
+      async function bridgeDiff(params = {}) {
+        await waitForBridgeRuntime();
+        const path = assertBridgeWorkspacePath(params.path);
+        const currentStat = await bridgeStat(path);
+        const current = currentStat.exists ? (await bridgeReadText(path)).content : "";
+        if (typeof params.before === "string") {
+          return {
+            path,
+            changed: params.before !== current,
+            diff: bridgeUnifiedTextDiff(params.before, current, path),
+            sha256: await bridgeSha256(current),
+          };
+        }
+        const snapshotId = String(params.snapshot_id || "");
+        const item = bridgeAgentSnapshotMetadata().find((entry) => entry.id === snapshotId);
+        if (!item) {
+          throw bridgeError("bridge_snapshot_not_found", "Choose a checkpoint to compare.");
+        }
+        const snapshotPath = localSnapshotPath(item.id);
+        const archiveBytes = WORKER_SHELL_ENABLED
+          ? base64ToBytes(await workerReadBase64(snapshotPath))
+          : pyodide.FS.readFile(snapshotPath);
+        const archive = await JSZip.loadAsync(archiveBytes);
+        assertBridgePathWithinRoot(path, item.root);
+        const relative = path.slice(String(item.root).length).replace(/^\/+/, "");
+        const entry = archive.file(relative);
+        const before = entry ? await entry.async("string") : "";
+        return {
+          path,
+          snapshot_id: item.id,
+          changed: before !== current,
+          diff: bridgeUnifiedTextDiff(before, current, path),
+          before_sha256: await bridgeSha256(before),
+          after_sha256: await bridgeSha256(current),
+        };
+      }
+
+      async function bridgeMove(params = {}) {
+        await waitForBridgeRuntime();
+        const source = assertBridgeWorkspacePath(params.source || params.path);
+        const destination = assertBridgeWorkspacePath(params.destination);
+        const root = assertBridgeWorkspacePath(params.root || `/home/${activeUser()}`);
+        assertBridgePathWithinRoot(source, root);
+        assertBridgePathWithinRoot(destination, root);
+        const sourceStat = await bridgeStat(source);
+        if (!sourceStat.exists || !sourceStat.is_file) {
+          throw bridgeError("bridge_file_not_found", `File not found: ${source}`);
+        }
+        const destinationStat = await bridgeStat(destination);
+        if (destinationStat.exists) {
+          throw bridgeError("bridge_file_exists", `The destination already exists: ${destination}`);
+        }
+        const current = await bridgeReadText(source);
+        const currentHash = await bridgeSha256(current.content);
+        if (!params.expected_sha256) {
+          throw bridgeError(
+            "bridge_expected_hash_required",
+            `Read the latest file hash before moving: ${source}`,
+          );
+        }
+        if (String(params.expected_sha256) !== currentHash) {
+          throw bridgeError("bridge_file_changed", `The file changed before moving: ${source}`);
+        }
+        const snapshot = await bridgeCreateSnapshot({
+          root,
+          label: String(params.label || "Before moving a file"),
+        });
+        await bridgeWriteText(destination, current.content, { persist: false });
+        try {
+          await bridgeRemoveFile(source);
+          if (!WORKER_SHELL_ENABLED) await persistActiveWorkspace();
+        } catch (error) {
+          try {
+            await bridgeRemoveFile(destination);
+          } catch {}
+          throw error;
+        }
+        const result = {
+          source,
+          destination,
+          sha256: currentHash,
+          snapshot_id: snapshot.id,
+          moved: true,
+        };
+        edgeTermBridgeServer?.emit("fs.changed", {
+          changes: [
+            { path: source, deleted: true },
+            { path: destination, created: true },
+          ],
+        });
+        return result;
+      }
+
+      function bridgeStandardServerCommand(command) {
+        const source = String(command || "").trim();
+        if (/^(?:python(?:3)?\s+-m\s+)?flask\s+run\b/i.test(source)) {
+          const appMatch = source.match(/(?:--app(?:=|\s+))([^\s]+)/i);
+          const portMatch = source.match(/(?:--port(?:=|\s+))(\d+)/i);
+          return {
+            framework: "flask",
+            target: appMatch?.[1] || "app:app",
+            virtual_port: Number(portMatch?.[1] || 5000),
+          };
+        }
+        const uvicornMatch = source.match(/^uvicorn\s+([^\s]+)(?:\s|$)/i);
+        if (uvicornMatch) {
+          const portMatch = source.match(/--port(?:=|\s+)(\d+)/i);
+          return {
+            framework: "fastapi",
+            target: uvicornMatch[1],
+            virtual_port: Number(portMatch?.[1] || 8000),
+          };
+        }
+        const fastapiMatch = source.match(/^fastapi\s+(?:dev|run)\s+([^\s]+)(?:\s|$)/i);
+        if (fastapiMatch) {
+          return {
+            framework: "fastapi",
+            target: fastapiMatch[1].replace(/\.py$/i, "").replaceAll("/", ".") + ":app",
+            virtual_port: 8000,
+          };
+        }
+        if (/^python(?:3)?\s+manage\.py\s+runserver\b/i.test(source)) {
+          const portMatch = source.match(/(?:(?:127\.0\.0\.1|0\.0\.0\.0):)?(\d+)(?:\s|$)/);
+          return {
+            framework: "django",
+            target: "siteapp.wsgi:application",
+            virtual_port: Number(portMatch?.[1] || 8000),
+          };
+        }
+        const phpMatch = source.match(/^php\s+-S\s+[^\s]+(?:\s+-t\s+([^\s]+))?(?:\s+([^\s]+))?/i);
+        if (phpMatch) {
+          const portMatch = source.match(/^php\s+-S\s+[^:\s]+:(\d+)/i);
+          return {
+            framework: "php",
+            target: phpMatch[2] || phpMatch[1] || "index.php",
+            virtual_port: Number(portMatch?.[1] || 8000),
+          };
+        }
+        const staticMatch = source.match(
+          /^python(?:3)?\s+-m\s+http\.server(?:\s+\d+)?(?:\s+--directory\s+([^\s]+))?/i,
+        );
+        if (staticMatch) {
+          const portMatch = source.match(/^python(?:3)?\s+-m\s+http\.server(?:\s+(\d+))?/i);
+          return {
+            framework: "static",
+            target: staticMatch[1] || ".",
+            virtual_port: Number(portMatch?.[1] || 8000),
+          };
+        }
+        return null;
+      }
+
+      async function bridgeRunTerminal(params) {
+        await waitForBridgeRuntime();
+        if (activeBridgeExecution) {
+          throw bridgeError("bridge_execution_busy", "Another Bridge command is already running.");
+        }
+        const command = String(params.command || "").trim();
+        if (!command) throw bridgeError("bridge_command_required", "Enter a command.");
+        if (command.length > 8_000) {
+          throw bridgeError("bridge_command_too_long", "Commands may contain up to 8,000 characters.");
+        }
+        const execution = {
+          id: String(params.execution_id || crypto.randomUUID()),
+          command,
+          stdout: [],
+          stderr: [],
+          outputBytes: 0,
+          outputLimit: 1_048_576,
+          truncated: false,
+          cancelRequested: false,
+          startedAt: new Date().toISOString(),
+        };
+        activeBridgeExecution = execution;
+        bridgeExecutionHistory.set(execution.id, {
+          execution_id: execution.id,
+          command,
+          status: "running",
+          stdout: "",
+          stderr: "",
+          truncated: false,
+          cancelled: false,
+          started_at: execution.startedAt,
+          completed_at: null,
+        });
+        edgeTermBridgeServer?.emit("terminal.started", {
+          execution_id: execution.id,
+          command,
+          started_at: execution.startedAt,
+        });
+        const startedAt = performance.now();
+        try {
+          const commandCwd = assertBridgeWorkspacePath(params.cwd || currentPath || `/home/${activeUser()}`);
+          execution.captureSuppressed = true;
+          try {
+            term.echo(`${commandCwd} $ ${command}`);
+          } finally {
+            execution.captureSuppressed = false;
+          }
+          const serverCommand = bridgeStandardServerCommand(command);
+          if (serverCommand) {
+            const app = await bridgeStartApp({
+              ...serverCommand,
+              root: params.cwd || currentPath || `/home/${activeUser()}`,
+              label: params.label || `${serverCommand.framework} app`,
+            });
+            const response = {
+              execution_id: execution.id,
+              command,
+              cwd: app.root,
+              exit_code: 0,
+              stdout: `EdgeTerm virtual listener ready at 127.0.0.1:${app.virtual_port}`,
+              stderr: "",
+              truncated: false,
+              cancelled: false,
+              app,
+              started_at: execution.startedAt,
+              completed_at: new Date().toISOString(),
+              duration_ms: Math.round(performance.now() - startedAt),
+            };
+            bridgeExecutionHistory.set(execution.id, { ...response, status: "completed" });
+            edgeTermBridgeServer?.emit("terminal.completed", response);
+            return response;
+          }
+          const result = WORKER_SHELL_ENABLED
+            ? await runWorkerCommand(command, { cwd: commandCwd, env: params.env })
+            : await runCommand(command);
+          const response = {
+            execution_id: execution.id,
+            command,
+            cwd: result?.cwd || currentPath || `/home/${activeUser()}`,
+            exit_code: Number(result?.exitCode || 0),
+            stdout: execution.stdout.join("\n"),
+            stderr: execution.stderr.join("\n"),
+            truncated: execution.truncated,
+            cancelled: execution.cancelRequested,
+            started_at: execution.startedAt,
+            completed_at: new Date().toISOString(),
+            duration_ms: Math.round(performance.now() - startedAt),
+          };
+          bridgeExecutionHistory.set(execution.id, {
+            ...response,
+            status: response.cancelled ? "cancelled" : response.exit_code === 0 ? "completed" : "failed",
+          });
+          edgeTermBridgeServer?.emit("terminal.completed", response);
+          return response;
+        } catch (error) {
+          if (execution.cancelRequested) {
+            const response = {
+              execution_id: execution.id,
+              command,
+              cwd: currentPath || `/home/${activeUser()}`,
+              exit_code: 130,
+              stdout: execution.stdout.join("\n"),
+              stderr: execution.stderr.join("\n"),
+              truncated: execution.truncated,
+              cancelled: true,
+              started_at: execution.startedAt,
+              completed_at: new Date().toISOString(),
+              duration_ms: Math.round(performance.now() - startedAt),
+            };
+            bridgeExecutionHistory.set(execution.id, { ...response, status: "cancelled" });
+            edgeTermBridgeServer?.emit("terminal.completed", response);
+            return response;
+          }
+          bridgeExecutionHistory.set(execution.id, {
+            execution_id: execution.id,
+            command,
+            status: "failed",
+            stdout: execution.stdout.join("\n"),
+            stderr: execution.stderr.join("\n"),
+            truncated: execution.truncated,
+            cancelled: false,
+            error: String(error?.message || error || "Command failed"),
+            started_at: execution.startedAt,
+            completed_at: new Date().toISOString(),
+          });
+          throw error;
+        } finally {
+          if (activeBridgeExecution?.id === execution.id) activeBridgeExecution = null;
+          while (bridgeExecutionHistory.size > 50) {
+            bridgeExecutionHistory.delete(bridgeExecutionHistory.keys().next().value);
+          }
+        }
+      }
+
+      async function bridgeStartTerminal(params = {}) {
+        if (activeBridgeExecution) {
+          throw bridgeError("bridge_execution_busy", "Another Bridge command is already running.");
+        }
+        const executionId = crypto.randomUUID();
+        void bridgeRunTerminal({ ...params, execution_id: executionId }).catch((error) => {
+          console.error("[BRIDGE] Background terminal execution failed:", error);
+        });
+        await Promise.resolve();
+        return {
+          execution_id: executionId,
+          status: "running",
+          started: true,
+        };
+      }
+
+      function bridgeTerminalStatus(params = {}) {
+        const executionId = String(params.execution_id || activeBridgeExecution?.id || "");
+        if (!executionId) return { running: false, execution: null };
+        const execution = bridgeExecutionHistory.get(executionId);
+        if (!execution) {
+          throw bridgeError("bridge_execution_not_found", "The terminal execution was not found.");
+        }
+        return {
+          running: execution.status === "running",
+          execution: {
+            ...execution,
+            stdout: undefined,
+            stderr: undefined,
+          },
+        };
+      }
+
+      function bridgeTerminalOutput(params = {}) {
+        const executionId = String(params.execution_id || activeBridgeExecution?.id || "");
+        if (!executionId) return { execution_id: "", stdout: "", stderr: "", status: "idle" };
+        const stored = bridgeExecutionHistory.get(executionId);
+        if (!stored) {
+          throw bridgeError("bridge_execution_not_found", "The terminal execution was not found.");
+        }
+        const active = activeBridgeExecution?.id === executionId ? activeBridgeExecution : null;
+        const stdout = active ? active.stdout.join("\n") : String(stored.stdout || "");
+        const stderr = active ? active.stderr.join("\n") : String(stored.stderr || "");
+        const offset = Math.max(0, Number(params.offset || 0));
+        const maxChars = Math.max(1_000, Math.min(Number(params.max_chars || 24_000), 64_000));
+        const combined = `${stdout}${stderr ? `\n${stderr}` : ""}`;
+        return {
+          execution_id: executionId,
+          status: active ? "running" : stored.status,
+          stdout,
+          stderr,
+          content: combined.slice(offset, offset + maxChars),
+          content_offset: offset,
+          content_length: Math.min(maxChars, Math.max(0, combined.length - offset)),
+          total_content_length: combined.length,
+          has_more: offset + maxChars < combined.length,
+          truncated: Boolean(active?.truncated || stored.truncated),
+        };
+      }
+
+      async function bridgeCancelTerminal(params) {
+        const execution = activeBridgeExecution;
+        if (!execution || (params.execution_id && params.execution_id !== execution.id)) {
+          return { cancelled: false, reason: "not_running" };
+        }
+        if (isNodeCommand(execution.command)) {
+          execution.cancelRequested = true;
+          const result = getNodeRuntime().cancel();
+          edgeTermBridgeServer?.emit("terminal.cancelled", {
+            execution_id: execution.id,
+          });
+          return {
+            ...result,
+            cancelled: true,
+            execution_id: execution.id,
+          };
+        }
+        if (externalShellRuntime?.status?.().running) {
+          execution.cancelRequested = true;
+          externalShellRuntime.cancel();
+          edgeTermBridgeServer?.emit("terminal.cancelled", {
+            execution_id: execution.id,
+          });
+          return { cancelled: true, execution_id: execution.id };
+        }
+        if (!WORKER_SHELL_ENABLED || !workerShell) {
+          throw bridgeError(
+            "bridge_cancel_unavailable",
+            "Command cancellation requires the EdgeTerm worker shell.",
+          );
+        }
+        execution.cancelRequested = true;
+        const cancellationError = bridgeError("bridge_execution_cancelled", "The command was stopped.");
+        for (const request of workerShellRequests.values()) request.reject(cancellationError);
+        workerShellRequests.clear();
+        workerShell.terminate();
+        workerShell = null;
+        workerShellReady = false;
+        showBootStatus("Restarting EdgeTerm runtime after cancellation...");
+        await bootWorkerShell(performance.now());
+        edgeTermBridgeServer?.emit("terminal.cancelled", { execution_id: execution.id });
+        return { cancelled: true, execution_id: execution.id };
+      }
+
+      function bridgeAptPackageNames(values) {
+        const packages = (Array.isArray(values) ? values : [])
+          .map((value) => String(value || "").trim())
+          .filter(Boolean);
+        if (packages.length > 100) {
+          throw bridgeError(
+            "apt_package_limit",
+            "A single APT request may include up to 100 packages.",
+          );
+        }
+        if (packages.some((name) => !/^[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?(?:=[0-9A-Za-z.+:~_-]+)?$/.test(name))) {
+          throw bridgeError("apt_package_name_invalid", "APT package names contain unsupported characters.");
+        }
+        return packages;
+      }
+
+      function bridgeAptSizeBytes(value, unit) {
+        const amount = Number(String(value || "0").replaceAll(",", ""));
+        const multiplier = {
+          b: 1,
+          kb: 1_000,
+          kib: 1_024,
+          mb: 1_000_000,
+          mib: 1_048_576,
+          gb: 1_000_000_000,
+          gib: 1_073_741_824,
+        }[String(unit || "B").toLowerCase()] || 1;
+        return Math.max(0, Math.ceil(amount * multiplier));
+      }
+
+      function bridgeAptSimulationSizes(output) {
+        const text = String(output || "");
+        const download = text.match(/Need to get\s+([0-9.,]+)\s*([KMG]i?B|B)/i);
+        const installed = text.match(/After this operation,\s+([0-9.,]+)\s*([KMG]i?B|B)/i)
+          || text.match(/Space needed:\s+([0-9.,]+)\s*([KMG]i?B|B)/i);
+        return {
+          download_bytes: download ? bridgeAptSizeBytes(download[1], download[2]) : 0,
+          installed_bytes: installed ? bridgeAptSizeBytes(installed[1], installed[2]) : 0,
+        };
+      }
+
+      async function bridgeAptStorageStatus() {
+        let estimate = {};
+        try {
+          estimate = await navigator.storage?.estimate?.() || {};
+        } catch {}
+        const quota = Number(estimate.quota || 0);
+        const usage = Number(estimate.usage || 0);
+        return {
+          quota_bytes: quota,
+          usage_bytes: usage,
+          available_bytes: Math.max(0, quota - usage),
+        };
+      }
+
+      async function bridgeRunApt(method, params = {}) {
+        await waitForBridgeRuntime();
+        await getExternalShellRuntime().prepare();
+        const packages = bridgeAptPackageNames(params.packages);
+        const packageWords = packages.join(" ");
+        const commands = {
+          "packages.apt.update": "apt-get update",
+          "packages.apt.install": `apt-get install -y ${packageWords}`.trim(),
+          "packages.apt.remove": `apt-get remove -y ${packageWords}`.trim(),
+          "packages.apt.upgrade": "apt-get upgrade -y",
+          "packages.apt.status": packages.length
+            ? `dpkg-query -W ${packageWords}`
+            : "dpkg-query -W",
+        };
+        const command = commands[method];
+        if (!command) throw bridgeError("apt_operation_invalid", "Choose a supported APT operation.");
+        if (["packages.apt.install", "packages.apt.remove"].includes(method) && !packages.length) {
+          throw bridgeError("apt_package_required", "Choose at least one package.");
+        }
+        let storage = await bridgeAptStorageStatus();
+        let required = { download_bytes: 0, installed_bytes: 0 };
+        if (["packages.apt.install", "packages.apt.upgrade"].includes(method)) {
+          edgeTermBridgeServer?.emit("packages.apt.progress", {
+            operation: method,
+            phase: "resolve",
+            message: "Resolving the APT transaction...",
+          });
+          const simulationCommand = command.replace(" -y", " --simulate");
+          const simulation = await bridgeRunTerminal({ command: simulationCommand });
+          if (simulation.exit_code !== 0) {
+            throw bridgeError(
+              "apt_transaction_unresolved",
+              simulation.stderr || simulation.stdout || "APT could not resolve the requested transaction.",
+            );
+          }
+          required = bridgeAptSimulationSizes(`${simulation.stdout}\n${simulation.stderr}`);
+          storage = await bridgeAptStorageStatus();
+          const temporaryBytes = Math.ceil((required.download_bytes + required.installed_bytes) * 1.25) + 16 * 1024 * 1024;
+          if (storage.quota_bytes && storage.available_bytes < temporaryBytes) {
+            throw bridgeError(
+              "apt_storage_insufficient",
+              `APT needs approximately ${temporaryBytes} bytes of free browser storage for this transaction.`,
+            );
+          }
+        }
+        const checkpoint = ["packages.apt.install", "packages.apt.remove", "packages.apt.upgrade"].includes(method) && params.skip_checkpoint !== true
+          ? await bridgeCreateAptPackageCheckpoint({
+              label: `Before ${method.replace("packages.apt.", "APT ")}`,
+              operation: method,
+            })
+          : null;
+        edgeTermBridgeServer?.emit("packages.apt.progress", {
+          operation: method,
+          phase: "execute",
+          message: "Running the APT transaction...",
+          required,
+        });
+        const result = await bridgeRunTerminal({ command });
+        edgeTermBridgeServer?.emit("packages.apt.progress", {
+          operation: method,
+          phase: result.exit_code === 0 ? "complete" : "failed",
+          message: result.exit_code === 0 ? "The APT transaction completed." : "The APT transaction failed.",
+        });
+        return { ...result, operation: method, packages, required, storage, checkpoint_id: checkpoint?.id || null };
+      }
+
+      async function invokeEdgeTermBridge(method, params) {
+        if (method.startsWith("backup.")) {
+          return await (await initializeExternalBackups()).handleBridge(method, params);
+        }
+        if (method === "runtime.status") {
+          return {
+            ready: bridgeRuntimeReady(),
+            phase: runtimeDiagnosticPhase,
+            active_workspace_id: activeWorkspaceId,
+            active_workspace_name: activeWorkspace()?.name || "",
+            active_user: activeUser(),
+            active_execution_id: activeBridgeExecution?.id || null,
+            capabilities: bridgeCapabilities(),
+          };
+        }
+        if (method === "runtime.node.prepare") {
+          await waitForBridgeRuntime();
+          return await getNodeRuntime().prepare();
+        }
+        if (method === "runtime.node.status") {
+          return {
+            ...getNodeRuntime().status(),
+            storage: await getNodeRuntime().storageStatus(),
+          };
+        }
+        if (method === "runtime.node.reset") {
+          return getNodeRuntime().reset();
+        }
+        if (method === "runtime.external_shell.prepare") {
+          await waitForBridgeRuntime();
+          return await getExternalShellRuntime().prepare();
+        }
+        if (method === "runtime.external_shell.status") {
+          return getExternalShellRuntime().status();
+        }
+        if (method === "runtime.external_shell.reset") {
+          return getExternalShellRuntime().reset();
+        }
+        if (method === "workspace.list") {
+          return {
+            active_workspace_id: activeWorkspaceId,
+            workspaces: workspaces.map((workspace) => ({
+              id: workspace.id,
+              name: workspace.name,
+              active: workspace.id === activeWorkspaceId,
+              created_at: workspace.createdAt || null,
+              updated_at: workspace.updatedAt || null,
+              storage_type: workspace.storageType || "browser-storage",
+            })),
+          };
+        }
+        if (method === "workspace.create") {
+          await waitForBridgeRuntime();
+          const name = String(params.name || "New workspace").trim().slice(0, 80);
+          if (!name) throw bridgeError("bridge_workspace_name_required", "Enter a workspace name.");
+          const id = WORKER_SHELL_ENABLED
+            ? await createWorkerWorkspaceFromZip(name, null)
+            : await createWorkspaceFromZip(name, null);
+          edgeTermBridgeServer?.emit("workspace.changed", { active_workspace_id: id });
+          return { id, name, active: true };
+        }
+        if (method === "workspace.open") {
+          await waitForBridgeRuntime();
+          const id = String(params.workspace_id || "");
+          if (!workspaces.some((workspace) => workspace.id === id)) {
+            throw bridgeError("bridge_workspace_not_found", "The EdgeTerm workspace was not found.");
+          }
+          if (id !== activeWorkspaceId) {
+            if (WORKER_SHELL_ENABLED) await switchWorkerWorkspace(id);
+            else await switchWorkspace(id);
+          }
+          edgeTermBridgeServer?.emit("workspace.changed", { active_workspace_id: id });
+          return { id, active: true };
+        }
+        if (method === "project.detect") return await bridgeDetectProject(params);
+        if (method === "project.scaffold") return await bridgeScaffoldProject(params);
+        if (method === "project.environment.inspect") return await bridgeInspectProjectEnvironment(params);
+        if (method === "project.environment.apply") return await bridgeApplyProjectEnvironment(params);
+        if (method === "task.list") return await bridgeListProjectTasks(params);
+        if (method === "task.run") return await bridgeRunProjectTask(params);
+        if (method === "task.cancel") return await bridgeCancelProjectTask(params);
+        if (method === "fs.list") return await bridgeListFiles(params);
+        if (method === "fs.search") return await bridgeSearchFiles(params);
+        if (method === "fs.manifest") return await bridgeFileManifest(params);
+        if (method === "fs.stat") {
+          await waitForBridgeRuntime();
+          const path = assertBridgeWorkspacePath(params.path);
+          const stat = await bridgeStat(path);
+          if (!stat.exists || !stat.is_file) return stat;
+          const source = await bridgeReadText(path);
+          return { ...stat, sha256: await bridgeSha256(source.content) };
+        }
+        if (method === "fs.read") {
+          await waitForBridgeRuntime();
+          const result = await bridgeReadText(params.path);
+          return { ...result, sha256: await bridgeSha256(result.content) };
+        }
+        if (method === "fs.read_binary") return await bridgeReadBinary(params);
+        if (method === "fs.write") {
+          await waitForBridgeRuntime();
+          const mode = String(params.mode || "replace").trim().toLowerCase();
+          if (!["replace", "create", "append"].includes(mode)) {
+            throw bridgeError(
+              "bridge_write_mode_invalid",
+              "Choose replace, create, or append for the file write mode.",
+            );
+          }
+          const target = assertBridgeWorkspacePath(params.path);
+          const stat = await bridgeStat(target);
+          if (stat.exists && !stat.is_file) {
+            throw bridgeError(
+              "bridge_path_not_file",
+              `The write target is not a file: ${target}`,
+            );
+          }
+          if (mode === "create" && stat.exists) {
+            throw bridgeError(
+              "bridge_file_exists",
+              `The file already exists: ${target}`,
+            );
+          }
+          if (mode === "append" && !stat.exists) {
+            throw bridgeError(
+              "bridge_file_not_found",
+              `Create the file before appending: ${target}`,
+            );
+          }
+          const current = stat.exists
+            ? await bridgeReadText(target)
+            : { content: "" };
+          const beforeSha256 = await bridgeSha256(current.content);
+          if (mode === "append" && !params.expected_sha256) {
+            throw bridgeError(
+              "bridge_expected_hash_required",
+              "Read the latest file hash before appending another segment.",
+            );
+          }
+          if (
+            params.expected_sha256 &&
+            beforeSha256 !== String(params.expected_sha256)
+          ) {
+              throw bridgeError("bridge_file_changed", "The file changed before the update was applied.");
+          }
+          const nextContent =
+            mode === "append"
+              ? `${current.content}${String(params.content ?? "")}`
+              : String(params.content ?? "");
+          const result = await bridgeWriteText(target, nextContent);
+          edgeTermBridgeServer?.emit("fs.changed", { changes: [{ path: result.path }] });
+          return {
+            ...result,
+            mode,
+            before_sha256: beforeSha256,
+          };
+        }
+        if (method === "fs.write_new") {
+          return await invokeEdgeTermBridge("fs.write", { ...params, mode: "create" });
+        }
+        if (method === "fs.replace") {
+          await waitForBridgeRuntime();
+          const target = assertBridgeWorkspacePath(params.path);
+          const stat = await bridgeStat(target);
+          if (!stat.exists || !stat.is_file) {
+            throw bridgeError(
+              "bridge_file_not_found",
+              `Read or create the file before replacing it: ${target}`,
+            );
+          }
+          if (!params.expected_sha256) {
+            throw bridgeError(
+              "bridge_expected_hash_required",
+              `Read the latest file hash before replacing: ${target}`,
+            );
+          }
+          return await invokeEdgeTermBridge("fs.write", { ...params, mode: "replace" });
+        }
+        if (method === "fs.replace_text") return await bridgeReplaceText(params);
+        if (method === "fs.write_binary") return await bridgeWriteBinary(params);
+        if (method === "fs.apply_patch") return await bridgeApplyPatch(params);
+        if (method === "fs.apply_changes") return await bridgeApplyChanges(params);
+        if (method === "fs.move") return await bridgeMove(params);
+        if (method === "fs.diff") return await bridgeDiff(params);
+        if (method === "fs.snapshot.create") return await bridgeCreateSnapshot(params);
+        if (method === "fs.snapshot.list") return await bridgeListSnapshots();
+        if (method === "fs.snapshot.restore") return await bridgeRestoreSnapshot(params);
+        if (method === "checkpoint.create") return await bridgeCreateDevelopmentCheckpoint(params);
+        if (method === "checkpoint.list") return await bridgeListDevelopmentCheckpoints();
+        if (method === "checkpoint.diff") return await bridgeDiffDevelopmentCheckpoint(params);
+        if (method === "checkpoint.restore") return await bridgeRestoreDevelopmentCheckpoint(params);
+        if (method === "checkpoint.pin") return await bridgePinDevelopmentCheckpoint(params);
+        if (method === "fs.mkdir") {
+          await waitForBridgeRuntime();
+          const path = assertBridgeWorkspacePath(params.path);
+          if (WORKER_SHELL_ENABLED) await workerFs("mkdir", { path });
+          else {
+            ensureDir(path);
+            await persistActiveWorkspace();
+          }
+          await bridgeNotifyExternalShellWorkspaceChanged();
+          edgeTermBridgeServer?.emit("fs.changed", { changes: [{ path, directory: true }] });
+          return { path, created: true };
+        }
+        if (method === "fs.delete") {
+          await waitForBridgeRuntime();
+          const path = assertBridgeWorkspacePath(params.path);
+          const root = `/home/${activeUser()}`;
+          if (path === root) {
+            throw bridgeError("bridge_delete_forbidden", "The workspace home directory cannot be deleted.");
+          }
+          const stat = await bridgeStat(path);
+          if (!stat.exists) return { path, deleted: false };
+          if (stat.is_dir) {
+            throw bridgeError(
+              "bridge_directory_delete_unsupported",
+              "Directory deletion is not available through Bridge v1.",
+            );
+          }
+          if (WORKER_SHELL_ENABLED) await workerFs("unlink", { path });
+          else {
+            pyodide.FS.unlink(path);
+            await persistActiveWorkspace();
+          }
+          await bridgeNotifyExternalShellWorkspaceChanged();
+          edgeTermBridgeServer?.emit("fs.changed", { changes: [{ path, deleted: true }] });
+          return { path, deleted: true };
+        }
+        if (method === "editor.open") {
+          await waitForBridgeRuntime();
+          const path = assertBridgeWorkspacePath(params.path);
+          await openEditorInTarget(path, { quiet: true });
+          setView("editorView");
+          return { path, opened: true };
+        }
+        if (method === "terminal.start") return await bridgeStartTerminal(params);
+        if (method === "terminal.status") return bridgeTerminalStatus(params);
+        if (method === "terminal.output") return bridgeTerminalOutput(params);
+        if (method === "terminal.run") return await bridgeRunTerminal(params);
+        if (method === "terminal.cancel") return await bridgeCancelTerminal(params);
+        if (method === "process.start") return await getProcessHost().start(params);
+        if (method === "process.status") return await getProcessHost().status(params.process_id);
+        if (method === "process.output") return await getProcessHost().output(params.process_id, params);
+        if (method === "process.input") return await getProcessHost().input(params.process_id, params.data);
+        if (method === "process.signal") return await getProcessHost().signal(params.process_id, params.signal);
+        if (method === "process.resize") return await getProcessHost().resize(params.process_id, params);
+        if (method === "process.wait") return await getProcessHost().wait(params.process_id, params);
+        if (method === "runtime.component.status") return getComponentHost().manifest();
+        if (method === "runtime.component.invoke") {
+          return await getComponentHost().invoke(params.interface, params.operation, params.payload, {
+            approved: params.approved === true,
+            cwd: params.cwd || `/home/${activeUser()}`,
+            environment: params.environment || {},
+            arguments: params.arguments || [],
+          });
+        }
+        if (method === "language.status") return getLanguageClient().status();
+        if (method === "language.restart") {
+          getLanguageClient().stop();
+          return await getLanguageClient().start();
+        }
+        if (method === "language.diagnostics") {
+          const path = assertBridgeWorkspacePath(params.path);
+          const source = await bridgeReadText(path);
+          const uri = `file://${path}`;
+          const languageId = String(params.language_id || path.split(".").pop() || "plaintext");
+          await getLanguageClient().open({ uri, languageId, text: source.content, version: Number(params.version || 1) });
+          const report = await getLanguageClient().diagnostics(uri);
+          return { path, uri, diagnostics: report.items || languageDiagnostics.get(uri) || [] };
+        }
+        if (method === "test.discover") return await bridgeDiscoverTests(params);
+        if (method === "test.run") return await bridgeRunTests(params);
+        if (method === "test.cancel") return await getTestController().cancel(params.run_id);
+        if (method === "debug.status") return { capabilities: getDebugController().capabilities() };
+        if (method === "debug.start") return await getDebugController().start(params);
+        if (method === "debug.command") return await getDebugController().command(params.session_id, params.command, params);
+        if (method === "debug.stop") return await getDebugController().stop(params.session_id);
+        if (method === "packages.npm.install") {
+          await waitForBridgeRuntime();
+          await ensureActiveWorkspaceMounted("Loading workspace files for npm...");
+          const root = assertBridgeWorkspacePath(
+            params.root || currentPath || `/home/${activeUser()}`,
+          );
+          const packages = (Array.isArray(params.packages) ? params.packages : [])
+            .map((value) => String(value || "").trim())
+            .filter(Boolean);
+          if (packages.length > 100) {
+            throw bridgeError(
+              "npm_package_limit",
+              "A single install request may include up to 100 direct packages.",
+            );
+          }
+          const args = [
+            "install",
+            ...(params.dev ? ["--save-dev"] : []),
+            ...(params.production ? ["--production"] : []),
+            ...(params.offline ? ["--offline"] : []),
+            ...(params.allow_scripts ? ["--allow-scripts"] : []),
+            ...packages,
+          ];
+          const checkpoint = await bridgeCreateDevelopmentCheckpoint({
+            root,
+            label: "Before npm install",
+            evidence: { operation: "packages.npm.install", packages },
+          });
+          const result = await getNodeRuntime().executeNpm(root, args);
+          return { ...result, checkpoint_id: checkpoint.id };
+        }
+        if (method === "packages.npm.ci") {
+          await waitForBridgeRuntime();
+          await ensureActiveWorkspaceMounted("Loading workspace files for npm...");
+          const root = assertBridgeWorkspacePath(
+            params.root || currentPath || `/home/${activeUser()}`,
+          );
+          const checkpoint = await bridgeCreateDevelopmentCheckpoint({
+            root,
+            label: "Before npm ci",
+            evidence: { operation: "packages.npm.ci" },
+          });
+          const result = await getNodeRuntime().executeNpm(root, ["ci"]);
+          return { ...result, checkpoint_id: checkpoint.id };
+        }
+        if (method === "packages.npm.run") {
+          await waitForBridgeRuntime();
+          await ensureActiveWorkspaceMounted("Loading workspace files for npm...");
+          const root = assertBridgeWorkspacePath(
+            params.root || currentPath || `/home/${activeUser()}`,
+          );
+          const script = String(params.script || "").trim();
+          if (!script) {
+            throw bridgeError("npm_script_not_found", "Choose a package script to run.");
+          }
+          const scriptArgs = (Array.isArray(params.args) ? params.args : []).map(
+            (value) => String(value),
+          );
+          return await getNodeRuntime().executeNpm(root, [
+            "run",
+            script,
+            ...(scriptArgs.length ? ["--", ...scriptArgs] : []),
+          ]);
+        }
+        if (method === "packages.npm.cancel") {
+          return getNodeRuntime().cancel();
+        }
+        if (method === "packages.npm.cache_status") {
+          return await getNodeRuntime().storageStatus();
+        }
+        if ([
+          "packages.apt.update",
+          "packages.apt.install",
+          "packages.apt.remove",
+          "packages.apt.upgrade",
+          "packages.apt.status",
+        ].includes(method)) {
+          return await bridgeRunApt(method, params);
+        }
+        if (method === "packages.apt.cancel") {
+          return await bridgeCancelTerminal(params);
+        }
+        if (method === "app.start") return await bridgeStartApp(params);
+        if (["app.status", "app.restart", "app.stop"].includes(method)) {
+          return await bridgeAppAction(method, params);
+        }
+        if (method === "preview.open" || method === "preview.refresh") {
+          return await bridgeAppAction("preview.open", params);
+        }
+        if (method === "preview.inspect") return await bridgePreviewInspect(params);
+        if (method === "preview.console") {
+          const inspected = await bridgePreviewInspect(params);
+          return { app: inspected.app, console: inspected.console };
+        }
+        if (method === "preview.network") {
+          const inspected = await bridgePreviewInspect(params);
+          return { app: inspected.app, network: inspected.network };
+        }
+        if (method === "preview.capture") return await bridgeCapturePreview(params);
+        if (method === "preview.request") return await bridgePreviewRequest(params);
+        if (method === "artifact.read") return bridgeReadArtifact(params);
+        if (["git.status", "git.diff", "git.log"].includes(method)) {
+          const result = await runGitPython(method === "git.diff" ? "diff" : "status", {
+            root: assertBridgeWorkspacePath(params.root || `/home/${activeUser()}`),
+          });
+          return result;
+        }
+        if (method === "git.commit") {
+          const result = await runGitPython("commit", {
+            root: assertBridgeWorkspacePath(params.root || `/home/${activeUser()}`),
+            message: String(params.message || "Update website").slice(0, 240),
+            paths: params.paths,
+          });
+          edgeTermBridgeServer?.emit("git.changed", result);
+          return result;
+        }
+        if (method === "ui.show") {
+          const views = {
+            terminal: "terminalView",
+            files: "filesView",
+            editor: "editorView",
+            preview: "browserView",
+            projects: "projectsView",
+            database: "databaseView",
+            display: "displayView",
+            backups: "backupView",
+          };
+          const view = views[String(params.view || "")];
+          if (!view) throw bridgeError("bridge_view_invalid", "Choose a supported EdgeTerm view.");
+          setView(view);
+          return { view: String(params.view), shown: true };
+        }
+        throw bridgeError("bridge_method_not_found", `Unsupported EdgeTerm Bridge method: ${method}`);
+      }
+
+      const bridgeMutatingMethods = new Set([
+        "workspace.create",
+        "workspace.open",
+        "project.scaffold",
+        "project.environment.apply",
+        "task.run",
+        "task.cancel",
+        "fs.write",
+        "fs.write_new",
+        "fs.replace",
+        "fs.replace_text",
+        "fs.write_binary",
+        "fs.apply_patch",
+        "fs.apply_changes",
+        "fs.move",
+        "fs.snapshot.create",
+        "fs.snapshot.restore",
+        "checkpoint.create",
+        "checkpoint.restore",
+        "checkpoint.pin",
+        "fs.mkdir",
+        "fs.delete",
+        "terminal.start",
+        "terminal.run",
+        "terminal.cancel",
+        "process.start",
+        "process.input",
+        "process.signal",
+        "process.resize",
+        "language.restart",
+        "test.run",
+        "test.cancel",
+        "debug.start",
+        "debug.command",
+        "debug.stop",
+        "runtime.node.prepare",
+        "runtime.node.reset",
+        "runtime.external_shell.prepare",
+        "runtime.external_shell.reset",
+        "runtime.component.invoke",
+        "packages.npm.install",
+        "packages.npm.ci",
+        "packages.npm.run",
+        "packages.npm.cancel",
+        "packages.apt.update",
+        "packages.apt.install",
+        "packages.apt.remove",
+        "packages.apt.upgrade",
+        "packages.apt.cancel",
+        "app.start",
+        "app.restart",
+        "app.stop",
+        "git.commit",
+        "backup.create",
+        "backup.attach_connection",
+        "backup.restore",
+        "backup.cancel",
+      ]);
+
+      async function invokeEdgeTermBridgeV3(method, params = {}) {
+        const startedAt = new Date().toISOString();
+        const requestId = String(params.request_id || crypto.randomUUID());
+        const idempotencyKey = String(params.idempotency_key || requestId);
+        const cacheKey = `${activeWorkspaceId}:${method}:${idempotencyKey}`;
+        if (bridgeMutatingMethods.has(method) && bridgeIdempotencyResults.has(cacheKey)) {
+          return {
+            ...bridgeIdempotencyResults.get(cacheKey),
+            idempotent_replay: true,
+          };
+        }
+        const result = await invokeEdgeTermBridge(method, params);
+        const response = createBridgeResult(method, result, {
+          requestId,
+          idempotencyKey,
+          workspaceGeneration: `${activeWorkspaceId}:${activeWorkspace()?.updatedAt || activeWorkspace()?.createdAt || 0}`,
+          startedAt,
+        });
+        if (bridgeMutatingMethods.has(method)) {
+          bridgeIdempotencyResults.set(cacheKey, response);
+          while (bridgeIdempotencyResults.size > 200) {
+            bridgeIdempotencyResults.delete(
+              bridgeIdempotencyResults.keys().next().value,
+            );
+          }
+        }
+        return response;
+      }
+
+      function setupEdgeTermEmbedBridge() {
+        if (!EMBED_ENABLED) return;
+        document.body.classList.add("edgeterm-embed");
+        const allowedOrigins = Array.isArray(window.EDGETERM_BRIDGE_ALLOWED_ORIGINS)
+          ? window.EDGETERM_BRIDGE_ALLOWED_ORIGINS
+          : [];
+        edgeTermBridgeServer = createEdgeTermBridgeServer({
+          enabled: true,
+          allowedOrigins,
+          runtimeVersion: EDGETERM_BOOT_BUNDLE_VERSION,
+          invoke: invokeEdgeTermBridgeV3,
+          getCapabilities: bridgeCapabilities,
+        });
+        edgeTermBridgeServer.start();
+      }
+
+      function notifyBridgeRuntimeReady() {
+        edgeTermBridgeServer?.emit("runtime.ready", {
+          ready: true,
+          active_workspace_id: activeWorkspaceId,
+          active_workspace_name: activeWorkspace()?.name || "",
+          capabilities: bridgeCapabilities(),
+        });
+      }
+
       async function main() {
         const bootStartedAt = performance.now();
         try {
@@ -16026,23 +23984,41 @@ shell
         };
         applyAppTheme(appTheme);
         applyEditionMode();
-        revealApp();
+        if (WORKER_SHELL_ENABLED) {
+          busyCount = Math.max(1, busyCount);
+          $id("app")?.classList.remove("hidden");
+          $id("loading")?.classList.remove("hidden");
+          showLoadingIndeterminate(
+            "Loading EdgeTerm runtime...",
+            "Preparing the local command environment...",
+          );
+        } else {
+          revealApp();
+        }
         applySidebarWidth();
         if (window.innerWidth > 820) setSidebarOpen(true);
         else setSidebarOpen(false);
         loadWorkspaceRegistry();
         renderWorkspaces();
+        void initializeExternalBackups().catch((error) => {
+          console.warn("[BACKUP] Initialization deferred:", error);
+        });
         window.lucide?.createIcons();
         initializeTerminal();
+        if (WORKER_SHELL_ENABLED) {
+          setTerminalInputReady(false);
+          term?.pause?.();
+        }
         bindCloudAuthEvents();
         showBootStatus("Loading EdgeTerm runtime...");
         await bootPhase("ui ready");
 
         const bootWatchdog = setTimeout(() => {
-          revealApp();
+          if (!WORKER_SHELL_ENABLED) revealApp();
           showBootStatus(
-            `EdgeTerm is still loading the browser Python runtime after ${Math.round((performance.now() - bootStartedAt) / 1000)}s. If this stays here, the browser is still initializing Pyodide/WASM for this tab.`,
-            true
+            WORKER_SHELL_ENABLED
+              ? "Still preparing the command environment..."
+              : "EdgeTerm is still starting...",
           );
         }, 20000);
 
@@ -16062,29 +24038,41 @@ shell
           bootTrace("pre-lucideIcons");
           window.lucide?.createIcons();
           bootTrace("pre-revealApp");
-          revealApp();
+          $id("app")?.classList.remove("hidden");
           bootTrace("pre-pruneWorkerBootStorage");
-          await pruneWorkerBootHeavyStorageBeforeMount(activeWorkspaceId);
+          if (WORKER_SHELL_ENABLED) {
+            await pruneWorkerBootHeavyStorageBeforeMount(activeWorkspaceId);
+          }
           bootTrace("post-pruneWorkerBootStorage");
           bootTrace("pre-workerShell");
           await bootWorkerShell(bootStartedAt);
           await bootPhase("shell interactive");
+          setRuntimeStatus(
+            externalShellFallbackActive ? "Python fallback active" : "Runtime ready",
+            externalShellFallbackActive ? "error" : "ready",
+          );
+          revealApp();
           bootTrace("boot-main-complete");
           clearTimeout(bootWatchdog);
           markRuntimePhase("root-idle");
+          notifyBridgeRuntimeReady();
           return;
         }
 
-        const pyodideIndexURL = "https://cdn.jsdelivr.net/pyodide/v0.27.5/full/";
-        const { loadPyodide } = await import(`${pyodideIndexURL}pyodide.mjs`);
+        markRuntimePhase("importPyodide");
+        const { loadPyodide, indexURL: pyodideIndexURL } = await importPyodideLoader();
         showBootStatus("Starting Python runtime...");
         await bootPhase("pyodide module imported");
         markRuntimePhase("loadPyodide");
         pyodide = await withPyodideBootLock(
-          async () => await loadPyodide({
-            indexURL: pyodideIndexURL,
-            fullStdLib: false,
-          }),
+          async () => await withTimeout(
+            loadPyodide({
+              indexURL: pyodideIndexURL,
+              fullStdLib: false,
+            }),
+            PYODIDE_RUNTIME_TIMEOUT_MS,
+            "The browser Python runtime did not finish starting within 60 seconds. Reload this tab to retry.",
+          ),
           bootStartedAt
         );
         globalThis.pyodide = pyodide;
@@ -16187,6 +24175,38 @@ shell
           // Mount the real workspace (IDBFS) lazily — avoids 60s IndexedDB
           // freeze during boot with large rootfs databases
           lazyMountWorkspaceAfterBoot();
+          setTerminalInputReady(false);
+          term?.pause?.();
+          showBootStatus("Preparing POSIX command environment...");
+          externalShellFallbackActive = false;
+          try {
+            await warmExternalShellForBoot(
+              currentPath,
+              `/home/${activeUser()}`,
+              { omitInstalledPayload: true },
+            );
+          } catch (error) {
+            externalShellFallbackActive = true;
+            window.__edgeTermRuntimeDiagnostics = {
+              ...(window.__edgeTermRuntimeDiagnostics || {}),
+              externalShellBootError: {
+                code: String(error?.code || "external_shell_prepare_failed"),
+                message: String(error?.message || "The external shell did not start."),
+                stack: String(error?.stack || ""),
+                runtimeStatus: externalShellRuntime?.status?.() || null,
+                observedAt: new Date().toISOString(),
+              },
+            };
+            console.info(
+              "[EXTERNAL SHELL] Python fallback is active:",
+              error.code || "external_shell_prepare_failed",
+              error.message || "The external shell did not start.",
+            );
+            showBootStatus("POSIX command runtime unavailable. Python tools remain available.", true);
+          } finally {
+            setTerminalInputReady(true);
+            term?.resume?.();
+          }
           await bootPhase("shell interactive");
         }
         if (PAGE_KIND === "admin" && CLOUD_ENABLED) setView("adminView");
@@ -16214,13 +24234,33 @@ shell
         bootTrace("boot-main-complete");
         clearTimeout(bootWatchdog);
         markRuntimePhase("root-idle");
+        setRuntimeStatus(
+          externalShellFallbackActive ? "Python fallback active" : "Runtime ready",
+          externalShellFallbackActive ? "error" : "ready",
+        );
 
         if (isWorkspaceStorageLoaded(activeWorkspaceId)) scheduleWorkspaceFlush(5000);
+        notifyBridgeRuntimeReady();
       }
 
+      setupEdgeTermEmbedBridge();
       main().catch((err) => {
         console.error("[BOOT] Failed:", err);
+        window.__edgeTermRuntimeDiagnostics = {
+          ...(window.__edgeTermRuntimeDiagnostics || {}),
+          mainBootError: {
+            phase: String(runtimeDiagnosticPhase || "unknown"),
+            message: formatError(err),
+            stack: String(err?.stack || ""),
+            observedAt: new Date().toISOString(),
+          },
+        };
+        edgeTermBridgeServer?.emit("runtime.error", {
+          code: "runtime_boot_failed",
+          message: formatError(err),
+        });
         revealApp();
+        setRuntimeStatus("Runtime unavailable", "error");
         showBootStatus("[BOOT] Failed to start EdgeTerm Workspace\n" + formatError(err), true);
         const errorBox = document.createElement("pre");
         errorBox.id = "boot-error";

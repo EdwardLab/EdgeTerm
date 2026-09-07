@@ -1,0 +1,1052 @@
+diff --git a/src/fs/directory.rs b/src/fs/directory.rs
+index 34af7da..3aa99ff 100644
+--- a/src/fs/directory.rs
++++ b/src/fs/directory.rs
+@@ -8,7 +8,6 @@ use js_sys::Reflect;
+ use tracing::Instrument;
+ use virtual_fs::{AsyncReadExt, AsyncWriteExt, FileSystem, FileType};
+ use wasm_bindgen::{prelude::wasm_bindgen, JsCast, JsValue};
+-use wasmer_wasix::runtime::task_manager::InlineWaker;
+ 
+ use crate::{utils::Error, StringOrBytes};
+ 
+@@ -213,8 +212,12 @@ impl FileSystem for Directory {
+     }
+ 
+     #[tracing::instrument(level = "trace", skip(self))]
+-    fn mount(&self, name: String, path: &Path, fs: Box<dyn FileSystem + Send + Sync>)
+-            -> virtual_fs::Result<()> {
++    fn mount(
++        &self,
++        name: String,
++        path: &Path,
++        fs: Box<dyn FileSystem + Send + Sync>,
++    ) -> virtual_fs::Result<()> {
+         self.0.mount(name, path, fs)
+     }
+ }
+@@ -304,7 +307,7 @@ fn in_memory_filesystem(record: &js_sys::Object) -> Result<virtual_fs::mem_fs::F
+             file.length=contents.len(),
+             "Adding file to directory",
+         );
+-        InlineWaker::block_on(async {
++        futures::executor::block_on(async {
+             let mut f = fs
+                 .new_open_options()
+                 .write(true)
+diff --git a/src/instance.rs b/src/instance.rs
+index 18b18d1..41ec942 100644
+--- a/src/instance.rs
++++ b/src/instance.rs
+@@ -71,9 +71,17 @@ impl Instance {
+ 
+         // Note: this relies on the underlying instance closing stdout and
+         // stderr when it exits. Failing to do this will block forever.
+-        let (_, _, ExitCondition(code)) =
++        let (_, _, ExitCondition { code, error }) =
+             futures::try_join!(stdout_done, stderr_done, exit.map_err(Error::from))?;
+ 
++        if let Some(error) = error {
++            if !stderr_buffer.is_empty() && !stderr_buffer.ends_with(b"\n") {
++                stderr_buffer.push(b'\n');
++            }
++            stderr_buffer.extend_from_slice(error.as_bytes());
++            stderr_buffer.push(b'\n');
++        }
++
+         let output = Output {
+             code,
+             ok: code == 0,
+@@ -98,12 +106,20 @@ async fn copy_to_buffer(
+ }
+ 
+ #[derive(Debug)]
+-pub(crate) struct ExitCondition(i32);
++pub(crate) struct ExitCondition {
++    code: i32,
++    error: Option<String>,
++}
+ 
+ impl ExitCondition {
+     pub(crate) fn from_result(result: Result<(), anyhow::Error>) -> Self {
+         let err = match result {
+-            Ok(_) => return ExitCondition(0),
++            Ok(_) => {
++                return ExitCondition {
++                    code: 0,
++                    error: None,
++                }
++            }
+             Err(e) => e,
+         };
+ 
+@@ -114,10 +130,16 @@ impl ExitCondition {
+             .and_then(|runtime_error| runtime_error.as_exit_code());
+ 
+         match error_code {
+-            Some(code) => ExitCondition(code.raw()),
++            Some(code) => ExitCondition {
++                code: code.raw(),
++                error: None,
++            },
+             None => {
+                 tracing::debug!(error = &*err, "Process exited unexpectedly");
+-                ExitCondition(1)
++                ExitCondition {
++                    code: 1,
++                    error: Some(format!("runWasix failed: {err:#}")),
++                }
+             }
+         }
+     }
+diff --git a/src/lib.rs b/src/lib.rs
+index 7b22da5..27a6d3f 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -36,7 +36,7 @@ pub use crate::{
+ };
+ 
+ use once_cell::sync::Lazy;
+-use wasm_bindgen::prelude::wasm_bindgen;
++use wasm_bindgen::{prelude::wasm_bindgen, JsCast};
+ use wasmer_wasix::runtime::resolver::BackendSource;
+ 
+ pub(crate) const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+@@ -56,6 +56,12 @@ fn on_start() {
+     std::panic::set_hook(Box::new(|p| {
+         tracing::error!("{p}");
+         console_error_panic_hook::hook(p);
++        if let Ok(scope) = js_sys::global().dyn_into::<web_sys::DedicatedWorkerGlobalScope>() {
++            let message = js_sys::Object::new();
++            let _ = js_sys::Reflect::set(&message, &"type".into(), &"wasmer-runtime-panic".into());
++            let _ = js_sys::Reflect::set(&message, &"message".into(), &p.to_string().into());
++            let _ = scope.post_message(&message);
++        }
+     }));
+ }
+ 
+diff --git a/src/options.rs b/src/options.rs
+index 9fb3958..5721311 100644
+--- a/src/options.rs
++++ b/src/options.rs
+@@ -1,10 +1,9 @@
+-use std::{collections::BTreeMap, sync::Arc};
++use std::{collections::BTreeMap, path::Path};
+ 
+ use anyhow::Context;
+ use js_sys::Array;
+ use virtual_fs::TmpFileSystem;
+ use wasm_bindgen::{prelude::wasm_bindgen, JsCast, JsValue, UnwrapThrowExt};
+-use wasmer_wasix::WasiEnvBuilder;
+ 
+ use crate::{runtime::Runtime, utils::Error, Directory, DirectoryInit, JsRuntime, StringOrBytes};
+ 
+@@ -18,6 +17,21 @@ extern "C" {
+     type OptionalDirectories;
+ }
+ 
++impl RunOptions {
++    pub(crate) fn filesystem(&self) -> Result<TmpFileSystem, Error> {
++        let root = TmpFileSystem::new();
++
++        for (dest, _) in self.mounted_directories()? {
++            if let Some(parent) = Path::new(&dest).parent() {
++                virtual_fs::create_dir_all(&root, parent)
++                    .with_context(|| format!("Unable to create mount parent for \"{dest}\""))?;
++            }
++        }
++
++        Ok(root)
++    }
++}
++
+ #[wasm_bindgen(typescript_custom_section)]
+ const TYPE_DEFINITIONS: &'static str = r#"
+ /**
+@@ -176,71 +190,6 @@ extern "C" {
+ 
+ }
+ 
+-impl RunOptions {
+-    /// Propagate any provided options to the [`WasiEnvBuilder`], returning
+-    /// streams that can be used for stdin/stdout/stderr.
+-    pub(crate) fn configure_builder(
+-        &self,
+-        builder: &mut WasiEnvBuilder,
+-    ) -> Result<
+-        (
+-            Option<web_sys::WritableStream>,
+-            web_sys::ReadableStream,
+-            web_sys::ReadableStream,
+-        ),
+-        Error,
+-    > {
+-        for arg in self.parse_args()? {
+-            builder.add_arg(arg);
+-        }
+-
+-        for (key, value) in self.parse_env()? {
+-            builder.add_env(key, value);
+-        }
+-
+-        let stdin = match self.read_stdin() {
+-            Some(stdin) => {
+-                let f = virtual_fs::StaticFile::new(stdin);
+-                builder.set_stdin(Box::new(f));
+-                None
+-            }
+-            None => {
+-                let (f, stdin) = crate::streams::input_pipe();
+-                builder.set_stdin(Box::new(f));
+-                Some(stdin)
+-            }
+-        };
+-
+-        let (stdout_file, stdout) = crate::streams::output_pipe();
+-        builder.set_stdout(Box::new(stdout_file));
+-
+-        let (stderr_file, stderr) = crate::streams::output_pipe();
+-        builder.set_stderr(Box::new(stderr_file));
+-
+-        let fs = self.filesystem()?;
+-        builder.set_fs(Box::new(fs));
+-        builder.add_preopen_dir("/")?;
+-
+-        Ok((stdin, stdout, stderr))
+-    }
+-
+-    pub(crate) fn filesystem(&self) -> Result<TmpFileSystem, Error> {
+-        let root = TmpFileSystem::new();
+-
+-        for (dest, fs) in self.mounted_directories()? {
+-            tracing::trace!(%dest, ?fs, "Mounting directory");
+-
+-            let fs = Arc::new(fs) as Arc<_>;
+-            root.mount(dest.as_str().into(), &fs, "/".into())
+-                .with_context(|| format!("Unable to mount to \"{dest}\""))?;
+-        }
+-
+-        tracing::trace!(?root, "Initialized the filesystem");
+-
+-        Ok(root)
+-    }
+-}
+-
+ impl OptionalRuntime {
+     pub(crate) fn as_runtime(&self) -> Option<JsRuntime> {
+         let js_value: &JsValue = self.as_ref();
+diff --git a/src/run.rs b/src/run.rs
+index 6e25018..35d0816 100644
+--- a/src/run.rs
++++ b/src/run.rs
+@@ -1,13 +1,19 @@
+-use futures::channel::oneshot;
+-use wasmer_types::ModuleHash;
+-use std::sync::Arc;
++use anyhow::{Context, anyhow};
++use futures::{channel::oneshot, executor::block_on};
++use std::{
++    collections::{BTreeMap, BTreeSet},
++    path::{Path, PathBuf},
++    sync::Arc,
++};
+ use wasm_bindgen::{prelude::wasm_bindgen, JsCast};
+-use wasmer_wasix::Runtime as _;
+-use wasmer_wasix::WasiEnvBuilder;
++use wasmer_types::ModuleHash;
++use wasmer_wasix::runners::wasi::{RuntimeOrEngine, WasiRunner};
+ use wasmer_wasix::runtime::module_cache::HashedModuleData;
+-use wasmer_wasix::runners::wasi::{WasiRunner, RuntimeOrEngine};
++use wasmer_wasix::runtime::task_manager::TaskWasmRecycleProperties;
++use wasmer_wasix::Runtime as _;
++use virtual_fs::{AsyncReadExt, AsyncWriteExt, FileSystem};
+ 
+-use crate::{instance::ExitCondition, utils::Error, Instance, RunOptions};
++use crate::{instance::ExitCondition, utils::Error, Directory, Instance, RunOptions};
+ 
+ const DEFAULT_PROGRAM_NAME: &str = "wasm";
+ 
+@@ -38,13 +44,40 @@ async fn run_wasix_inner(wasm_module: WasmModule, config: RunOptions) -> Result<
+         .program()
+         .as_string()
+         .unwrap_or_else(|| DEFAULT_PROGRAM_NAME.to_string());
++    let root_fs = config.filesystem()?;
+ 
+-    let mut builder = WasiEnvBuilder::new(program_name.clone()).runtime(runtime.clone());
+-    let (stdin, stdout, stderr) = config.configure_builder(&mut builder)?;
+-
+-    let (exit_code_tx, exit_code_rx) = oneshot::channel();
+     let mut runner = WasiRunner::new();
++    runner.with_args(config.parse_args()?);
++    runner.with_envs(config.parse_env()?);
++
++    let mounted_directories = config.mounted_directories()?;
++    for (dest, directory) in &mounted_directories {
++        runner.with_mount(dest.clone(), Arc::new(directory.clone()));
++    }
++
++    if let Some(cwd) = config.parse_cwd()? {
++        runner.with_current_dir(cwd);
++    }
+ 
++    let stdin = match config.read_stdin() {
++        Some(contents) => {
++            runner.with_stdin(Box::new(virtual_fs::StaticFile::new(contents)));
++            None
++        }
++        None => {
++            let (pipe, stream) = crate::streams::input_pipe();
++            runner.with_stdin(Box::new(pipe));
++            Some(stream)
++        }
++    };
++
++    let (stdout_pipe, stdout) = crate::streams::output_pipe();
++    runner.with_stdout(Box::new(stdout_pipe.clone()));
++
++    let (stderr_pipe, stderr) = crate::streams::output_pipe();
++    runner.with_stderr(Box::new(stderr_pipe.clone()));
++
++    let (exit_code_tx, exit_code_rx) = oneshot::channel();
+     let module: wasmer::Module = wasm_module.to_module(&*runtime).await?;
+ 
+     // Note: The WasiEnvBuilder::run() method blocks, so we need to run it on
+@@ -53,9 +86,41 @@ async fn run_wasix_inner(wasm_module: WasmModule, config: RunOptions) -> Result<
+     tasks.spawn_with_module(
+         module,
+         Box::new(move |module| {
++            let mut stdout_pipe = stdout_pipe;
++            let mut stderr_pipe = stderr_pipe;
+             let _span = tracing::debug_span!("run").entered();
+             let hash = ModuleHash::random();
+-            let result = runner.run_wasm(RuntimeOrEngine::Runtime(runtime), &program_name, module, hash );
++            let (sync_tx, sync_rx) = oneshot::channel();
++            let recycle = Box::new(move |props: TaskWasmRecycleProperties| {
++                let result = synchronize_mounted_directories(
++                    props.env.fs_root(),
++                    &mounted_directories,
++                );
++                let _ = sync_tx.send(result);
++            });
++            let run_result = runner.run_wasm_with_root_fs_and_recycle(
++                RuntimeOrEngine::Runtime(runtime),
++                &program_name,
++                module,
++                hash,
++                root_fs,
++                recycle,
++            );
++            let result = match run_result {
++                Err(error) => Err(error),
++                Ok(()) => block_on(sync_rx)
++                    .map_err(|_| anyhow!("Runtime filesystem synchronization did not complete"))
++                    .and_then(|result| result),
++            };
++            if let Err(error) = &result {
++                let message = format!("Runtime execution failed: {error:#}\n");
++                let _ = block_on(stderr_pipe.write_all(message.as_bytes()));
++                let _ = block_on(stderr_pipe.flush());
++                web_sys::console::error_1(&format!("runWasix failed: {error:#}").into());
++            }
++            stdout_pipe.close();
++            stderr_pipe.close();
+             let _ = exit_code_tx.send(ExitCondition::from_result(result));
+         }),
+     )?;
+@@ -68,6 +133,112 @@ async fn run_wasix_inner(wasm_module: WasmModule, config: RunOptions) -> Result<
+     })
+ }
+ 
++#[derive(Default, PartialEq, Eq)]
++struct FileSystemSnapshot {
++    directories: BTreeSet<PathBuf>,
++    files: BTreeMap<PathBuf, Vec<u8>>,
++}
++
++fn snapshot_file_system(
++    fs: &dyn FileSystem,
++    source_root: &Path,
++) -> anyhow::Result<FileSystemSnapshot> {
++    fn visit(
++        fs: &dyn FileSystem,
++        source_root: &Path,
++        relative: &Path,
++        snapshot: &mut FileSystemSnapshot,
++    ) -> anyhow::Result<()> {
++        let current = source_root.join(relative);
++        let entries = fs
++            .read_dir(&current)
++            .with_context(|| format!("Unable to read {}", current.display()))?;
++        for entry in entries {
++            let entry = entry?;
++            let name = entry.file_name();
++            let child_relative = relative.join(name);
++            let child_source = source_root.join(&child_relative);
++            let file_type = entry.file_type()?;
++            if file_type.is_dir() {
++                snapshot.directories.insert(child_relative.clone());
++                visit(fs, source_root, &child_relative, snapshot)?;
++                continue;
++            }
++            if file_type.is_file() {
++                let mut options = fs.new_open_options();
++                options.read(true);
++                let mut file = options.open(&child_source)?;
++                let mut bytes = Vec::with_capacity(file.size() as usize);
++                block_on(file.read_to_end(&mut bytes))?;
++                snapshot.files.insert(child_relative, bytes);
++            }
++        }
++        Ok(())
++    }
++
++    let mut snapshot = FileSystemSnapshot::default();
++    visit(fs, source_root, Path::new(""), &mut snapshot)?;
++    Ok(snapshot)
++}
++
++fn replace_directory_contents(
++    directory: &Directory,
++    source: &FileSystemSnapshot,
++) -> anyhow::Result<()> {
++    let before = snapshot_file_system(directory, Path::new("/"))?;
++    if before == *source {
++        return Ok(());
++    }
++
++    for path in before.files.keys().filter(|path| !source.files.contains_key(*path)) {
++        FileSystem::remove_file(directory, &Path::new("/").join(path))?;
++    }
++    let mut removed_directories = before
++        .directories
++        .iter()
++        .filter(|path| !source.directories.contains(*path))
++        .collect::<Vec<_>>();
++    removed_directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
++    for path in removed_directories {
++        FileSystem::remove_dir(directory, &Path::new("/").join(path))?;
++    }
++    for path in &source.directories {
++        let path = Path::new("/").join(path);
++        if FileSystem::read_dir(directory, &path).is_err() {
++            virtual_fs::create_dir_all(directory, &path)?;
++        }
++    }
++    for (path, bytes) in &source.files {
++        let path = Path::new("/").join(path);
++        if let Some(parent) = path.parent() {
++            virtual_fs::create_dir_all(directory, parent)?;
++        }
++        let mut options = directory.new_open_options();
++        options.write(true).create(true).truncate(true);
++        let mut file = options.open(&path)?;
++        block_on(file.write_all(bytes))?;
++        block_on(file.flush())?;
++    }
++    Ok(())
++}
++
++fn synchronize_mounted_directories(
++    root_fs: &dyn FileSystem,
++    mounted_directories: &[(String, Directory)],
++) -> anyhow::Result<()> {
++    for (guest_path, directory) in mounted_directories {
++        if !guest_path.starts_with('/') {
++            return Err(anyhow!("Relative runtime mount is not supported: {guest_path:?}"));
++        }
++        let guest_path = Path::new(guest_path);
++        let snapshot = snapshot_file_system(root_fs, guest_path)
++            .with_context(|| format!("Unable to snapshot mount {}", guest_path.display()))?;
++        replace_directory_contents(directory, &snapshot)
++            .with_context(|| format!("Unable to persist mount {}", guest_path.display()))?;
++    }
++    Ok(())
++}
++
+ #[wasm_bindgen]
+ extern "C" {
+     #[wasm_bindgen(typescript_type = "WebAssembly.Module | Uint8Array")]
+diff --git a/src/tasks/post_message_payload.rs b/src/tasks/post_message_payload.rs
+index 88480cd..d864ded 100644
+--- a/src/tasks/post_message_payload.rs
++++ b/src/tasks/post_message_payload.rs
+@@ -1,5 +1,6 @@
++use bytes::Bytes;
+ use derivative::Derivative;
+-use js_sys::WebAssembly;
++use js_sys::{Uint8Array, WebAssembly};
+ use wasm_bindgen::JsValue;
+ use wasmer_types::ModuleHash;
+ 
+@@ -28,6 +29,7 @@ pub(crate) enum BlockingJob {
+     Thunk(#[derivative(Debug(format_with = "crate::utils::hidden"))] BlockingTask),
+     SpawnWithModule {
+         module: WebAssembly::Module,
++        module_bytes: Bytes,
+         #[derivative(Debug(format_with = "crate::utils::hidden"))]
+         task: BlockingModuleTask,
+     },
+@@ -63,6 +65,7 @@ mod consts {
+     pub(crate) const TYPE_SPAWN_WITH_MODULE_AND_MEMORY: &str = "spawn-with-module-and-memory";
+     pub(crate) const PTR: &str = "ptr";
+     pub(crate) const MODULE: &str = "module";
++    pub(crate) const MODULE_BYTES: &str = "module-bytes";
+     pub(crate) const MEMORY: &str = "memory";
+     pub(crate) const MODULE_HASH: &str = "module-hash";
+ }
+@@ -80,12 +83,18 @@ impl PostMessagePayload {
+                     .boxed(consts::PTR, task)
+                     .finish()
+             }
+-            PostMessagePayload::Blocking(BlockingJob::SpawnWithModule { module, task }) => {
+-                Serializer::new(consts::TYPE_SPAWN_WITH_MODULE)
+-                    .boxed(consts::PTR, task)
+-                    .set(consts::MODULE, module)
+-                    .finish()
+-            }
++            PostMessagePayload::Blocking(BlockingJob::SpawnWithModule {
++                module,
++                module_bytes,
++                task,
++            }) => Serializer::new(consts::TYPE_SPAWN_WITH_MODULE)
++                .boxed(consts::PTR, task)
++                .set(consts::MODULE, module)
++                .set(
++                    consts::MODULE_BYTES,
++                    Uint8Array::from(module_bytes.as_ref()),
++                )
++                .finish(),
+             PostMessagePayload::Blocking(BlockingJob::SpawnWithModuleAndMemory {
+                 module,
+                 memory,
+@@ -139,9 +148,11 @@ impl PostMessagePayload {
+             consts::TYPE_SPAWN_WITH_MODULE => {
+                 let task = de.boxed(consts::PTR)?;
+                 let module = de.js(consts::MODULE)?;
++                let module_bytes: Uint8Array = de.js(consts::MODULE_BYTES)?;
+ 
+                 Ok(PostMessagePayload::Blocking(BlockingJob::SpawnWithModule {
+                     module,
++                    module_bytes: Bytes::from(module_bytes.to_vec()),
+                     task,
+                 }))
+             }
+@@ -231,9 +242,11 @@ mod tests {
+         let wasm: &[u8] = include_bytes!("../../tests/envvar.wasm");
+         let engine = wasmer::Engine::default();
+         let module = wasmer::Module::new(&engine, wasm).unwrap();
++        let module_bytes = module.serialize().unwrap();
+         let (sender, receiver) = oneshot::channel();
+         let msg = PostMessagePayload::Blocking(BlockingJob::SpawnWithModule {
+             module: JsValue::from(module).dyn_into().unwrap(),
++            module_bytes,
+             task: Box::new(|m| {
+                 sender
+                     .send(
+@@ -248,13 +261,15 @@ mod tests {
+         let js = msg.into_js().unwrap();
+         let round_tripped = unsafe { PostMessagePayload::try_from_js(js).unwrap() };
+ 
+-        let (module, task) = match round_tripped {
+-            PostMessagePayload::Blocking(BlockingJob::SpawnWithModule { module, task }) => {
+-                (module, task)
+-            }
++        let (module, module_bytes, task) = match round_tripped {
++            PostMessagePayload::Blocking(BlockingJob::SpawnWithModule {
++                module,
++                module_bytes,
++                task,
++            }) => (module, module_bytes, task),
+             _ => unreachable!(),
+         };
+-        task(module.into());
++        task(wasmer::Module::from((module, module_bytes)));
+         let name = receiver.await.unwrap();
+         assert_eq!(
+             name,
+@@ -319,7 +334,7 @@ mod tests {
+                 spawn_wasm,
+             } => PostMessagePayload::Blocking(BlockingJob::SpawnWithModuleAndMemory {
+                 module: module.into(),
+-                memory: memory.map(|m| m.as_jsvalue(&wasmer::Store::default()).dyn_into().unwrap()),
++                memory,
+                 spawn_wasm,
+             }),
+             _ => unreachable!(),
+diff --git a/src/tasks/scheduler.rs b/src/tasks/scheduler.rs
+index 95ed5d1..7c2815b 100644
+--- a/src/tasks/scheduler.rs
++++ b/src/tasks/scheduler.rs
+@@ -9,7 +9,6 @@ use tokio::sync::mpsc::UnboundedSender;
+ use tokio::sync::mpsc::{self};
+ use tracing::Instrument;
+ use wasm_bindgen::{JsCast, JsValue};
+-use wasmer::js::AsJs;
+ use wasmer_types::ModuleHash;
+ 
+ use crate::tasks::{
+@@ -176,19 +175,20 @@ impl SchedulerState {
+ 
+                 Ok(())
+             }
+-            SchedulerMessage::SpawnWithModule { module, task } => {
+-                self.post_message(PostMessagePayload::Blocking(BlockingJob::SpawnWithModule {
+-                    module: JsValue::from(module).unchecked_into(),
+-                    task,
+-                }))
+-            }
++            SchedulerMessage::SpawnWithModule {
++                module,
++                module_bytes,
++                task,
++            } => self.post_message(PostMessagePayload::Blocking(BlockingJob::SpawnWithModule {
++                module: JsValue::from(module).unchecked_into(),
++                module_bytes,
++                task,
++            })),
+             SchedulerMessage::SpawnWithModuleAndMemory {
+                 module,
+                 memory,
+                 spawn_wasm,
+             } => {
+-                let temp_store = wasmer::Store::default();
+-                let memory = memory.map(|m| m.as_jsvalue(&temp_store).dyn_into().unwrap());
+                 let module = JsValue::from(module).dyn_into().unwrap();
+ 
+                 self.post_message(PostMessagePayload::Blocking(
+@@ -219,6 +219,15 @@ impl SchedulerState {
+                 );
+                 Ok(())
+             }
++            SchedulerMessage::WorkerFailed { worker_id } => {
++                remove_worker(worker_id, &mut self.idle);
++                remove_worker(worker_id, &mut self.busy);
++                tracing::warn!(
++                    worker.id = worker_id,
++                    "Worker removed after an execution failure"
++                );
++                Ok(())
++            }
+             SchedulerMessage::Markers { uninhabited, .. } => match uninhabited {},
+         }
+     }
+@@ -293,6 +302,12 @@ fn move_worker(worker_id: u32, from: &mut VecDeque<WorkerHandle>, to: &mut VecDe
+     }
+ }
+ 
++fn remove_worker(worker_id: u32, workers: &mut VecDeque<WorkerHandle>) {
++    if let Some(ix) = workers.iter().position(|worker| worker.id() == worker_id) {
++        workers.remove(ix);
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use tokio::sync::oneshot;
+diff --git a/src/tasks/scheduler_message.rs b/src/tasks/scheduler_message.rs
+index f142a0d..c2193c6 100644
+--- a/src/tasks/scheduler_message.rs
++++ b/src/tasks/scheduler_message.rs
+@@ -1,9 +1,9 @@
+ use std::marker::PhantomData;
+ 
++use bytes::Bytes;
+ use derivative::Derivative;
+-use js_sys::WebAssembly;
++use js_sys::{Uint8Array, WebAssembly};
+ use wasm_bindgen::JsValue;
+-use wasmer::js::AsJs;
+ use wasmer_types::ModuleHash;
+ 
+ use crate::{
+@@ -31,6 +31,8 @@ pub(crate) enum SchedulerMessage {
+     WorkerIdle { worker_id: u32 },
+     /// Mark a worker as busy.
+     WorkerBusy { worker_id: u32 },
++    /// Remove a worker that terminated while running a task.
++    WorkerFailed { worker_id: u32 },
+     /// Tell all workers to cache a WebAssembly module.
+     #[allow(dead_code)]
+     CacheModule {
+@@ -41,6 +43,7 @@ pub(crate) enum SchedulerMessage {
+     /// [`js_sys::WebAssembly::Module`] to the worker.
+     SpawnWithModule {
+         module: wasmer::Module,
++        module_bytes: Bytes,
+         #[derivative(Debug(format_with = "crate::utils::hidden"))]
+         task: BlockingModuleTask,
+     },
+@@ -48,7 +51,7 @@ pub(crate) enum SchedulerMessage {
+     /// [`js_sys::WebAssembly::Module`] to the worker.
+     SpawnWithModuleAndMemory {
+         module: wasmer::Module,
+-        memory: Option<wasmer::Memory>,
++        memory: Option<WebAssembly::Memory>,
+         spawn_wasm: SpawnWasm,
+     },
+     #[doc(hidden)]
+@@ -82,6 +85,10 @@ impl SchedulerMessage {
+                 let worker_id = de.serde(consts::WORKER_ID)?;
+                 Ok(SchedulerMessage::WorkerBusy { worker_id })
+             }
++            consts::TYPE_WORKER_FAILED => {
++                let worker_id = de.serde(consts::WORKER_ID)?;
++                Ok(SchedulerMessage::WorkerFailed { worker_id })
++            }
+             consts::TYPE_CACHE_MODULE => {
+                 let hash = de.string(consts::MODULE_HASH)?;
+                 let hash = if let Ok(hash) = ModuleHash::sha256_parse_hex(&hash) {
+@@ -97,9 +104,11 @@ impl SchedulerMessage {
+             }
+             consts::TYPE_SPAWN_WITH_MODULE => {
+                 let module: WebAssembly::Module = de.js(consts::MODULE)?;
++                let module_bytes: Uint8Array = de.js(consts::MODULE_BYTES)?;
+                 let task = de.boxed(consts::PTR)?;
+                 Ok(SchedulerMessage::SpawnWithModule {
+-                    module: module.into(),
++                    module: wasmer::Module::from((module, module_bytes.to_vec())),
++                    module_bytes: Bytes::from(module_bytes.to_vec()),
+                     task,
+                 })
+             }
+@@ -110,11 +119,7 @@ impl SchedulerMessage {
+                 let module = wasmer::Module::from((module, module_bytes));
+ 
+                 let memory = match spawn_wasm.shared_memory_type() {
+-                    Some(ty) => {
+-                        let memory: JsValue = de.js(consts::MEMORY)?;
+-                        let mut store = wasmer::Store::default();
+-                        wasmer::Memory::from_jsvalue(&mut store, &ty, &memory).ok()
+-                    }
++                    Some(_) => de.js(consts::MEMORY).ok(),
+                     None => None,
+                 };
+ 
+@@ -146,18 +151,29 @@ impl SchedulerMessage {
+             SchedulerMessage::WorkerBusy { worker_id } => Serializer::new(consts::TYPE_WORKER_BUSY)
+                 .set(consts::WORKER_ID, worker_id)
+                 .finish(),
++            SchedulerMessage::WorkerFailed { worker_id } => {
++                Serializer::new(consts::TYPE_WORKER_FAILED)
++                    .set(consts::WORKER_ID, worker_id)
++                    .finish()
++            }
+             SchedulerMessage::CacheModule { hash, module } => {
+                 Serializer::new(consts::TYPE_CACHE_MODULE)
+                     .set(consts::MODULE_HASH, hash.to_string())
+                     .set(consts::MODULE, module)
+                     .finish()
+             }
+-            SchedulerMessage::SpawnWithModule { module, task } => {
+-                Serializer::new(consts::TYPE_SPAWN_WITH_MODULE)
+-                    .set(consts::MODULE, module)
+-                    .boxed(consts::PTR, task)
+-                    .finish()
+-            }
++            SchedulerMessage::SpawnWithModule {
++                module,
++                module_bytes,
++                task,
++            } => Serializer::new(consts::TYPE_SPAWN_WITH_MODULE)
++                .set(consts::MODULE, module)
++                .set(
++                    consts::MODULE_BYTES,
++                    Uint8Array::from(module_bytes.as_ref()),
++                )
++                .boxed(consts::PTR, task)
++                .finish(),
+             SchedulerMessage::SpawnWithModuleAndMemory {
+                 module,
+                 memory,
+@@ -168,8 +184,7 @@ impl SchedulerMessage {
+                     .boxed(consts::PTR, spawn_wasm);
+ 
+                 if let Some(memory) = memory {
+-                    let store = wasmer::Store::default();
+-                    ser = ser.set(consts::MEMORY, memory.as_jsvalue(&store));
++                    ser = ser.set(consts::MEMORY, memory);
+                 }
+ 
+                 ser.finish()
+@@ -185,12 +200,14 @@ mod consts {
+     pub const TYPE_SPAWN_BLOCKING: &str = "spawn-blocking";
+     pub const TYPE_WORKER_IDLE: &str = "worker-idle";
+     pub const TYPE_WORKER_BUSY: &str = "worker-busy";
++    pub const TYPE_WORKER_FAILED: &str = "worker-failed";
+     pub const TYPE_CACHE_MODULE: &str = "cache-module";
+     pub const TYPE_SPAWN_WITH_MODULE: &str = "spawn-with-module";
+     pub const TYPE_SPAWN_WITH_MODULE_AND_MEMORY: &str = "spawn-with-module-and-memory";
+     pub const MEMORY: &str = "memory";
+     pub const MODULE_HASH: &str = "module-hash";
+     pub const MODULE: &str = "module";
++    pub const MODULE_BYTES: &str = "module-bytes";
+     pub const PTR: &str = "ptr";
+     pub const WORKER_ID: &str = "worker-id";
+ }
+diff --git a/src/tasks/task_wasm.rs b/src/tasks/task_wasm.rs
+index 2b61599..bb8cc8f 100644
+--- a/src/tasks/task_wasm.rs
++++ b/src/tasks/task_wasm.rs
+@@ -38,9 +38,7 @@ pub(crate) fn to_scheduler_message(
+     let module_bytes = module.serialize().unwrap();
+ 
+     let (memory_ty, memory, run_type) = match spawn_type {
+-        SpawnType::CreateMemory => {
+-            (None, None, WasmMemoryType::CreateMemory)
+-        }
++        SpawnType::CreateMemory => (None, None, WasmMemoryType::CreateMemory),
+         SpawnType::CreateMemoryOfType(ty) => {
+             (Some(ty), None, WasmMemoryType::CreateMemoryOfType(ty))
+         }
+@@ -75,16 +73,7 @@ pub(crate) fn to_scheduler_message(
+         }
+     };
+ 
+-    let memory = memory.map(|m| {
+-        // HACK: The store isn't used when converting memories, so it's fine to
+-        // use a dummy one.
+-        let mut store = wasmer::Store::default();
+-        let ty = memory_ty.expect("Guaranteed to be set");
+-        match wasmer::Memory::from_jsvalue(&mut store, &ty, &m) {
+-            Ok(m) => m,
+-            Err(_) => unreachable!(),
+-        }
+-    });
++    let memory = memory.map(|memory| memory.unchecked_into::<WebAssembly::Memory>());
+ 
+     let store_snapshot = globals.clone();
+     let spawn_wasm = SpawnWasm {
+diff --git a/src/tasks/thread_pool.rs b/src/tasks/thread_pool.rs
+index 97b57da..70282c8 100644
+--- a/src/tasks/thread_pool.rs
++++ b/src/tasks/thread_pool.rs
+@@ -142,7 +142,16 @@ impl VirtualTaskManager for ThreadPool {
+         module: wasmer::Module,
+         task: Box<dyn FnOnce(wasmer::Module) + Send + 'static>,
+     ) -> Result<(), WasiThreadError> {
+-        self.send(SchedulerMessage::SpawnWithModule { task, module });
++        let module_bytes = module.serialize().map_err(|error| {
++            WasiThreadError::InitFailed(std::sync::Arc::new(anyhow::anyhow!(
++                "Unable to preserve module bytes for the worker: {error}"
++            )))
++        })?;
++        self.send(SchedulerMessage::SpawnWithModule {
++            task,
++            module,
++            module_bytes,
++        });
+ 
+         Ok(())
+     }
+diff --git a/src/tasks/thread_pool_worker.rs b/src/tasks/thread_pool_worker.rs
+index b73468d..883ef29 100644
+--- a/src/tasks/thread_pool_worker.rs
++++ b/src/tasks/thread_pool_worker.rs
+@@ -57,9 +57,13 @@ impl ThreadPoolWorker {
+                 let _guard = self.busy();
+                 thunk();
+             }
+-            BlockingJob::SpawnWithModule { module, task } => {
++            BlockingJob::SpawnWithModule {
++                module,
++                module_bytes,
++                task,
++            } => {
+                 let _guard = self.busy();
+-                task(module.into());
++                task(wasmer::Module::from((module, module_bytes)));
+             }
+             BlockingJob::SpawnWithModuleAndMemory {
+                 module,
+diff --git a/src/tasks/worker_handle.rs b/src/tasks/worker_handle.rs
+index 6e2a695..67a5c43 100644
+--- a/src/tasks/worker_handle.rs
++++ b/src/tasks/worker_handle.rs
+@@ -39,8 +39,10 @@ impl WorkerHandle {
+         let on_message: js_sys::Function = on_message.into_js_value().unchecked_into();
+         worker.set_onmessage(Some(&on_message));
+ 
+-        let on_error: Closure<dyn FnMut(web_sys::ErrorEvent)> =
+-            Closure::new(move |msg| on_error(msg, worker_id));
++        let on_error: Closure<dyn FnMut(web_sys::ErrorEvent)> = Closure::new({
++            let sender = sender.clone();
++            move |msg| on_error(msg, &sender, worker_id)
++        });
+         let on_error: js_sys::Function = on_error.into_js_value().unchecked_into();
+         worker.set_onerror(Some(&on_error));
+ 
+@@ -75,7 +77,8 @@ impl WorkerHandle {
+ }
+ 
+ #[tracing::instrument(level = "trace", skip_all, fields(worker.id=worker_id))]
+-fn on_error(msg: web_sys::ErrorEvent, worker_id: u32) {
++fn on_error(msg: web_sys::ErrorEvent, sender: &Scheduler, worker_id: u32) {
++    msg.prevent_default();
+     tracing::error!(
+         error = %msg.message(),
+         filename = %msg.filename(),
+@@ -83,6 +86,7 @@ fn on_error(msg: web_sys::ErrorEvent, worker_id: u32) {
+         column = %msg.colno(),
+         "An error occurred",
+     );
++    let _ = sender.send(SchedulerMessage::WorkerFailed { worker_id });
+ }
+ 
+ #[tracing::instrument(level = "trace", skip_all, fields(worker.id=worker_id))]
+diff --git a/src/utils.rs b/src/utils.rs
+index 1301d2d..33b811e 100644
+--- a/src/utils.rs
++++ b/src/utils.rs
+@@ -8,7 +8,6 @@ use js_sys::{JsString, Promise, Uint8Array};
+ 
+ use wasm_bindgen::{prelude::wasm_bindgen, JsCast, JsValue};
+ use web_sys::{Window, WorkerGlobalScope};
+-
+ /// Try to extract the most appropriate error message from a [`JsValue`],
+ /// falling back to a generic error message.
+ pub(crate) fn js_error(value: JsValue) -> anyhow::Error {
+diff --git a/src/wasmer.rs b/src/wasmer.rs
+index 372c165..23218da 100644
+--- a/src/wasmer.rs
++++ b/src/wasmer.rs
+@@ -6,19 +6,19 @@ use futures::{channel::oneshot, TryStreamExt};
+ use js_sys::{JsString, Reflect, Uint8Array};
+ use sha2::Digest;
+ use tracing::Instrument;
+-use virtual_fs::{AsyncReadExt, Pipe, RootFileSystemBuilder};
++use virtual_fs::{AsyncReadExt, Pipe};
+ use wasm_bindgen::{prelude::wasm_bindgen, JsValue, UnwrapThrowExt};
++use wasmer_config::package::SuggestedCompilerOptimizations;
+ use wasmer_config::{
+     hash::Sha256Hash,
+     package::{PackageHash, PackageId, PackageSource},
+ };
+ use wasmer_package::package::Package;
+ use wasmer_types::ModuleHash;
+-use wasmer_config::package::SuggestedCompilerOptimizations;
+ use wasmer_wasix::{
+     bin_factory::{BinaryPackage, BinaryPackageCommand},
+     os::{Tty, TtyOptions},
+-    runners::{wasi::{WasiRunner, RuntimeOrEngine}},
++    runners::wasi::{RuntimeOrEngine, WasiRunner},
+     Runtime as _,
+ };
+ use web_sys::{ReadableStream, WritableStream};
+@@ -161,7 +161,6 @@ impl Wasmer {
+     }
+ 
+     fn from_wasm(wasm: Vec<u8>, runtime: Option<OptionalRuntime>) -> Result<Self, Error> {
+-        let webc_fs = RootFileSystemBuilder::default().build();
+         let hash = ModuleHash::xxhash(&wasm);
+         let metadata = MetadataCommand {
+             runner: "wasi".to_string(),
+@@ -175,7 +174,7 @@ impl Wasmer {
+             package_ids: vec![],
+             hash: hash.clone().into(),
+             uses: vec![],
+-            webc_fs: Arc::new(webc_fs),
++            webc_fs: None,
+             when_cached: None,
+             file_system_memory_footprint: 0,
+             entrypoint_cmd: Some("entrypoint".to_string()),
+@@ -185,7 +184,7 @@ impl Wasmer {
+                 wasm.into(),
+                 hash,
+                 None,
+-                suggested_compiler_optimizations
++                suggested_compiler_optimizations,
+             )],
+             additional_host_mapped_directories: vec![],
+         };
+@@ -243,7 +242,8 @@ impl Command {
+         let options = options.unwrap_or_default();
+ 
+         let mut runner = WasiRunner::new();
+-        let (stdin, stdout, stderr) = configure_runner(&options, &mut runner, &runtime).await?;
++        let (stdin, stdout, stderr, mut stdout_pipe, mut stderr_pipe) =
++            configure_runner(&options, &mut runner, &runtime).await?;
+         let command_name = String::from(&self.name);
+ 
+         tracing::debug!(%command_name, "Starting the WASI runner");
+@@ -254,6 +254,8 @@ impl Command {
+         // it on the thread pool.
+         tasks.task_dedicated(Box::new(move || {
+             let result = runner.run_command(&command_name, &pkg, RuntimeOrEngine::Runtime(runtime));
++            stdout_pipe.close();
++            stderr_pipe.close();
+             let _ = sender.send(ExitCondition::from_result(result));
+             thread_pool.close();
+         }))?;
+@@ -315,6 +317,8 @@ pub(crate) async fn configure_runner(
+         Option<web_sys::WritableStream>,
+         web_sys::ReadableStream,
+         web_sys::ReadableStream,
++        Pipe,
++        Pipe,
+     ),
+     Error,
+ > {
+@@ -324,16 +328,16 @@ pub(crate) async fn configure_runner(
+     let env = options.parse_env()?;
+     runner.with_envs(env);
+ 
++    for (dest, dir) in options.mounted_directories()? {
++        runner.with_mount(dest, Arc::new(dir));
++    }
++
+     tracing::debug!("Setting up CWD");
+     if let Some(cwd) = options.parse_cwd()? {
+         tracing::debug!("CWD FOUND {}", cwd);
+         runner.with_current_dir(cwd);
+     }
+ 
+-    for (dest, dir) in options.mounted_directories()? {
+-        runner.with_mount(dest, Arc::new(dir));
+-    }
+-
+     if let Some(uses) = options.uses() {
+         let uses = crate::utils::js_string_array(uses)?;
+         let packages = load_injected_packages(uses, runtime).await?;
+@@ -341,7 +345,7 @@ pub(crate) async fn configure_runner(
+     }
+ 
+     let (stderr_pipe, stderr_stream) = crate::streams::output_pipe();
+-    runner.with_stderr(Box::new(stderr_pipe));
++    runner.with_stderr(Box::new(stderr_pipe.clone()));
+ 
+     let tty_options = runtime.tty_options().clone();
+     match setup_tty(options, tty_options) {
+@@ -353,15 +357,21 @@ pub(crate) async fn configure_runner(
+         } => {
+             tracing::debug!("Setting up interactive TTY");
+             runner.with_stdin(Box::new(stdin_pipe));
+-            runner.with_stdout(Box::new(stdout_pipe));
++            runner.with_stdout(Box::new(stdout_pipe.clone()));
+             runtime.set_connected_to_tty(true);
+-            Ok((Some(stdin_stream), stdout_stream, stderr_stream))
++            Ok((
++                Some(stdin_stream),
++                stdout_stream,
++                stderr_stream,
++                stdout_pipe,
++                stderr_pipe,
++            ))
+         }
+         TerminalMode::NonInteractive { stdin } => {
+             tracing::debug!("Setting up non-interactive TTY");
+             let (stdout_pipe, stdout_stream) = crate::streams::output_pipe();
+             runner.with_stdin(Box::new(stdin));
+-            runner.with_stdout(Box::new(stdout_pipe));
++            runner.with_stdout(Box::new(stdout_pipe.clone()));
+ 
+             // HACK: Make sure we don't report stdin as interactive.  This
+             // doesn't belong here because now it'll affect every other
+@@ -370,7 +380,7 @@ pub(crate) async fn configure_runner(
+             // for wasmer-wasix to work out.
+             runtime.set_connected_to_tty(false);
+ 
+-            Ok((None, stdout_stream, stderr_stream))
++            Ok((None, stdout_stream, stderr_stream, stdout_pipe, stderr_pipe))
+         }
+     }
+ }

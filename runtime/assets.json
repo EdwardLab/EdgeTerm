@@ -1,0 +1,51 @@
+{
+  "schema": "edgeterm.runtime-assets.v1",
+  "release": "runtime-v384",
+  "assets": [
+    {
+      "path": "runtime/wasmer-sdk/dist/index.mjs",
+      "name": "wasmer-sdk-index.mjs",
+      "bytes": 49012,
+      "sha256": "4d907bd2244a2e77b4807de0909f4850d47507cb325e3c5e972a9c37dc2ab8ed",
+      "url": "https://github.com/EdwardLab/EdgeTerm/releases/download/runtime-v384/wasmer-sdk-index.mjs"
+    },
+    {
+      "path": "runtime/wasmer-sdk/dist/worker.mjs",
+      "name": "wasmer-sdk-worker.mjs",
+      "bytes": 710,
+      "sha256": "40f481d4eb7dfbcc7a6603820989a4971d4f7b95a25e1c8d713ff3ebf6f361a1",
+      "url": "https://github.com/EdwardLab/EdgeTerm/releases/download/runtime-v384/wasmer-sdk-worker.mjs"
+    },
+    {
+      "path": "runtime/wasmer-sdk/dist/wasmer_js_bg.wasm",
+      "name": "wasmer-sdk.wasm.gz",
+      "bytes": 6606520,
+      "sha256": "b24bb08d48bd3f5440317bb960c47c71aa38d78731f2eb41cf5da0ad55139fea",
+      "url": "https://github.com/EdwardLab/EdgeTerm/releases/download/runtime-v384/wasmer-sdk.wasm.gz",
+      "compression": "gzip"
+    },
+    {
+      "path": "runtime-packages/external-shell/runtime-manifest.json",
+      "name": "external-shell-manifest.json",
+      "bytes": 10337,
+      "sha256": "50989de957de2689a309b4798ba9dbcee6ae96d98dd8b676bfd61a531ebaed08",
+      "url": "https://github.com/EdwardLab/EdgeTerm/releases/download/runtime-v384/external-shell-manifest.json"
+    },
+    {
+      "path": "runtime-packages/external-shell/edgeterm-posix-apt.webc",
+      "name": "edgeterm-posix-apt.webc.gz",
+      "bytes": 207410184,
+      "sha256": "3471f6920b83c47a65479948c555f40c68b42b0ada7a5dec2f062e943e16ec9f",
+      "url": "https://github.com/EdwardLab/EdgeTerm/releases/download/runtime-v384/edgeterm-posix-apt.webc.gz",
+      "compression": "gzip"
+    },
+    {
+      "path": "runtime-packages/node/edgejs-quickjs-0.1.0-554eb9b-browser.webc",
+      "name": "edgejs-quickjs-0.1.0-554eb9b-browser.webc.gz",
+      "bytes": 63018581,
+      "sha256": "f380eecca458a164dbc65d8fc8a35bb9b53f7e5aee7e058b225fad3ddd44a4ee",
+      "url": "https://github.com/EdwardLab/EdgeTerm/releases/download/runtime-v384/edgejs-quickjs-0.1.0-554eb9b-browser.webc.gz",
+      "compression": "gzip"
+    }
+  ]
+}

@@ -1,0 +1,74 @@
+diff --git a/apt-pkg/contrib/fileutl.cc b/apt-pkg/contrib/fileutl.cc
+index 832e87127..7c8d71202 100644
+--- a/apt-pkg/contrib/fileutl.cc
++++ b/apt-pkg/contrib/fileutl.cc
+@@ -904,7 +904,7 @@ pid_t ExecFork()
+ pid_t ExecFork(std::set<int> KeepFDs)
+ {
+    // Fork off the process
+-   pid_t Process = fork();
++   pid_t Process = edgeterm_vfork();
+    if (Process < 0)
+    {
+       cerr << "FATAL -> Failed to fork." << endl;
+diff --git a/apt-pkg/install-progress.h b/apt-pkg/install-progress.h
+index 499ac238f..18e7ac409 100644
+--- a/apt-pkg/install-progress.h
++++ b/apt-pkg/install-progress.h
+@@ -38,7 +38,7 @@ namespace Progress {
+     */
+     virtual void StartDpkg() {};
+ 
+-    virtual pid_t fork() {return ::fork(); };
++    virtual pid_t fork() {return ::edgeterm_vfork(); };
+ 
+     virtual void Pulse() {};
+     virtual long GetPulseInterval() {
+diff --git a/methods/aptmethod.h b/methods/aptmethod.h
+index 9499367c8..fb130eb85 100644
+--- a/methods/aptmethod.h
++++ b/methods/aptmethod.h
+@@ -140,7 +140,7 @@ protected:
+       int status;
+       pid_t pid;
+ 
+-      pid = fork();
++      pid = edgeterm_vfork();
+       if (pid == 0)
+       {
+ 	 close(0);
+diff --git a/methods/gpgv.cc b/methods/gpgv.cc
+index 9a973664f..b1263f039 100644
+--- a/methods/gpgv.cc
++++ b/methods/gpgv.cc
+@@ -195,7 +195,7 @@ string GPGVMethod::VerifyGetSigners(const char *file, const char *outfile,
+    if (pipe(fd) < 0)
+       return "Couldn't create pipe";
+ 
+-   pid_t pid = fork();
++   pid_t pid = edgeterm_vfork();
+    if (pid < 0)
+       return string("Couldn't spawn new process") + strerror(errno);
+    else if (pid == 0)
+diff --git a/apt-pkg/aptconfiguration.cc b/apt-pkg/aptconfiguration.cc
+index c900b449b..a522a6f6b 100644
+--- a/apt-pkg/aptconfiguration.cc
++++ b/apt-pkg/aptconfiguration.cc
+@@ -628,6 +628,9 @@ bool Configuration::isChroot()
+    static struct once
+    {
+       bool res = false;
++#ifdef __wasi__
++      once() = default;
++#else
+       once()
+       {
+ 	 pid_t child = ExecFork();
+@@ -644,6 +647,7 @@ bool Configuration::isChroot()
+ 
+ 	 res = ExecWait(child, "ischroot", true);
+       }
++#endif
+    } once;
+ 
+    return once.res;

@@ -51,6 +51,13 @@ def upload_snapshot():
     user_snapshots = [s for s in db["snapshots"].values() if s["userId"] == user["id"]]
     if len(user_snapshots) >= int(perms["maxSnapshots"]):
         return jsonify({"error": "snapshot limit exceeded"}), 403
+    requested_keep = request.headers.get("X-EdgeTerm-Keep-Last-Backups") or request.args.get("keepLastBackups", "")
+    keep_last = perms.get("keepLastBackups")
+    if str(requested_keep).strip():
+        try:
+            keep_last = min(max(0, int(requested_keep)), int(perms["maxSnapshots"]))
+        except (ValueError, TypeError):
+            return jsonify({"error": "keepLastBackups must be an integer"}), 400
     raw = request.get_data(cache=False, as_text=False)
     if current + len(raw) > int(perms["storageQuota"]):
         return jsonify({"error": "storage quota exceeded", "storageUsed": current, "quota": perms["storageQuota"]}), 403
@@ -85,10 +92,6 @@ def upload_snapshot():
     }
     db["snapshots"][snapshot_id] = snapshot
     recompute_user_storage(db, user["id"])
-    requested_keep = request.headers.get("X-EdgeTerm-Keep-Last-Backups") or request.args.get("keepLastBackups", "")
-    keep_last = perms.get("keepLastBackups")
-    if str(requested_keep).strip():
-        keep_last = min(max(0, int(requested_keep)), int(perms.get("maxSnapshots", keep_last)))
     pruned = prune_user_snapshots(db, store, user["id"], keep_last)
     store.save_db(db)
     return jsonify({"snapshot": snapshot, "storageUsed": db["users"][user["id"]]["storageUsed"], "quota": perms["storageQuota"], "prunedSnapshots": pruned}), 201

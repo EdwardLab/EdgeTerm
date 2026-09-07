@@ -1,0 +1,15 @@
+--- a/lib/dpkg/buffer.c
++++ b/lib/dpkg/buffer.c
+@@ -269,7 +269,12 @@
+ 	case BUFFER_READ_FD:
+ 		if (lseek(input->arg.i, limit, SEEK_CUR) >= 0)
+ 			return limit;
++#ifdef __wasi__
++		if (errno != 0 && errno != ESPIPE && errno != ENOSYS &&
++		    errno != EPERM && errno != EACCES)
++#else
+ 		if (errno != ESPIPE)
++#endif
+ 			return dpkg_put_errno(err, _("failed to seek"));
+ 		break;
+ 	default:

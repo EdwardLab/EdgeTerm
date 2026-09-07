@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EdgeTerm browser acceptance</title>
+<style>
+  body { font: 15px system-ui; margin: 24px; color: #202124; background: #fafafa; }
+  button { padding: 10px 18px; font: inherit; }
+  iframe { width: 100%; height: 650px; border: 1px solid #ccc; border-radius: 8px; }
+  pre { white-space: pre-wrap; padding: 16px; background: #eee; max-height: 360px; overflow: auto; }
+</style>
+<h1>EdgeTerm browser acceptance</h1>
+<p>This suite creates a test workspace, installs packages, runs Git, PHP, Python and npm, opens application previews, tests repository failure, and reloads the workspace to verify persistence.</p>
+<button id="run">Run acceptance suite</button>
+<p id="status">Wait for EdgeTerm to finish loading, then run the suite.</p>
+<pre id="results" aria-live="polite"></pre>
+<iframe id="edgeterm" title="EdgeTerm test workspace" src="/edgeterm/index.html" allow="cross-origin-isolated"></iframe>
+<script type="module" src="/suite.js"></script>
+</html>

@@ -215,6 +215,9 @@ def main(args):
             "edgeserve", "edgeflask", "edgeasgi", "edgepkg",
             "wine", "wine11", "wineconsole", "winecfg", "winetricks",
         ]),
+        ("Package Management", [
+            "pkg", "edgepkg",
+        ]),
         ("Databases", [
             "sqlite3",
         ]),

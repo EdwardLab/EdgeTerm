@@ -1,0 +1,145 @@
+--- a/apt-pkg/acquire-worker.cc
++++ b/apt-pkg/acquire-worker.cc
+@@ -140,6 +140,19 @@ bool pkgAcquire::Worker::Start()
+       SetCloseExec(Pipes[I],true);
+ 
+    // Fork off the process
++#ifdef __wasi__
++   char * const Args[] = { const_cast<char *>(Calling.c_str()), nullptr };
++   int const SpawnError = edgeterm_spawn(
++      &Process, Method.c_str(), Args, Pipes[2], Pipes[1], STDERR_FILENO);
++   if (SpawnError != 0)
++   {
++      errno = SpawnError;
++      _error->Errno("posix_spawn", "Failed to start method %s", Calling.c_str());
++      for (int I = 0; I != 4; I++)
++         close(Pipes[I]);
++      return false;
++   }
++#else
+    Process = ExecFork();
+    if (Process == 0)
+    {
+@@ -155,6 +168,7 @@ bool pkgAcquire::Worker::Start()
+       std::cerr << "Failed to exec method " << Calling << " ( via " << Method << ")" << endl;
+       _exit(100);
+    }
++#endif
+ 
+    // Fix up our FDs
+    InFd = Pipes[0];
+--- a/apt-pkg/deb/debsystem.cc
++++ b/apt-pkg/deb/debsystem.cc
+@@ -456,6 +456,50 @@ pid_t debSystem::ExecDpkg(std::vector<std::string> const &sArgs, int * const inp
+ 	 return -1;
+       }
+ 
++#ifdef __wasi__
++   int const nullfd = open("/dev/null", O_RDWR);
++   if (nullfd < 0)
++   {
++      _error->WarningE("dpkg", "Can't open /dev/null for dpkg call");
++      return -1;
++   }
++   if (_system != nullptr && _system->IsLocked() == true)
++      setenv("DPKG_FRONTEND_LOCKED", "true", 1);
++   if (_config->Find("DPkg::Path", "").empty() == false)
++      setenv("PATH", _config->Find("DPkg::Path", "").c_str(), 1);
++
++   if (inputFd != nullptr)
++      SetCloseExec(external[1], true);
++   if (outputFd != nullptr)
++      SetCloseExec(external[0], true);
++
++   int const input = inputFd == nullptr ? nullfd : external[0];
++   int const output = outputFd == nullptr ? nullfd : external[1];
++   int const error = DiscardOutput == true ? nullfd : STDERR_FILENO;
++   pid_t dpkg = -1;
++   int const SpawnError = edgeterm_spawn(
++      &dpkg, Args[0], const_cast<char **>(Args.data()), input, output, error);
++   close(nullfd);
++   if (SpawnError != 0)
++   {
++      errno = SpawnError;
++      _error->WarningE("dpkg", "Can't execute dpkg");
++      close(external[0]);
++      close(external[1]);
++      return -1;
++   }
++   if (outputFd != nullptr)
++   {
++      close(external[1]);
++      *outputFd = external[0];
++   }
++   else if (inputFd != nullptr)
++   {
++      close(external[0]);
++      *inputFd = external[1];
++   }
++   return dpkg;
++#else
+    pid_t const dpkg = ExecFork();
+    if (dpkg == 0) {
+       int const nullfd = open("/dev/null", O_RDWR);
+@@ -500,6 +539,7 @@ pid_t debSystem::ExecDpkg(std::vector<std::string> const &sArgs, int * const inp
+       *inputFd = external[1];
+    }
+    return dpkg;
++#endif
+ }
+ 									/*}}}*/
+ bool debSystem::MultiArchSupported() const					/*{{{*/
+--- a/apt-pkg/deb/dpkgpm.cc
++++ b/apt-pkg/deb/dpkgpm.cc
+@@ -1488,6 +1488,18 @@ public:
+    auto begin() const { return args.cbegin(); }
+    auto end() const { return args.cend(); }
+    auto& front() const { return args.front(); }
++   pid_t spawn() {
++      args.push_back(nullptr);
++      pid_t child = -1;
++      int const SpawnError = edgeterm_spawn(
++         &child, args.front(), args.data(), STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO);
++      args.pop_back();
++      if (SpawnError != 0) {
++         errno = SpawnError;
++         return -1;
++      }
++      return child;
++   }
+    [[noreturn]] void execute(char const *const errmsg) {
+       args.push_back(nullptr);
+       execvp(args.front(), &args.front());
+@@ -2018,6 +2030,24 @@ bool pkgDPkgPM::Go(APT::Progress::PackageManager *progress)
+       std::set<int> KeepFDs;
+       KeepFDs.insert(fd[1]);
+       MergeKeepFdsFromConfiguration(KeepFDs);
++#ifdef __wasi__
++      if (_config->FindB("APT::Color", false) == true)
++         setenv("DPKG_COLORS", "always", 0);
++      else
++         setenv("DPKG_COLORS", "never", 0);
++      if (_system->IsLocked() == true)
++         setenv("DPKG_FRONTEND_LOCKED", "true", 1);
++      if (_config->Find("DPkg::Path", "").empty() == false)
++         setenv("PATH", _config->Find("DPkg::Path", "").c_str(), 1);
++      SetCloseExec(fd[0], true);
++      pid_t Child = Args.spawn();
++      if (Child < 0)
++      {
++         close(fd[0]);
++         close(fd[1]);
++         return _error->Errno("posix_spawn", "Could not execute dpkg");
++      }
++#else
+       pid_t Child = ExecFork(KeepFDs);
+       if (Child == 0)
+       {
+@@ -2062,6 +2091,7 @@ bool pkgDPkgPM::Go(APT::Progress::PackageManager *progress)
+ 
+ 	 Args.execute("Could not exec dpkg!");
+       }
++#endif
+ 
+       // we read from dpkg here
+       int const _dpkgin = fd[0];

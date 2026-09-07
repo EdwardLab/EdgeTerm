@@ -1,0 +1,13 @@
+--- a/lib/dpkg/dir.c
++++ b/lib/dpkg/dir.c
+@@ -106,6 +106,10 @@
+ static void
+ dir_sync(DIR *dir, const char *path)
+ {
++#ifdef __wasi__
++	return;
++#endif
++
+ #ifdef HAVE_FSYNC_DIR
+ 	int fd;
+ 

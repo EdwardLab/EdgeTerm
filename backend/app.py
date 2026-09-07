@@ -13,6 +13,7 @@ from flask import Flask, abort, jsonify, render_template, request, send_from_dir
 from admin import bp as admin_bp
 from auth import bp as auth_bp
 from models import CloudStore, apply_expired_tiers, find_share_by_public_path
+from mysql_manager import handle_mysql_action
 from shares import bp as shares_bp
 from snapshots import bp as snapshots_bp
 
@@ -70,8 +71,17 @@ def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | N
     app.jinja_env.auto_reload = True
     store = CloudStore(Path(cloud_dir), mysql_config=mysql_config)
     app.extensions["edgeterm_store"] = store
-    package_root = Path(packages_dir or os.environ.get("EDGETERM_PACKAGES_DIR") or (repo_root.parent / "edgeterm-packages")).resolve()
+    package_root = Path(packages_dir or os.environ.get("EDGETERM_PACKAGES_DIR") or (repo_root.parent / "edgeterm-packages" / "repository")).resolve()
     app.extensions["edgeterm_packages_root"] = package_root
+
+    @app.before_request
+    def validate_request():
+        if request.endpoint in {"static", "external_package_asset"}:
+            if any(part.startswith(".") for part in request.path.split("/") if part):
+                abort(404)
+        if request.path.startswith("/api/") and request.is_json:
+            if not isinstance(request.get_json(silent=True), dict):
+                return jsonify({"error": "A JSON object is required."}), 400
 
     def bearer_token(db):
         auth = request.headers.get("Authorization", "")
@@ -127,7 +137,7 @@ def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | N
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-        response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
+        response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
         response.headers["Origin-Agent-Cluster"] = "?1"
         response.headers["Permissions-Policy"] = "cross-origin-isolated=(self)"
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -163,6 +173,20 @@ def create_app(cloud_dir: str | Path = ".edgeterm-cloud", mysql_config: dict | N
     @app.get("/admin")
     def admin_page():
         return render_template("admin.html")
+
+    @app.post("/api/database/mysql")
+    def mysql_database_action():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "A JSON request body is required."}), 400
+        try:
+            return jsonify(handle_mysql_action(payload))
+        except (ValueError, TypeError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            error_code = getattr(exc, "args", [None])[0]
+            message = getattr(exc, "args", [None, str(exc)])[1] if len(getattr(exc, "args", [])) > 1 else str(exc)
+            return jsonify({"error": f"MySQL connection failed: {message}", "code": error_code}), 502
 
     @app.get("/s/<share_id>")
     @app.get("/s/<share_id>/")

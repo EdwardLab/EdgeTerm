@@ -1,0 +1,36 @@
+--- a/src/main/unpack.c
++++ b/src/main/unpack.c
+@@ -551,7 +551,11 @@
+     /* First we check it's not a directory. */
+     if (rmdir(cidir) == 0)
+       ohshit(_("package control info contained directory '%.250s'"), cidir);
++#ifdef __wasi__
++    else if (errno != ENOTDIR && errno != ENOENT)
++#else
+     else if (errno != ENOTDIR)
++#endif
+       ohshite(_("package control info rmdir of '%.250s' didn't say not a dir"),
+               de->d_name);
+
+--- a/lib/dpkg/path-remove.c
++++ b/lib/dpkg/path-remove.c
+@@ -129,6 +129,19 @@ path_remove_tree(const char *pathname)
+ 		internerr("pathname '%s' reduces to nothing", pathname);
+ 
+ 	debug(dbg_eachfile, "%s '%s'", __func__, pathname);
++#ifdef __wasi__
++	{
++		char *arguments[] = { "rm", "-rf", "--", (char *)pathname, NULL };
++		int spawn_error = edgeterm_spawn(&pid, RM, arguments, -1, -1, -1);
++		if (spawn_error != 0) {
++			errno = spawn_error;
++			ohshite(_("unable to execute %s (%s)"),
++			        _("rm command for cleanup"), RM);
++		}
++		subproc_reap(pid, _("rm command for cleanup"), 0);
++		return;
++	}
++#endif
+ 	if (!rmdir(pathname))
+ 		return; /* Deleted it OK, it was a directory. */
+ 	if (errno == ENOENT || errno == ELOOP)

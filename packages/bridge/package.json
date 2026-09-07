@@ -1,0 +1,19 @@
+{
+  "name": "@edgeterm/bridge",
+  "version": "3.0.0",
+  "description": "Host client and protocol types for the EdgeTerm Embed Bridge.",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "license": "MPL-2.0"
+}

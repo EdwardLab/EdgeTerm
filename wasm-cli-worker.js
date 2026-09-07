@@ -34,6 +34,14 @@ function patchLauncherSource(source) {
     .replace(
       /ws\.once\(event,listener\)\}\);const cancel=\(\)=>\{ws\.removeListener\(event,listener\);setTimeout\(resolve\)\}/g,
       `if(typeof ws.once==="function"){ws.once(event,listener)}else if(typeof ws.addEventListener==="function"){ws.addEventListener(event,listener,{once:true})}else{ws["on"+event]=listener}});const cancel=()=>{if(typeof ws.removeListener==="function"){ws.removeListener(event,listener)}else if(typeof ws.removeEventListener==="function"){ws.removeEventListener(event,listener)}else if(typeof ws.off==="function"){ws.off(event,listener)}else if(ws["on"+event]===listener){ws["on"+event]=null}setTimeout(resolve)}`
+    )
+    .replaceAll(
+      "ws.once(event, listener);",
+      'if (typeof ws.once === "function") ws.once(event, listener); else if (typeof ws.addEventListener === "function") ws.addEventListener(event, listener, { once: true }); else ws["on" + event] = listener;'
+    )
+    .replaceAll(
+      "ws.removeListener(event, listener);",
+      'if (typeof ws.removeListener === "function") ws.removeListener(event, listener); else if (typeof ws.removeEventListener === "function") ws.removeEventListener(event, listener); else if (typeof ws.off === "function") ws.off(event, listener); else if (ws["on" + event] === listener) ws["on" + event] = null;'
     );
 }
 
@@ -195,8 +203,19 @@ return new Promise((resolve, reject) => {
             const key = ["content-type", "content-length"].includes(lower) ? lower.toUpperCase().replace(/-/g, "_") : "HTTP_" + String(name).toUpperCase().replace(/-/g, "_");
             addServer(key, value);
           }
-          const result = phpModule.ccall("wasm_sapi_handle_request", "number", [], [], { async: true });
-          const code = Number((result && typeof result.then === "function" ? await result : result) || 0);
+          let code = 0;
+          try {
+            const result = phpModule.ccall("wasm_sapi_handle_request", "number", [], [], { async: true });
+            code = Number((result && typeof result.then === "function" ? await result : result) || 0);
+          } catch (requestError) {
+            const message = String(requestError?.message || requestError || "");
+            const exitedNormally = requestError === "unwind"
+              || requestError?.name === "ExitStatus"
+              || requestError?.constructor?.name === "ExitStatus"
+              || /null function/i.test(message);
+            if (!exitedNormally) throw requestError;
+            code = Number(requestError?.status ?? requestError?.code ?? 0);
+          }
           try {
             const shutdownResult = phpModule.ccall("wasm_sapi_request_shutdown", "number", [], [], { async: true });
             if (shutdownResult && typeof shutdownResult.then === "function") await shutdownResult;
@@ -302,12 +321,16 @@ function ensureModuleParentDirs(moduleFs, path) {
 function exportedFsDelta(moduleFs, syncRoots, snapshot) {
   const result = [];
   const seen = new Set();
+  const normalizedRoots = syncRoots.map((root) => String(root || "/").replace(/\/+$/, "") || "/");
   for (const root of syncRoots) {
     deltaWalk(moduleFs, root, snapshot, result, seen);
   }
   if (snapshot) {
     for (const path of snapshot.keys()) {
-      if (!seen.has(path)) {
+      const synchronized = normalizedRoots.some(
+        (root) => root === "/" || path === root || path.startsWith(`${root}/`),
+      );
+      if (synchronized && !seen.has(path)) {
         result.push({ path, dir: false, deleted: true });
       }
     }
@@ -439,6 +462,33 @@ self.onmessage = async (event) => {
     let streamOutput = data.streamOutput === true && String(data?.env?.EDGETERM_PHP_STREAM || "") !== "0";
     let streamedOutput = false;
     let stdinQueue = [];
+    const streamBuffers = { stdout: "", stderr: "" };
+    let streamFlushTimer = null;
+
+    const flushStream = (stream = "") => {
+      const names = stream ? [stream] : ["stdout", "stderr"];
+      for (const name of names) {
+        const text = streamBuffers[name];
+        if (!text) continue;
+        streamBuffers[name] = "";
+        self.postMessage({ type: "stream", stream: name, text });
+      }
+      if (!streamBuffers.stdout && !streamBuffers.stderr && streamFlushTimer !== null) {
+        clearTimeout(streamFlushTimer);
+        streamFlushTimer = null;
+      }
+    };
+
+    const queueStream = (stream, chunk) => {
+      streamBuffers[stream] += chunk;
+      if (chunk === "\n" || streamBuffers[stream].length >= 256) {
+        flushStream(stream);
+        return;
+      }
+      if (streamFlushTimer === null) {
+        streamFlushTimer = setTimeout(() => flushStream(), 16);
+      }
+    };
 
     ttyBrokerUrl = data.ttyBrokerUrl || "";
     ttySessionId = data.ttySessionId || "";
@@ -487,7 +537,7 @@ self.onmessage = async (event) => {
       pendingDisplay += chunk;
       if (streamOutput) {
         streamedOutput = true;
-        self.postMessage({ type: "stream", stream: "stdout", text: chunk });
+        queueStream("stdout", chunk);
       }
     };
 
@@ -498,7 +548,7 @@ self.onmessage = async (event) => {
       pendingDisplay += chunk;
       if (streamOutput) {
         streamedOutput = true;
-        self.postMessage({ type: "stream", stream: "stderr", text: chunk });
+        queueStream("stderr", chunk);
       }
     };
 
@@ -506,32 +556,32 @@ self.onmessage = async (event) => {
     if (!factory) throw new Error("package launcher did not expose an Emscripten module factory");
     debug(`${command}: factory ready`);
     const moduleInstance = await factory({
-      noInitialRun: true,
-      arguments: [...(data.args || [])],
-      thisProgram: data.thisProgram,
-      extensions: data.extensions || {},
-      ENV: { ...(data.env || {}), PWD: data.cwd || "/" },
-      wasmBinary: new Uint8Array(data.wasmBytes),
-      locateFile: (path) => `${data.packageRoot}/${path}`,
-      __edgetermStdinChar: stdinInput,
-      __edgetermStdoutChar: stdoutOutput,
-      __edgetermStderrChar: stderrOutput,
-      onStdout: (chunk) => {
-        for (const code of chunk || []) stdoutOutput(code);
-      },
-      onStderr: (chunk) => {
-        for (const code of chunk || []) stderrOutput(code);
-      },
-      print: (text) => {
-        const chunk = String(text);
-        stdout.push(chunk);
-        pendingDisplay += chunk;
-      },
-      printErr: (text) => {
-        const chunk = String(text);
-        stderr.push(chunk);
-        pendingDisplay += chunk;
-      },
+        noInitialRun: true,
+        arguments: [...(data.args || [])],
+        thisProgram: data.thisProgram,
+        extensions: data.extensions || {},
+        ENV: { ...(data.env || {}), PWD: data.cwd || "/" },
+        wasmBinary: new Uint8Array(data.wasmBytes),
+        locateFile: (path) => `${data.packageRoot}/${path}`,
+        __edgetermStdinChar: stdinInput,
+        __edgetermStdoutChar: stdoutOutput,
+        __edgetermStderrChar: stderrOutput,
+        onStdout: (chunk) => {
+          for (const code of chunk || []) stdoutOutput(code);
+        },
+        onStderr: (chunk) => {
+          for (const code of chunk || []) stderrOutput(code);
+        },
+        print: (text) => {
+          const chunk = String(text);
+          stdout.push(chunk);
+          pendingDisplay += chunk;
+        },
+        printErr: (text) => {
+          const chunk = String(text);
+          stderr.push(chunk);
+          pendingDisplay += chunk;
+        },
     });
     if (!moduleInstance?.FS) throw new Error("package runtime did not expose FS after initialization");
     debug(`${command}: runtime initialized`);
@@ -601,6 +651,7 @@ self.onmessage = async (event) => {
         `${command}: interactive terminal input still needs the worker stdin bridge to stay active for the full program lifecycle.\n`
       );
     }
+    flushStream();
     self.postMessage({
       type: "done",
       code,
@@ -612,6 +663,7 @@ self.onmessage = async (event) => {
       sapi: !!data.phpRequest,
     });
   } catch (err) {
+    if (typeof flushStream === "function") flushStream();
     self.postMessage({
       type: "error",
       code: 1,

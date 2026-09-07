@@ -1,0 +1,15 @@
+[package]
+name = "digitalplat/edgeterm-subprocess-__PACKAGE__"
+version = "0.1.0"
+description = "EdgeTerm browser subprocess command"
+license = "GPL-2.0-only"
+entrypoint = "__COMMAND__"
+
+[[module]]
+name = "program"
+source = "program.wasm"
+
+[[command]]
+name = "__COMMAND__"
+module = "program"
+runner = "wasi"

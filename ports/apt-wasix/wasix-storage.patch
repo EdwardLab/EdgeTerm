@@ -1,0 +1,14 @@
+--- a/apt-private/private-download.cc
++++ b/apt-private/private-download.cc
+@@ -131,6 +131,11 @@ bool CheckFreeSpaceBeforeDownload(std::string const &Dir, unsigned long long Fet
+        _config->FindB("APT::Get::Download", true) == false)
+       return true;
+ 
++#ifdef __wasi__
++   // The browser runtime checks its storage quota before starting package work.
++   return true;
++#endif
++
+    struct statvfs Buf;
+    if (statvfs(Dir.c_str(),&Buf) != 0) {
+       if (errno == EOVERFLOW)

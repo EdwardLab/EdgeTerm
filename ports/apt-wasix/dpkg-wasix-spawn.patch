@@ -1,0 +1,160 @@
+--- a/src/main/unpack.c
++++ b/src/main/unpack.c
+@@ -97,12 +97,16 @@ deb_reassemble(const char **filename, const char **pfilename)
+ 
+   push_cleanup(cu_pathname, ~0, 1, (void *)reasmbuf);
+ 
++#ifdef __wasi__
++  return true;
++#else
+   pid = subproc_fork();
+   if (!pid) {
+     execlp(SPLITTER, SPLITTER, "-Qao", reasmbuf, *filename, NULL);
+     ohshite(_("unable to execute %s (%s)"),
+             _("split package reassembly"), SPLITTER);
+   }
++#endif
+   status = subproc_reap(pid, SPLITTER, SUBPROC_RETERROR);
+   switch (status) {
+   case 0:
+@@ -1246,13 +1250,30 @@ process_archive(const char *filename)
+   cidirrest = cidir + strlen(cidir);
+   push_cleanup(cu_cidir, ~0, 2, (void *)cidir, (void *)cidirrest);
+ 
++#ifdef __wasi__
++  {
++    char *control_directory = m_strdup(cidir);
++    char *arguments[] = {
++      (char *)BACKEND, "--control", (char *)filename, control_directory, NULL
++    };
++    control_directory[strlen(control_directory) - 1] = '\0';
++    int spawn_error = edgeterm_spawn(&pid, BACKEND, arguments, -1, -1, -1);
++    free(control_directory);
++    if (spawn_error != 0) {
++      errno = spawn_error;
++      ohshite(_("unable to execute %s (%s)"),
++              _("package control information extraction"), BACKEND);
++    }
++  }
++#else
+   pid = subproc_fork();
+   if (pid == 0) {
+     cidirrest[-1] = '\0';
+     execlp(BACKEND, BACKEND, "--control", filename, cidir, NULL);
+     ohshite(_("unable to execute %s (%s)"),
+             _("package control information extraction"), BACKEND);
+   }
++#endif
+   subproc_reap(pid, BACKEND " --control", 0);
+ 
+   /* We want to guarantee the extracted files are on the disk, so that the
+@@ -1538,6 +1559,19 @@ process_archive(const char *filename)
+ 
+   m_pipe(p1);
+   push_cleanup(cu_closepipe, ehflag_bombout, 1, (void *)&p1[0]);
++#ifdef __wasi__
++  {
++    char *arguments[] = {
++      (char *)BACKEND, "--fsys-tarfile", (char *)filename, NULL
++    };
++    int spawn_error = edgeterm_spawn(&pid, BACKEND, arguments, -1, p1[1], -1);
++    if (spawn_error != 0) {
++      errno = spawn_error;
++      ohshite(_("unable to execute %s (%s)"),
++              _("package filesystem archive extraction"), BACKEND);
++    }
++  }
++#else
+   pid = subproc_fork();
+   if (pid == 0) {
+     m_dup2(p1[1],1); close(p1[0]); close(p1[1]);
+@@ -1546,5 +1580,6 @@ process_archive(const char *filename)
+             _("package filesystem archive extraction"), BACKEND);
+   }
++#endif
+   close(p1[1]);
+   p1[1] = -1;
+ 
+--- a/src/main/script.c
++++ b/src/main/script.c
+@@ -178,6 +178,45 @@ maintscript_exec(struct pkginfo *pkg, struct pkgbin *pkgbin,
+ 
+ 	push_cleanup(cu_post_script_tasks, ehflag_bombout, 0);
+ 
++#ifdef __wasi__
++	{
++		char *pkg_count;
++		const char *maintscript_debug;
++		char **arguments;
++		int i;
++		int spawn_error;
++
++		pkg_count = str_fmt("%d", pkgset_installed_instances(pkg->set));
++		maintscript_debug = debug_has_flag(dbg_scripts) ? "1" : "0";
++
++		if (setenv("DPKG_MAINTSCRIPT_PACKAGE", pkg->set->name, 1) ||
++		    setenv("DPKG_MAINTSCRIPT_PACKAGE_REFCOUNT", pkg_count, 1) ||
++		    setenv("DPKG_MAINTSCRIPT_ARCH", pkgbin->arch->name, 1) ||
++		    setenv("DPKG_MAINTSCRIPT_NAME", cmd->argv[0], 1) ||
++		    setenv("DPKG_MAINTSCRIPT_DEBUG", maintscript_debug, 1) ||
++		    setenv("DPKG_RUNNING_VERSION", PACKAGE_VERSION, 1))
++			ohshite(_("unable to setenv for maintainer script"));
++
++		cmd->filename = cmd->argv[0] = maintscript_pre_exec(cmd);
++		if (maintscript_set_exec_context(cmd) < 0)
++			ohshite(_("cannot set security execution context for "
++			          "maintainer script"));
++
++		arguments = m_malloc((cmd->argc + 2) * sizeof(arguments[0]));
++		arguments[0] = "/bin/sh";
++		for (i = 0; i < cmd->argc; i++)
++			arguments[i + 1] = (char *)cmd->argv[i];
++		arguments[cmd->argc + 1] = NULL;
++
++		spawn_error = edgeterm_spawn(&pid, "/bin/sh", arguments, -1, -1, -1);
++		free(arguments);
++		free(pkg_count);
++		if (spawn_error != 0) {
++			errno = spawn_error;
++			ohshite(_("unable to execute %s (%s)"), cmd->name, cmd->filename);
++		}
++	}
++#else
+ 	pid = subproc_fork();
+ 	if (pid == 0) {
+ 		char *pkg_count;
+@@ -203,6 +242,7 @@ maintscript_exec(struct pkginfo *pkg, struct pkgbin *pkgbin,
+ 
+ 		command_exec(cmd);
+ 	}
++#endif
+ 	subproc_signals_ignore(cmd->name);
+ 	rc = subproc_reap(pid, cmd->name, warn);
+ 	subproc_signals_restore();
+--- a/lib/dpkg/path-remove.c
++++ b/lib/dpkg/path-remove.c
+@@ -149,12 +149,24 @@ path_remove_tree(const char *pathname)
+ 	if (errno != ENOTEMPTY && errno != EEXIST) /* Huh? */
+ 		ohshite(_("unable to securely remove '%.255s'"), pathname);
+ 
++#ifdef __wasi__
++	{
++		char *arguments[] = { "rm", "-rf", "--", (char *)pathname, NULL };
++		int spawn_error = edgeterm_spawn(&pid, RM, arguments, -1, -1, -1);
++		if (spawn_error != 0) {
++			errno = spawn_error;
++			ohshite(_("unable to execute %s (%s)"),
++			        _("rm command for cleanup"), RM);
++		}
++	}
++#else
+ 	pid = subproc_fork();
+ 	if (pid == 0) {
+ 		execlp(RM, "rm", "-rf", "--", pathname, NULL);
+ 		ohshite(_("unable to execute %s (%s)"),
+ 		        _("rm command for cleanup"), RM);
+ 	}
++#endif
+ 	debug(dbg_eachfile, "%s running rm -rf '%s'", __func__, pathname);
+ 	subproc_reap(pid, _("rm command for cleanup"), 0);
+ }

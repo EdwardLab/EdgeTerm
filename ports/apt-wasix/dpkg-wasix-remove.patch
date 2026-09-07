@@ -1,0 +1,42 @@
+--- a/src/main/remove.c
++++ b/src/main/remove.c
+@@ -326,6 +326,10 @@ removal_bulk(struct pkginfo *pkg)
+           continue;
+ 
+-        if (strcmp(usenode->name, "/.") == 0) {
++#ifdef __wasi__
++        if (strcmp(usenode->name, "/.") == 0 || strcmp(usenode->name, "/") == 0) {
++#else
++        if (strcmp(usenode->name, "/.") == 0) {
++#endif
+           debug(dbg_eachfiledetail,
+                 "removal_bulk '%s' root directory, cannot remove", fnvb.buf);
+           push_leftover(&leftover, namenode);
+@@ -355,6 +355,15 @@ removal_bulk(struct pkginfo *pkg)
+ 
+       varbuf_rollback(&fnvb_state);
+ 
++#ifdef __wasi__
++      if (!is_dir) {
++        debug(dbg_eachfiledetail, "removal_bulk unlinking '%s'", fnvb.buf);
++        if (secure_unlink(fnvb.buf) && errno != ENOENT)
++          ohshite(_("unable to securely remove '%.250s'"), fnvb.buf);
++        continue;
++      }
++#endif
++
+       debug(dbg_eachfiledetail, "removal_bulk removing '%s'", fnvb.buf);
+       if (!rmdir(fnvb.buf) || errno == ENOENT || errno == ELOOP) continue;
+       if (errno == ENOTEMPTY || errno == EEXIST) {
+@@ -438,7 +447,11 @@ removal_bulk_remove_leftover_dirs(struct pkginfo *pkg) {
+       if (dir_is_used_by_others(namenode, pkg))
+         continue;
+ 
++#ifdef __wasi__
++      if (strcmp(usenode->name, "/.") == 0 || strcmp(usenode->name, "/") == 0) {
++#else
+       if (strcmp(usenode->name, "/.") == 0) {
++#endif
+         debug(dbg_eachfiledetail,
+               "removal_bulk '%s' root directory, cannot remove", fnvb.buf);
+         push_leftover(&leftover, namenode);

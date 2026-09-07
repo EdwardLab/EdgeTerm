@@ -8,22 +8,26 @@ The backend, when enabled, handles accounts, metadata, snapshots, sharing, tiers
 
 - Editions: Offline Edition and Cloud Edition from the same frontend runtime.
 - Workspace storage: browser IndexedDB/IDBFS, local-directory sync through the File System Access API, ZIP import/export, and cloud snapshots.
-- Terminal runtime: Pyodide Python, bundled shell tools, `pip`/`micropip` package flow, `pkg` for browser-native WASM binary packages, WASM CLI packages, and PHP CLI/runtime support.
+- Terminal runtime: an optional BusyBox WASIX environment, Pyodide Python fallback, bundled shell tools, `pip`/`micropip`, WASM CLI packages, PHP CLI/runtime support, and experimental browser-local Node/npm support.
 - Web app preview: EdgeServe for Flask/WSGI, ASGI/FastAPI/Starlette, Django WSGI, PHP document roots, PHP files, and static sites.
 - App Mode: workspace apps that open directly as Python, PHP, or static HTML app surfaces.
 - Display output: canvas, SVG, image, trusted HTML, table output, matplotlib helpers, pandas table helpers, and SDL/pygame-style canvas binding.
 - Files and editor: file manager, upload/download, drag-and-drop, copy/cut/paste, rename/delete, archive extraction, Monaco editor, split editor, preview, and command palette.
+- Project launcher: one-action Flask, Django, FastAPI, WordPress, static-site, and pygame starters with dependency setup and automatic preview.
+- Run center: active app discovery with open, restart, stop, and log actions for EdgeServe projects.
 - Cloud features: users, sessions, cloud backups, restore-from-cloud, public/restricted/private shares, read-only/read-write shares, write-back, forks, tiers, quotas, and admin pages.
+- External backups: encrypted incremental restore points written directly from the browser to Google Drive, Dropbox, S3-compatible storage, or a local folder.
 - EdgeServe browser: tabbed preview surface, route prefixes, back/refresh/fullscreen controls, local cookies/storage, request logs, and app navigation.
 
 ## Editions
 
-EdgeTerm builds two editions from the same source tree.
+EdgeTerm builds three editions from the same source tree.
 
 | Edition | Output | Backend | Cloud UI | Runtime execution |
 | --- | --- | --- | --- | --- |
 | Offline Edition | `build/` or `dist-offline/` | No | No | Browser only |
 | Cloud Edition | `build/`, copied to `backend/static/` | Flask | Yes | Browser only |
+| Embed Edition | `build/` | No | No | Browser only, controlled through Bridge |
 
 Offline Edition is a pure static app. Cloud Edition adds a Flask backend for auth, snapshots, sharing, and admin operations. In both editions, workspace commands and user code run in the browser runtime.
 
@@ -65,10 +69,11 @@ Related docs:
 
 ## Install and build
 
-Install frontend build dependencies:
+Install the pinned frontend dependencies and verified runtime assets:
 
 ```bash
-npm install
+npm ci
+npm run prepare:runtime
 ```
 
 Build Offline Edition:
@@ -77,11 +82,120 @@ Build Offline Edition:
 npm run build:offline
 ```
 
+`prepare:node-runtime` installs and verifies the optional pinned Edge.js runtime
+pack. It accepts a locally built artifact through `EDGEJS_RUNTIME_FILE` and can
+also use an already verified artifact in `runtime-packages/node`. Omit that step
+when producing an EdgeTerm build without direct `node` execution. Browser npm
+installs and the React/Vite frontend adapter remain separate from the Edge.js
+runtime pack. The browser runtime uses `@wasmer/sdk@0.11.0`; the POSIX package
+runtime keeps its independently pinned SDK integration so upgrades in either
+runtime cannot silently change the other.
+
 Build Cloud Edition:
 
 ```bash
 npm run build:cloud
 ```
+
+Build and serve Embed Edition:
+
+```bash
+npm run build:embed
+npm run serve:embed
+```
+
+The Embed Edition enables the versioned EdgeTerm Bridge for an explicit list
+of parent origins. It is intended for products that embed the upstream
+EdgeTerm UI without forking it. See `docs/embed-bridge.md`.
+
+## Browser npm and Node runtime
+
+EdgeTerm provides browser-local `npm` and `npx` commands for frontend projects.
+Source files, installed packages, the npm cache, and build output stay in the
+active browser workspace.
+
+Supported commands:
+
+- `npm install`, including direct dependencies and `--save-dev`
+- `npm ci` with lockfile v3 validation
+- `npm uninstall`, `npm list`, and `npm cache clean`
+- `npm run`, `npm exec`, and `npx`
+- `npm --version`
+
+Supported frontend workflows:
+
+- static HTML, CSS, and JavaScript
+- React and Vite projects
+- Next.js `app/page` and `pages/index` projects through the static frontend adapter
+- JavaScript, JSX, TypeScript, and TSX browser builds
+- `npm run build`, `npm run dev`, and `npm run preview`
+- EdgeServe virtual URLs, SPA fallback, automatic rebuild, and full preview refresh
+
+EdgeTerm resolves public npm packages in the browser, verifies each tarball
+against its registry integrity value, and writes lockfile v3. It rejects path
+traversal, links, native `.node` addons, unsafe archive entries, oversized
+packages, and unsupported flags. Package lifecycle scripts are blocked by
+default and require separate approval for each install.
+
+Vite platform binaries are not executed. EdgeTerm uses its bundled
+`esbuild-wasm` adapter and skips optional platform packages such as native
+Rollup, Rolldown, SWC, Lightning CSS, Parcel watcher, Sharp, and fsevents
+bindings. Native Vite HMR is not promised in this release; file changes trigger
+a browser-local rebuild and a full EdgeServe refresh.
+
+Next.js `dev`, `build`, and `start` scripts use the same browser-local adapter.
+Client components, common `next/link`, `next/image`, navigation, public assets,
+and SPA routing are supported. Server Components that require server-only
+modules, Server Actions, API routes, middleware, SSR, and image optimization
+remain experimental and return an explicit compatibility error.
+
+Direct `node` execution uses the optional pinned Edge.js QuickJS/WASIX runtime.
+Its Bridge capability becomes available only after artifact checksum
+verification and a real startup smoke test. Express, Next.js SSR, WebSocket,
+and arbitrary `server.listen()` request dispatch remain experimental until a
+reliable Edge.js-to-EdgeServe request bridge is available.
+
+The pinned browser package is defined by `runtime/node/edgejs-package.toml` and
+`runtime/node/manifest.json`. Rebuild Edge.js at the commit in that manifest
+with the QuickJS WebAssembly fallback disabled, package the resulting WASIX
+module as WebC, and update the manifest size and SHA-256 together. EdgeTerm
+does not accept an unverified or floating runtime artifact.
+
+The Node runtime requires a secure context, `SharedArrayBuffer`, and these
+response headers:
+
+```text
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+Chrome is the first supported browser for this runtime. Firefox and Safari
+receive a compatibility error when the required browser capabilities are not
+available.
+
+## External workspace backups
+
+The Backups view can write encrypted incremental restore points directly to a
+user-owned storage destination. Google Drive uses app data, Dropbox uses an
+App Folder, S3 uses browser-side Signature Version 4, and Local Folder uses
+the File System Access API. Backup bytes do
+not require an EdgeTerm backend.
+
+The repository stores content-addressed encrypted chunks in immutable packs.
+Unchanged chunks are reused across restore points. A full encrypted manifest
+and commit marker make interrupted uploads resumable and prevent incomplete
+restore points from appearing as valid backups. Restore verifies manifest,
+chunk, and final file hashes before committing a staging workspace.
+
+The recovery password stays in the browser and is not recoverable by an OAuth
+broker or EdgeTerm server. Remembering it stores an encrypted local copy in
+IndexedDB. Schedules run while EdgeTerm is open; a static browser application
+cannot wake itself after every tab is closed.
+
+Embed hosts can expose these operations through `backup.status`,
+`backup.create`, `backup.list`, `backup.verify`, `backup.restore_preview`,
+`backup.restore`, and `backup.cancel`. See `docs/embed-bridge.md` for the
+authorization boundary.
 
 You can also use the Makefile:
 
@@ -92,11 +206,69 @@ make clean
 make run
 ```
 
-After changing files in `rootfs/`, rebuild `rootfs.zip`:
+Every build regenerates `rootfs.zip` and the boot manifests from `rootfs/`.
+The library sources live in `rootfs/usr/lib`; generated manifests and backend
+static files are excluded from Git. Runtime downloads are pinned by size and
+SHA-256 in `runtime/assets.json` and are decompressed and verified before use.
 
-```bat
-buildrootfs.bat
+## Package repository
+
+The published repository is [packages.digitalplat.org](https://packages.digitalplat.org/).
+The candidate catalog contains 101 downloadable packages; 75 currently meet the
+stable suite gates, including Git and PHP. The artifact catalog identifies each
+package's channel, version, checksum, license, and upstream source.
+
+```sh
+apt update
+apt install git php
+git --version
+php --version
 ```
+
+The browser verifies `InRelease` with the pinned publisher key before accepting
+an index. It checks the release expiry, index digest, package size, and package
+digest. Missing, expired, empty, or unavailable repositories fail explicitly.
+The verified index is staged as a local APT source so native APT queries and
+installations use the same package catalog. The browser's default transport
+includes candidate packages; stable acceptance is listed separately in the catalog.
+
+Set `EDGETERM_APT_REPOSITORY_URL` at build time to use another deployment of the
+same signed repository. Local development uses `/edgeterm-packages/local-flat`
+and a signed sibling `edgeterm-packages/repository/local-flat` directory.
+The legacy `pkg` source uses the preserved `legacy-packages` branch.
+
+## Verification
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r backend/requirements-lock.txt
+npm run build:cloud
+npm test
+python -m unittest discover -s tests/backend
+```
+
+The backend suite exercises accounts, sessions, snapshots, sharing, quotas, and
+authorization. Set `EDGETERM_TEST_MYSQL_HOST`, `EDGETERM_TEST_MYSQL_PORT`,
+`EDGETERM_TEST_MYSQL_USER`, and `EDGETERM_TEST_MYSQL_PASSWORD` to also run the
+integration tests. These create and drop uniquely named test databases and
+require a dedicated test MySQL instance. CI runs both layers against MySQL 8.4.
+
+For browser acceptance against the signed local repository:
+
+```sh
+EDGETERM_APT_REPOSITORY_URL=/edgeterm-packages/local-flat npm run build:embed
+npm run test:browser
+```
+
+Open `http://127.0.0.1:3100/` in Chrome and select **Run acceptance suite**.
+The suite creates a separate workspace and checks package installation,
+execution, application previews, repository failures, and reload persistence.
+Results are saved to `/tmp/edgeterm-browser-acceptance.json` by default.
+
+Private cloud shares are readable only by their owner. Restricted shares allow
+the owner and the named recipients. Expired or revoked shares cannot be written
+back, and disabled forks are enforced by the backend.
 
 ## Offline Edition
 
@@ -153,14 +325,31 @@ Supported terminal/runtime features:
 - `python`, `python3`, `pip`, `pip3`, and `micropip`
 - runtime package rehydration for installed Python packages where supported
 - PHP through the bundled php-wasm package system
-- `pkg` for static repositories of browser-native WASM/Emscripten binary packages
+- `pkg` for browser-native package repositories
 - experimental BoxedWine/Wine launch bridge for browser-local Win32 apps
 - common shell commands through Bigbox-style helpers
 - workspace filesystem access from Python and PHP
 - WSGI/ASGI request dispatch without host sockets
 - WASM CLI execution for supported command packages
 
-EdgeTerm's binary package manager is available as `pkg`. It reads `/etc/sources.list`, downloads static repository indexes, resolves dependencies, installs archives into `/packages/<name>/`, records state in `/var/lib/pkg/status.json`, caches archives under `/var/cache/pkg/`, and registers package binaries through `/bin/<command>` for the WASM command bridge.
+Common Unix commands prefer the optional BusyBox WASIX runtime. EdgeTerm loads
+the runtime through a generic external-process boundary, verifies its release
+manifest, size, SHA-256 checksum, license identifier, and startup behavior, and
+then mounts the active browser workspace into `ash`. If the runtime cannot be
+loaded or verified, the existing Python EdgeTerm shell continues automatically.
+
+BusyBox source code and release artifacts are not included in this MPL-2.0
+repository. They are distributed separately under GPL-2.0-only from
+[`DigitalPlatDev/EdgeTerm-BusyBox-WASIX`](https://github.com/DigitalPlatDev/EdgeTerm-BusyBox-WASIX).
+EdgeTerm contains only the generic runtime loader, configuration, and fallback
+integration. Python, PHP, npm, Node, EdgeServe, and other host-integrated
+commands continue to use their dedicated browser runtimes.
+
+EdgeTerm's binary package manager is available as `pkg`. It reads
+`/etc/sources.list`, downloads static repository indexes, resolves dependencies,
+installs archives into `/packages/<name>/`, records state in
+`/var/lib/pkg/status.json`, caches archives under `/var/cache/pkg/`, and
+registers package binaries through `/bin/<command>` for the WASM command bridge.
 
 ```bash
 pkg source add https://example.com/edgeterm/repo
@@ -169,9 +358,9 @@ pkg install sqlite
 sqlite3 test.db
 ```
 
-Repository and manifest details live in `docs/pkg.md`.
+Legacy repository and manifest details live in `docs/pkg.md`.
 
-Common bundled commands include file, archive, text, process-like, and network-style tools such as `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `grep`, `sed`, `awk`, `tar`, `zip`, `unzip`, `curl`, and `wget`. Some commands are compatibility implementations for the browser filesystem rather than full native Linux binaries.
+Common bundled commands include file, archive, text, process-like, and network-style tools such as `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `grep`, `sed`, `awk`, `tar`, `zip`, `unzip`, `curl`, and `wget`. Some commands are compatibility implementations for the browser filesystem rather than standalone native executables.
 
 Experimental Wine commands are reserved for the BoxedWine runtime path:
 
@@ -217,6 +406,52 @@ The editor uses Monaco and supports:
 - upload into the active folder
 
 Monaco is loaded from CDN in the current frontend, so first load requires network access unless your deployment caches or vendors it.
+
+## Project launcher and run center
+
+Open **Projects and Runs** from the main toolbar to create a ready-to-run starter. Choose a template, project name, and workspace location. EdgeTerm writes the starter files, installs browser-compatible dependencies, persists the project, and optionally opens the app immediately.
+
+Available templates:
+
+- Flask WSGI app
+- Django WSGI app with a local SQLite database
+- FastAPI ASGI app
+- WordPress with the browser-compatible SQLite integration
+- static HTML, CSS, and JavaScript site
+- pygame SDL canvas app
+
+The Run Center lists EdgeServe apps started by either the launcher or terminal. Each entry can be opened, restarted, stopped, or connected to the EdgeServe request log. pygame runs open in Display and keep their terminal output available through the log action.
+
+Projects can also use a versioned `edgeterm.toml` file to declare package dependencies, local tasks, preview behavior, environment values, and references to encrypted local Vault entries. The Development workspace panel can inspect and restore that configuration, discover and run tests, start a supported debugger, and create or restore browser-local checkpoints. See [`docs/development-environment.md`](docs/development-environment.md) for the schema, Bridge methods, and capability boundaries.
+
+## Database Manager
+
+Open **Database Manager** to work with SQLite files inside the active workspace. It discovers `.db`, `.sqlite`, and `.sqlite3` files, including common Django and WordPress locations.
+
+The manager supports:
+
+- schema and table discovery
+- row browsing with a 100-row table shortcut
+- arbitrary SQL queries and `EXPLAIN QUERY PLAN`
+- committed `INSERT`, `UPDATE`, and `DELETE` statements
+- database import and export
+- one-click WordPress and Django database shortcuts
+
+Query results are limited to 500 displayed rows so a large result does not freeze the workspace UI.
+
+## Developer Hub
+
+Open **Developer Hub** and choose a project root to use the integrated developer workflow:
+
+- **Git** initializes real Git repositories, shows staged, modified, and untracked files, creates commits through Dulwich, imports public GitHub repository archives through the EdgeTerm network bridge, and exports project ZIP files.
+- **Dependencies** reads Python `requirements.txt`, Node `package.json`, and PHP/WordPress runtime requirements. Missing Python and PHP dependencies can be repaired in one action.
+- **Logs** summarizes and exports EdgeServe request, response, timing, failure, and browser-bridge events.
+- **WordPress** discovers local installations, reports their version and plugin count, opens the site or SQLite database, and repairs the PHP runtime package.
+- **Snapshots** creates compressed local restore points, provides a chronological timeline, and supports restore, download, and delete actions.
+- **Templates** provides one-click handoff to the tested Flask, Django, FastAPI, WordPress, static-site, and pygame project starters.
+- **Performance** audits project file count and size, browser resource transfer, running apps, pending saves, request logs, and the largest files. It can also force pending workspace saves to flush.
+
+Git support installs the pure-Python Dulwich package into the active browser runtime on first use. Public GitHub imports do not require an account or token; authenticated private-repository operations and pushing to GitHub are not included.
 
 ## Display output
 
@@ -590,7 +825,7 @@ Supported keys:
 - `EDGETERM_DB_USER`
 - `EDGETERM_DB_PASSWORD`
 
-### Linux production example
+### Production service example
 
 ```bash
 cd /home/python/edgeterm

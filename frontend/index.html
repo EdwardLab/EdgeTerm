@@ -13,7 +13,7 @@
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.86em' font-size='84'>ET</text></svg>"
       rel="icon"
     />
-    <title>EdgeTerm Workspace</title>
+    <title>EdgeTerm — Browser Development Environment</title>
     <link rel="stylesheet" href="./src/ui/styles.css" />
   </head>
   <body>
@@ -36,16 +36,30 @@
     <div id="app" class="app hidden">
       <aside class="sidebar">
         <div class="brand">
-          <strong>EdgeTerm Workspace</strong>
-          <span>Local-first terminal instances</span>
+          <div class="brand-mark" aria-hidden="true"><i data-lucide="square-terminal"></i></div>
+          <div class="brand-copy">
+            <strong>EdgeTerm</strong>
+            <span>Browser development environment</span>
+          </div>
+        </div>
+        <div class="sidebar-section-heading">
+          <span>WORKSPACES</span>
+          <span id="workspaceCount">0</span>
         </div>
         <div class="workspace-actions">
-          <button id="newWorkspace" class="icon-button" title="New workspace"><i data-lucide="plus"></i>New</button>
-          <button id="importRootfs" class="icon-button" title="Import custom rootfs"><i data-lucide="upload-cloud"></i>Import</button>
-          <button id="exportWorkspace" class="icon-button" title="Download workspace"><i data-lucide="archive"></i>Export</button>
-          <button id="deleteWorkspace" class="icon-button" title="Delete workspace"><i data-lucide="trash-2"></i>Delete</button>
+          <button id="newWorkspace" class="icon-button workspace-primary-action" title="Create workspace"><i data-lucide="plus"></i>New workspace</button>
+          <button id="importRootfs" class="icon-button" title="Import workspace"><i data-lucide="upload"></i>Import</button>
+          <button id="exportWorkspace" class="icon-button" title="Export workspace"><i data-lucide="download"></i>Export</button>
+          <button id="deleteWorkspace" class="icon-button workspace-danger-action" title="Delete workspace"><i data-lucide="trash-2"></i>Delete</button>
         </div>
         <div id="workspaceList" class="workspace-list"></div>
+        <div class="sidebar-runtime-summary">
+          <span class="runtime-dot" aria-hidden="true"></span>
+          <div>
+            <strong>Stored on this device</strong>
+            <span>Projects and dependencies stay in browser storage.</span>
+          </div>
+        </div>
       </aside>
       <div id="sidebarResizer" class="sidebar-resizer" aria-hidden="true"></div>
       <div id="sidebarBackdrop" class="sidebar-backdrop hidden"></div>
@@ -54,20 +68,35 @@
           <header class="topbar">
             <div class="topbar-left">
             <button id="toggleSidebar" class="icon-only sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar"><i data-lucide="panel-left"></i></button>
+            <div class="topbar-context">
+              <strong id="activeViewTitle">Terminal</strong>
+              <span>Development workspace</span>
+            </div>
             <div class="tabs">
-              <button class="tab active" data-view="terminalView" title="Terminal" aria-label="Terminal"><i data-lucide="terminal"></i></button>
-              <button class="tab" data-view="displayView" title="Display" aria-label="Display"><i data-lucide="monitor-play"></i></button>
-              <button class="tab" data-view="browserView" title="EdgeTerm Browser" aria-label="EdgeTerm Browser"><i data-lucide="globe-2"></i></button>
-              <button class="tab" data-view="filesView" title="Files" aria-label="Files"><i data-lucide="folder-tree"></i></button>
-              <button class="tab" data-view="editorView" title="Editor" aria-label="Editor"><i data-lucide="file-code-2"></i></button>
-              <button class="tab" data-view="usersView" title="Users" aria-label="Users"><i data-lucide="users"></i></button>
-              <button class="tab" data-view="cloudView" title="Cloud" aria-label="Cloud"><i data-lucide="cloud"></i></button>
-              <button class="tab hidden" id="adminTab" data-view="adminView" title="Admin" aria-label="Admin"><i data-lucide="shield"></i></button>
-              <button class="tab" data-view="settingsView" title="Settings" aria-label="Settings"><i data-lucide="settings"></i></button>
+              <button class="tab active" data-view="terminalView" data-label="Terminal" title="Terminal" aria-label="Terminal"><i data-lucide="terminal"></i></button>
+              <button class="tab" data-view="editorView" data-label="Editor" title="Editor" aria-label="Editor"><i data-lucide="file-code-2"></i></button>
+              <button class="tab" data-view="browserView" data-label="Browser" title="EdgeTerm Browser" aria-label="EdgeTerm Browser"><i data-lucide="globe-2"></i></button>
+              <button class="tab" data-view="filesView" data-label="Files" title="Files" aria-label="Files"><i data-lucide="folder-tree"></i></button>
+              <button class="tab" data-view="displayView" data-label="Display" title="Display" aria-label="Display"><i data-lucide="monitor-play"></i></button>
+              <button class="tab tab-group-start" data-view="projectsView" data-label="Projects" title="Projects and Runs" aria-label="Projects and Runs"><i data-lucide="rocket"></i></button>
+              <button class="tab" data-view="databaseView" data-label="Database" title="Database Manager" aria-label="Database Manager"><i data-lucide="database"></i></button>
+              <button class="tab" data-view="developerView" data-label="Tools" title="Developer Tools" aria-label="Developer Tools"><i data-lucide="blocks"></i></button>
+              <button class="tab" data-view="backupView" data-label="Backups" title="Backups" aria-label="Backups"><i data-lucide="cloud-upload"></i></button>
+              <button class="tab" data-view="usersView" data-label="Users" title="Users" aria-label="Users"><i data-lucide="users"></i></button>
+              <button class="tab" data-view="cloudView" data-label="Cloud" title="Cloud" aria-label="Cloud"><i data-lucide="cloud"></i></button>
+              <button class="tab hidden" id="adminTab" data-view="adminView" data-label="Admin" title="Admin" aria-label="Admin"><i data-lucide="shield"></i></button>
+              <button class="tab" data-view="settingsView" data-label="Settings" title="Settings" aria-label="Settings"><i data-lucide="settings"></i></button>
             </div>
             </div>
             <div class="topbar-right">
-          <div id="activeTitle" class="active-title"></div>
+          <div class="runtime-state" id="runtimeState" data-kind="loading">
+            <span class="runtime-dot" aria-hidden="true"></span>
+            <span id="runtimeStateText">Starting runtime</span>
+          </div>
+          <div class="workspace-context">
+            <strong id="activeTitle"></strong>
+            <span>Local workspace</span>
+          </div>
           <button id="topbarShareWriteback" class="icon-button hidden"><i data-lucide="upload"></i>Save Shared Copy</button>
           <button id="toggleTheme" class="icon-only" title="Switch theme" aria-label="Switch theme"><i data-lucide="moon-star"></i></button>
           <button id="toggleFullscreen" class="icon-button"><i data-lucide="maximize-2"></i>Fullscreen</button>
@@ -77,6 +106,12 @@
           <section id="terminalView" class="view terminal-view active">
             <button id="exitFullscreen" class="icon-button fullscreen-exit hidden" title="Exit fullscreen"><i data-lucide="minimize-2"></i>Exit</button>
             <div id="terminal"></div>
+            <div class="terminal-statusbar" aria-label="Terminal environment">
+              <span><i data-lucide="hard-drive"></i>Persistent workspace</span>
+              <span><i data-lucide="shield-check"></i>Local execution</span>
+              <button id="stopTerminalCommand" class="terminal-stop hidden" type="button" aria-label="Stop running command"><i data-lucide="square"></i>Stop command</button>
+              <span class="terminal-statusbar-right">UTF-8</span>
+            </div>
           </section>
 
             <section id="displayView" class="view display-view">
@@ -135,7 +170,7 @@
                   <div id="browserEmpty" class="display-empty">
                     <div>
                       <div class="display-empty-icon"><i data-lucide="globe-2"></i></div>
-                      <p>Start EdgeServe or open a running instance.</p>
+                      <p>No app is running. Start a project or an EdgeServe process to open a preview.</p>
                     </div>
                   </div>
                   <div id="browserContent" class="display-content hidden"></div>
@@ -179,6 +214,322 @@
           <div id="fileList" class="file-list"></div>
         </section>
 
+        <section id="projectsView" class="view projects-view">
+          <div class="projects-shell">
+            <div class="projects-heading">
+              <div>
+                <span class="projects-kicker">WORKSPACE / PROJECTS</span>
+                <h1>Projects</h1>
+                <p>Create a project and manage its local development process.</p>
+              </div>
+              <button id="refreshRunCenter" class="icon-button button-ghost" type="button"><i data-lucide="refresh-cw"></i>Refresh runs</button>
+            </div>
+
+            <div class="projects-grid">
+              <form id="projectWizard" class="project-panel project-wizard-card">
+                <div class="project-panel-title">
+                  <span class="project-step"><i data-lucide="folder-plus"></i></span>
+                  <div>
+                    <h2>New project</h2>
+                    <p>Start from a framework template.</p>
+                  </div>
+                </div>
+                <label class="project-field">
+                  <span>Template</span>
+                  <select id="projectTemplate">
+                    <option value="flask">Flask web app</option>
+                    <option value="django">Django web app</option>
+                    <option value="fastapi">FastAPI web app</option>
+                    <option value="wordpress">WordPress site</option>
+                    <option value="static">Static website</option>
+                    <option value="pygame">pygame canvas app</option>
+                  </select>
+                </label>
+                <label class="project-field">
+                  <span>Project name</span>
+                  <input id="projectName" value="flask-app" autocomplete="off" spellcheck="false" />
+                </label>
+                <label class="project-field">
+                  <span>Location</span>
+                  <input id="projectLocation" value="/home/user" autocomplete="off" spellcheck="false" />
+                </label>
+                <label class="project-check">
+                  <input id="projectRunAfterCreate" type="checkbox" checked />
+                  <span>Run and open after creation</span>
+                </label>
+                <button id="createProject" class="project-primary-action" type="submit">
+                  <i data-lucide="plus"></i>
+                  <span>Create project</span>
+                </button>
+                <div id="projectWizardStatus" class="project-status" role="status">Ready to create a project.</div>
+              </form>
+
+              <section class="project-panel run-center-card">
+                <div class="project-panel-title">
+                  <span class="project-step"><i data-lucide="activity"></i></span>
+                  <div>
+                    <h2>Run center</h2>
+                    <p>Open, restart, stop, and inspect active apps.</p>
+                  </div>
+                </div>
+                <div id="runCenterList" class="run-center-list"></div>
+              </section>
+            </div>
+
+            <section class="development-workspace" aria-labelledby="developmentWorkspaceTitle">
+              <div class="development-workspace-heading">
+                <div>
+                  <span class="projects-kicker">PROJECT ENVIRONMENT</span>
+                  <h2 id="developmentWorkspaceTitle">Development workspace</h2>
+                  <p>Restore dependencies, run tasks and tests, inspect debugging support, and recover local checkpoints.</p>
+                </div>
+                <label class="development-root-field">
+                  <span>Project root</span>
+                  <input id="developmentProjectRoot" value="/home/user" autocomplete="off" spellcheck="false" />
+                </label>
+              </div>
+              <div class="development-panel-grid">
+                <article class="development-panel" data-development-panel="environment">
+                  <div class="development-panel-title"><i data-lucide="package-check"></i><strong>Environment</strong></div>
+                  <p id="developmentEnvironmentSummary">Inspect edgeterm.toml or generate a draft from this project.</p>
+                  <div class="development-panel-actions">
+                    <button id="developmentInspectEnvironment" class="icon-button button-ghost" type="button">Inspect</button>
+                    <button id="developmentManageVault" class="icon-button button-ghost" type="button">Vault</button>
+                    <button id="developmentApplyEnvironment" class="icon-button" type="button">Restore</button>
+                  </div>
+                </article>
+                <article class="development-panel" data-development-panel="tasks">
+                  <div class="development-panel-title"><i data-lucide="list-checks"></i><strong>Tasks</strong></div>
+                  <div id="developmentTaskList" class="development-compact-list"><span>No tasks loaded.</span></div>
+                  <div class="development-panel-actions"><button id="developmentRefreshTasks" class="icon-button button-ghost" type="button">Refresh</button></div>
+                </article>
+                <article class="development-panel" data-development-panel="tests">
+                  <div class="development-panel-title"><i data-lucide="flask-conical"></i><strong>Tests</strong></div>
+                  <div id="developmentTestList" class="development-compact-list"><span>No test suites discovered.</span></div>
+                  <details id="developmentTestResult" class="development-result hidden">
+                    <summary>Latest result</summary>
+                    <div id="developmentTestResultSummary" class="development-result-summary"></div>
+                    <div id="developmentTestFailures" class="development-compact-list"></div>
+                    <pre id="developmentTestOutput"></pre>
+                  </details>
+                  <div class="development-panel-actions"><button id="developmentDiscoverTests" class="icon-button button-ghost" type="button">Discover</button></div>
+                </article>
+                <article class="development-panel" data-development-panel="debug">
+                  <div class="development-panel-title"><i data-lucide="bug"></i><strong>Debug</strong></div>
+                  <p id="developmentDebugSummary">Debug adapters load only when the current runtime supports them.</p>
+                  <div class="development-panel-actions">
+                    <button id="developmentStartDebug" class="icon-button" type="button">Start</button>
+                    <button id="developmentContinueDebug" class="icon-button button-ghost" type="button">Continue</button>
+                    <button id="developmentStepDebug" class="icon-button button-ghost" type="button">Step</button>
+                    <button id="developmentStopDebug" class="icon-button button-ghost" type="button">Stop</button>
+                    <button id="developmentRefreshDebug" class="icon-button button-ghost" type="button">Status</button>
+                  </div>
+                </article>
+                <article class="development-panel" data-development-panel="checkpoints">
+                  <div class="development-panel-title"><i data-lucide="history"></i><strong>Checkpoints</strong></div>
+                  <div id="developmentCheckpointList" class="development-compact-list"><span>No local checkpoints.</span></div>
+                  <div class="development-panel-actions">
+                    <button id="developmentCreateCheckpoint" class="icon-button" type="button">Create</button>
+                    <button id="developmentRefreshCheckpoints" class="icon-button button-ghost" type="button">Refresh</button>
+                  </div>
+                </article>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section id="databaseView" class="view database-view">
+          <div class="database-shell">
+            <header class="database-heading">
+              <div>
+                <span class="projects-kicker">WORKSPACE / DATABASE</span>
+                <h1>Database Manager</h1>
+                <p>Open local SQLite files or connect to a MySQL server.</p>
+              </div>
+              <div class="database-heading-actions">
+                <button id="databaseWordPressShortcut" class="icon-button button-ghost" type="button"><i data-lucide="globe-2"></i>WordPress</button>
+                <button id="databaseDjangoShortcut" class="icon-button button-ghost" type="button"><i data-lucide="layers-3"></i>Django</button>
+                <button id="databaseRefresh" class="icon-button" type="button"><i data-lucide="refresh-cw"></i>Scan</button>
+              </div>
+            </header>
+
+            <div class="database-engine-tabs" role="tablist" aria-label="Database engine">
+              <button class="active" type="button" data-database-engine="sqlite"><i data-lucide="database"></i>SQLite</button>
+              <button type="button" data-database-engine="mysql"><i data-lucide="server"></i>MySQL</button>
+            </div>
+
+            <div id="databaseSqliteToolbar" class="database-toolbar-card">
+              <label class="database-path-field">
+                <span>Database path</span>
+                <input id="databasePath" value="/home/user/db.sqlite3" autocomplete="off" spellcheck="false" />
+              </label>
+              <label class="database-found-field">
+                <span>Discovered databases</span>
+                <select id="databaseDiscovered"><option value="">Select a database...</option></select>
+              </label>
+              <button id="databaseOpen" class="project-primary-action database-open-button" type="button"><i data-lucide="folder-open"></i>Open</button>
+              <button id="databaseImport" class="icon-button button-ghost" type="button"><i data-lucide="upload"></i>Import</button>
+              <button id="databaseExport" class="icon-button button-ghost" type="button"><i data-lucide="download"></i>Export</button>
+              <input id="databaseImportPicker" class="hidden" type="file" accept=".db,.sqlite,.sqlite3,application/vnd.sqlite3" />
+            </div>
+
+            <div id="databaseMysqlToolbar" class="database-toolbar-card database-mysql-toolbar hidden">
+              <label><span>Host</span><input id="databaseMysqlHost" value="127.0.0.1" autocomplete="off" spellcheck="false" /></label>
+              <label class="database-port-field"><span>Port</span><input id="databaseMysqlPort" type="number" min="1" max="65535" value="3306" /></label>
+              <label><span>User</span><input id="databaseMysqlUser" value="root" autocomplete="username" /></label>
+              <label><span>Password</span><input id="databaseMysqlPassword" type="password" autocomplete="current-password" /></label>
+              <label><span>Database</span><select id="databaseMysqlDatabase"><option value="">Connect to load databases...</option></select></label>
+              <button id="databaseMysqlConnect" class="project-primary-action" type="button"><i data-lucide="plug-zap"></i>Connect</button>
+              <button id="databaseMysqlStatus" class="icon-button button-ghost" type="button"><i data-lucide="activity"></i>Status</button>
+              <button id="databaseMysqlImport" class="icon-button button-ghost" type="button"><i data-lucide="upload"></i>Import SQL</button>
+              <button id="databaseMysqlExport" class="icon-button button-ghost" type="button"><i data-lucide="download"></i>Export SQL</button>
+              <input id="databaseMysqlImportPicker" class="hidden" type="file" accept=".sql,text/sql,text/plain" />
+            </div>
+
+            <div class="database-workbench">
+              <aside class="database-sidebar project-panel">
+                <div class="database-sidebar-title">
+                  <div>
+                    <span>SCHEMA</span>
+                    <strong id="databaseActiveName">No database open</strong>
+                  </div>
+                  <button id="databaseRefreshSchema" class="icon-only" type="button" title="Refresh schema" aria-label="Refresh schema"><i data-lucide="refresh-cw"></i></button>
+                </div>
+                <div id="databaseTableList" class="database-table-list">
+                  <div class="database-empty-small">Open a database to inspect its tables.</div>
+                </div>
+              </aside>
+
+              <main class="database-main project-panel">
+                <div class="database-query-header">
+                  <div>
+                    <span>SQL QUERY</span>
+                    <strong id="databaseQueryLabel">Ready</strong>
+                  </div>
+                  <div class="database-query-actions">
+                    <button id="databaseStructure" class="icon-button button-ghost" type="button"><i data-lucide="list-tree"></i>Structure</button>
+                    <button id="databaseHistory" class="icon-button button-ghost" type="button"><i data-lucide="history"></i>History</button>
+                    <button id="databaseExplain" class="icon-button button-ghost" type="button"><i data-lucide="scan-search"></i>Explain</button>
+                    <button id="databaseRunQuery" class="icon-button" type="button"><i data-lucide="play"></i>Run SQL</button>
+                  </div>
+                </div>
+                <textarea id="databaseQuery" class="database-query-editor" spellcheck="false">SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name;</textarea>
+                <div class="database-result-meta">
+                  <span id="databaseResultStatus">No query executed.</span>
+                  <span id="databaseResultTiming"></span>
+                </div>
+                <div id="databaseResults" class="database-results">
+                  <div class="database-empty-result">Query results will appear here.</div>
+                </div>
+                <div id="databasePagination" class="database-pagination hidden">
+                  <button id="databasePreviousPage" class="icon-button button-ghost" type="button"><i data-lucide="chevron-left"></i>Previous</button>
+                  <span id="databasePageStatus">Rows 1–100</span>
+                  <button id="databaseNextPage" class="icon-button button-ghost" type="button">Next<i data-lucide="chevron-right"></i></button>
+                </div>
+              </main>
+            </div>
+          </div>
+        </section>
+
+        <section id="developerView" class="view developer-view">
+          <div class="developer-shell">
+            <header class="developer-heading">
+              <div>
+                <span class="projects-kicker">DEVELOPER TOOLKIT</span>
+                <h1>Developer Hub</h1>
+                <p>Source control, dependency checks, logs, WordPress maintenance, snapshots, templates, and performance in one place.</p>
+              </div>
+              <label class="developer-root-field">
+                <span>Project root</span>
+                <input id="developerProjectRoot" value="/home/user" autocomplete="off" spellcheck="false" />
+              </label>
+            </header>
+
+            <nav class="developer-nav" aria-label="Developer tools">
+              <button class="active" type="button" data-developer-panel="git"><i data-lucide="git-branch"></i>Git</button>
+              <button type="button" data-developer-panel="dependencies"><i data-lucide="package-check"></i>Dependencies</button>
+              <button type="button" data-developer-panel="logs"><i data-lucide="bug"></i>Logs</button>
+              <button type="button" data-developer-panel="wordpress"><i data-lucide="globe-2"></i>WordPress</button>
+              <button type="button" data-developer-panel="snapshots"><i data-lucide="history"></i>Snapshots</button>
+              <button type="button" data-developer-panel="templates"><i data-lucide="layout-template"></i>Templates</button>
+              <button type="button" data-developer-panel="performance"><i data-lucide="gauge"></i>Performance</button>
+            </nav>
+
+            <div class="developer-panels">
+              <section class="developer-panel active" data-developer-panel-content="git">
+                <div class="developer-panel-head">
+                  <div><h2>Git and GitHub</h2><p>Real local Git commits powered by Dulwich, plus public GitHub repository import.</p></div>
+                  <div class="developer-actions"><button id="gitInitialize" class="icon-button" type="button"><i data-lucide="git-branch-plus"></i>Initialize</button><button id="gitRefresh" class="icon-button button-ghost" type="button"><i data-lucide="refresh-cw"></i>Refresh</button></div>
+                </div>
+                <div class="developer-form-row">
+                  <input id="gitCommitMessage" placeholder="Commit message" value="Update project" />
+                  <button id="gitCommit" class="project-primary-action" type="button"><i data-lucide="git-commit-horizontal"></i>Commit all</button>
+                </div>
+                <div class="developer-form-row">
+                  <input id="githubRepositoryUrl" placeholder="https://github.com/owner/repository" />
+                  <button id="githubImport" class="icon-button" type="button"><i data-lucide="github"></i>Import public repository</button>
+                  <button id="gitDownload" class="icon-button button-ghost" type="button"><i data-lucide="download"></i>Download ZIP</button>
+                </div>
+                <div id="gitStatus" class="developer-status">Choose a project root, then initialize or refresh.</div>
+                <div id="gitResults" class="developer-results"></div>
+              </section>
+
+              <section class="developer-panel" data-developer-panel-content="dependencies">
+                <div class="developer-panel-head">
+                  <div><h2>Dependency health</h2><p>Inspect Python, Node, PHP, and WordPress dependency declarations.</p></div>
+                  <div class="developer-actions"><button id="dependencyScan" class="icon-button" type="button"><i data-lucide="scan-search"></i>Scan</button><button id="dependencyRepair" class="icon-button button-ghost" type="button"><i data-lucide="wrench"></i>Repair missing</button></div>
+                </div>
+                <div id="dependencyStatus" class="developer-status">No dependency scan has run.</div>
+                <div id="dependencyResults" class="developer-results"></div>
+              </section>
+
+              <section class="developer-panel" data-developer-panel-content="logs">
+                <div class="developer-panel-head">
+                  <div><h2>Debugger and request logs</h2><p>Inspect EdgeServe requests, failures, response timing, and browser bridge events.</p></div>
+                  <div class="developer-actions"><button id="developerLogsRefresh" class="icon-button" type="button"><i data-lucide="refresh-cw"></i>Refresh</button><button id="developerLogsClear" class="icon-button button-ghost" type="button"><i data-lucide="trash-2"></i>Clear</button><button id="developerLogsDownload" class="icon-button button-ghost" type="button"><i data-lucide="download"></i>Export</button></div>
+                </div>
+                <div id="developerLogSummary" class="developer-metrics"></div>
+                <pre id="developerLogOutput" class="developer-log-output">No EdgeServe requests recorded yet.</pre>
+              </section>
+
+              <section class="developer-panel" data-developer-panel-content="wordpress">
+                <div class="developer-panel-head">
+                  <div><h2>WordPress tools</h2><p>Discover sites, open them, inspect their database, and repair the PHP runtime.</p></div>
+                  <button id="wordpressScan" class="icon-button" type="button"><i data-lucide="scan-search"></i>Scan sites</button>
+                </div>
+                <div id="wordpressStatus" class="developer-status">No WordPress scan has run.</div>
+                <div id="wordpressResults" class="developer-results"></div>
+              </section>
+
+              <section class="developer-panel" data-developer-panel-content="snapshots">
+                <div class="developer-panel-head">
+                  <div><h2>Local snapshots and timeline</h2><p>Create compressed restore points before risky changes.</p></div>
+                  <button id="snapshotCreate" class="icon-button" type="button"><i data-lucide="camera"></i>Create snapshot</button>
+                </div>
+                <div class="developer-form-row"><input id="snapshotLabel" placeholder="Snapshot label" value="Before changes" /></div>
+                <div id="snapshotStatus" class="developer-status">Snapshots stay in this browser workspace.</div>
+                <div id="snapshotResults" class="developer-results"></div>
+              </section>
+
+              <section class="developer-panel" data-developer-panel-content="templates">
+                <div class="developer-panel-head">
+                  <div><h2>Template marketplace</h2><p>Use maintained starters that are already tested with EdgeTerm runtimes.</p></div>
+                </div>
+                <div id="templateMarketplace" class="template-marketplace"></div>
+              </section>
+
+              <section class="developer-panel" data-developer-panel-content="performance">
+                <div class="developer-panel-head">
+                  <div><h2>Performance center</h2><p>Measure workspace size, browser resource cost, running apps, and persistence health.</p></div>
+                  <div class="developer-actions"><button id="performanceAudit" class="icon-button" type="button"><i data-lucide="activity"></i>Run audit</button><button id="performanceFlush" class="icon-button button-ghost" type="button"><i data-lucide="save"></i>Flush saves</button></div>
+                </div>
+                <div id="performanceMetrics" class="developer-metrics"></div>
+                <div id="performanceResults" class="developer-results"></div>
+              </section>
+            </div>
+          </div>
+        </section>
+
         <section id="editorView" class="view editor-view">
           <div class="editor-shell">
             <div id="editorMenuBar" class="editor-menubar"></div>
@@ -187,13 +538,46 @@
               <input id="editorPath" class="path" value="/home/user/notes.txt" />
               <div class="editor-toolbar-group">
                 <span id="editorStatus" class="editor-status">Ready</span>
+                <button id="editorMaximizeButton" class="icon-only" type="button" title="Maximize editor" aria-label="Maximize editor"><i data-lucide="maximize-2"></i></button>
               </div>
             </div>
-            <div id="editorMain" class="editor-main">
-              <div class="editor-pane">
-                <div id="editor"></div>
-              </div>
-              <div id="editorSplitPane" class="editor-pane hidden">
+            <div class="editor-workbench">
+              <nav class="editor-activity" aria-label="Editor activity">
+                <button class="active" type="button" data-editor-activity="explorer" title="Explorer"><i data-lucide="files"></i></button>
+                <button type="button" data-editor-activity="search" title="Search"><i data-lucide="search"></i></button>
+                <button type="button" data-editor-activity="source" title="Source Control"><i data-lucide="git-branch"></i></button>
+                <button type="button" data-editor-activity="run" title="Run and Debug"><i data-lucide="play-circle"></i></button>
+              </nav>
+              <aside class="editor-sidebar">
+                <section class="editor-side-panel active" data-editor-side-panel="explorer">
+                  <header><strong>EXPLORER</strong><span><button id="editorNewFile" type="button" title="New file"><i data-lucide="file-plus-2"></i></button><button id="editorNewFolder" type="button" title="New folder"><i data-lucide="folder-plus"></i></button><button id="editorRefreshExplorer" type="button" title="Refresh"><i data-lucide="refresh-cw"></i></button></span></header>
+                  <label class="editor-workspace-root"><span>Workspace</span><input id="editorWorkspaceRoot" value="/home/user" spellcheck="false" /></label>
+                  <div id="editorExplorerTree" class="editor-explorer-tree"><div class="editor-panel-empty">Open the editor to load files.</div></div>
+                </section>
+                <section class="editor-side-panel" data-editor-side-panel="search">
+                  <header><strong>SEARCH</strong></header>
+                  <div class="editor-search-box"><input id="editorGlobalSearch" placeholder="Search in files" /><button id="editorRunSearch" type="button"><i data-lucide="search"></i></button></div>
+                  <div id="editorSearchResults" class="editor-search-results"><div class="editor-panel-empty">Enter text to search the workspace.</div></div>
+                </section>
+                <section class="editor-side-panel" data-editor-side-panel="source">
+                  <header><strong>SOURCE CONTROL</strong></header>
+                  <div class="editor-side-actions"><button id="editorOpenGit" type="button"><i data-lucide="git-branch"></i>Open Git tools</button></div>
+                  <div class="editor-panel-empty">Git status, commits, and GitHub import are available in Developer Hub.</div>
+                </section>
+                <section class="editor-side-panel" data-editor-side-panel="run">
+                  <header><strong>RUN AND DEBUG</strong></header>
+                  <div class="editor-side-actions"><button id="editorRunCurrent" type="button"><i data-lucide="play"></i>Run current file</button><button id="editorOpenTerminal" type="button"><i data-lucide="terminal"></i>Open terminal</button></div>
+                  <div id="editorRunHint" class="editor-panel-empty">Ctrl/⌘ + Enter runs the active file.</div>
+                </section>
+              </aside>
+              <div class="editor-center">
+                <div id="editorTabs" class="editor-tabs"><div class="editor-tab-welcome">No open editors</div></div>
+                <div id="editorBreadcrumbs" class="editor-breadcrumbs">/home/user</div>
+                <div id="editorMain" class="editor-main">
+                  <div class="editor-pane">
+                    <div id="editor"></div>
+                  </div>
+                  <div id="editorSplitPane" class="editor-pane hidden">
                 <div class="editor-pane-header">
                   <div class="editor-toolbar-group">
                     <button id="openSplitEditorButton" class="icon-only" type="button" title="Open file in split editor" aria-label="Open file in split editor">
@@ -212,6 +596,15 @@
                   </div>
                 </div>
                 <div id="editorSplit"></div>
+                  </div>
+                </div>
+                <section id="editorBottomPanel" class="editor-bottom-panel">
+                  <nav><button class="active" type="button" data-editor-bottom-tab="problems">Problems <span id="editorProblemCount">0</span></button><button type="button" data-editor-bottom-tab="output">Output</button><button type="button" data-editor-bottom-tab="terminal">Terminal</button><button id="editorClearTerminal" class="editor-panel-action hidden" type="button" title="Clear terminal" aria-label="Clear editor terminal"><i data-lucide="trash-2"></i></button><button id="editorToggleBottomPanel" class="editor-panel-toggle" type="button" title="Toggle panel" aria-label="Toggle bottom panel"><i data-lucide="panel-bottom-close"></i></button></nav>
+                  <div id="editorProblemsPanel" class="editor-bottom-content active" data-editor-bottom-panel="problems"><div class="editor-panel-empty">No problems detected.</div></div>
+                  <pre id="editorOutputPanel" class="editor-bottom-content" data-editor-bottom-panel="output">Editor output will appear here.</pre>
+                  <div id="editorTerminalPanel" class="editor-bottom-content" data-editor-bottom-panel="terminal"><div id="editorTerminal" aria-label="Editor terminal"></div></div>
+                </section>
+                <footer class="editor-statusbar"><button id="editorStatusBranch" type="button"><i data-lucide="git-branch"></i>main</button><span id="editorStatusCursor">Ln 1, Col 1</span><span id="editorStatusIndent">Spaces: 2</span><span>UTF-8</span><span>LF</span><button id="editorStatusLanguage" type="button">Plain Text</button><span id="editorStatusProblems"><i data-lucide="circle-x"></i>0</span></footer>
               </div>
             </div>
           </div>
@@ -234,6 +627,127 @@
                 <span>Home directory</span>
                 <code id="activeHomeLabel">/home/user</code>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="backupView" class="view settings-view external-backup-view">
+          <div class="product-header">
+            <div>
+              <h1>Backups</h1>
+              <p>Save encrypted, incremental workspace backups to storage you control.</p>
+            </div>
+            <div id="externalBackupStatus" class="status-pill">Not connected</div>
+          </div>
+
+          <div class="metric-strip backup-metric-strip">
+            <div><span>Last backup</span><strong id="externalBackupLastRun">Never</strong></div>
+            <div><span>Stored snapshots</span><strong id="externalBackupCount">0</strong></div>
+            <div><span>Data reused</span><strong id="externalBackupReused">0 B</strong></div>
+            <div><span>Active job</span><strong id="externalBackupJob">None</strong></div>
+          </div>
+
+          <div class="backup-layout">
+            <div class="panel backup-panel backup-provider-panel">
+              <div class="panel-head">
+                <div><h2>Storage</h2><p class="file-muted">Backup files go directly from this browser to your provider.</p></div>
+              </div>
+              <div class="backup-provider-grid">
+                <button type="button" data-backup-provider="google-drive"><i data-lucide="hard-drive"></i><span>Google Drive</span></button>
+                <button type="button" data-backup-provider="dropbox"><i data-lucide="box"></i><span>Dropbox</span></button>
+                <button type="button" data-backup-provider="s3"><i data-lucide="database-zap"></i><span>S3 compatible</span></button>
+                <button type="button" data-backup-provider="local-folder"><i data-lucide="folder-open"></i><span>Local folder</span></button>
+              </div>
+              <div id="backupConnectionSummary" class="developer-status">Choose where to store this workspace.</div>
+              <div class="setting-actions">
+                <button id="backupDisconnect" class="icon-button button-ghost" type="button" disabled><i data-lucide="unlink"></i>Disconnect</button>
+              </div>
+            </div>
+
+            <div class="panel backup-panel">
+              <div class="panel-head">
+                <div><h2>Encryption</h2><p class="file-muted">Your recovery password encrypts file contents and names.</p></div>
+              </div>
+              <div class="setting-stack">
+                <div class="setting-field">
+                  <label for="backupPassword">Recovery password</label>
+                  <input id="backupPassword" type="password" autocomplete="new-password" placeholder="Enter a strong recovery password" />
+                </div>
+                <div class="setting-field">
+                  <label for="backupPasswordConfirm">Confirm password</label>
+                  <input id="backupPasswordConfirm" type="password" autocomplete="new-password" placeholder="Enter it again" />
+                </div>
+                <label class="setting-checkbox"><input id="backupRememberPassword" type="checkbox" /> Remember on this device</label>
+                <div class="setting-actions">
+                  <button id="backupUnlock" class="icon-button" type="button"><i data-lucide="key-round"></i>Unlock backups</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="backupS3Panel" class="panel backup-panel backup-wide hidden">
+              <div class="panel-head"><div><h2>Connect S3-compatible storage</h2><p class="file-muted">Works with Amazon S3, R2, Backblaze B2, MinIO, and compatible services.</p></div></div>
+              <div class="backup-form-grid">
+                <div class="setting-field"><label for="backupS3Endpoint">Endpoint</label><input id="backupS3Endpoint" placeholder="https://s3.us-east-1.amazonaws.com" /></div>
+                <div class="setting-field"><label for="backupS3Region">Region</label><input id="backupS3Region" value="us-east-1" /></div>
+                <div class="setting-field"><label for="backupS3Bucket">Bucket</label><input id="backupS3Bucket" /></div>
+                <div class="setting-field"><label for="backupS3Prefix">Folder</label><input id="backupS3Prefix" value="EdgeTerm Backups" /></div>
+                <div class="setting-field"><label for="backupS3AccessKey">Access key</label><input id="backupS3AccessKey" autocomplete="off" /></div>
+                <div class="setting-field"><label for="backupS3SecretKey">Secret key</label><input id="backupS3SecretKey" type="password" autocomplete="new-password" /></div>
+              </div>
+              <label class="setting-checkbox"><input id="backupS3PathStyle" type="checkbox" checked /> Use path-style URLs</label>
+              <div class="setting-actions">
+                <button id="backupS3Connect" class="icon-button" type="button"><i data-lucide="link"></i>Connect</button>
+                <button id="backupS3Cancel" class="icon-button button-ghost" type="button">Cancel</button>
+              </div>
+            </div>
+
+            <div class="panel backup-panel backup-wide">
+              <div class="backup-action-row">
+                <div><h2>Current workspace</h2><p id="backupWorkspaceLabel" class="file-muted">No workspace selected</p></div>
+                <div class="setting-actions">
+                  <button id="externalBackupNow" class="icon-button" type="button" disabled><i data-lucide="cloud-upload"></i>Back up now</button>
+                  <button id="externalBackupCancel" class="icon-button button-ghost hidden" type="button"><i data-lucide="square"></i>Cancel</button>
+                </div>
+              </div>
+              <div id="externalBackupProgress" class="backup-progress hidden">
+                <div><strong id="externalBackupProgressTitle">Preparing backup</strong><span id="externalBackupProgressDetail"></span></div>
+                <progress id="externalBackupProgressBar" max="100" value="0"></progress>
+              </div>
+            </div>
+
+            <div class="panel backup-panel">
+              <div class="panel-head"><div><h2>Automatic backups</h2><p class="file-muted">Runs while EdgeTerm is open.</p></div></div>
+              <div class="setting-stack">
+                <label class="setting-checkbox"><input id="externalBackupScheduleEnabled" type="checkbox" /> Enable schedule</label>
+                <div class="setting-field">
+                  <label for="externalBackupScheduleInterval">Frequency</label>
+                  <select id="externalBackupScheduleInterval">
+                    <option value="60">Every hour</option>
+                    <option value="360">Every 6 hours</option>
+                    <option value="720">Every 12 hours</option>
+                    <option value="1440" selected>Daily</option>
+                    <option value="10080">Weekly</option>
+                  </select>
+                </div>
+                <button id="externalBackupSaveSchedule" class="icon-button" type="button"><i data-lucide="save"></i>Save schedule</button>
+              </div>
+            </div>
+
+            <div class="panel backup-panel">
+              <div class="panel-head"><div><h2>Storage usage</h2><p class="file-muted">Incremental backups reuse unchanged encrypted chunks.</p></div></div>
+              <div class="setting-stack">
+                <div class="setting-row"><span>Workspace data</span><code id="externalBackupSourceBytes">0 B</code></div>
+                <div class="setting-row"><span>Uploaded</span><code id="externalBackupUploadedBytes">0 B</code></div>
+                <div class="setting-row"><span>Reused</span><code id="externalBackupReusedBytes">0 B</code></div>
+              </div>
+            </div>
+
+            <div class="panel backup-panel backup-wide">
+              <div class="panel-head">
+                <div><h2>Restore points</h2><p class="file-muted">Restore into a new workspace, verify, or remove a snapshot.</p></div>
+                <button id="externalBackupRefresh" class="icon-button button-ghost" type="button"><i data-lucide="refresh-cw"></i>Refresh</button>
+              </div>
+              <div id="externalBackupList" class="backup-list"><div class="file-muted">Connect storage to list backups.</div></div>
             </div>
           </div>
         </section>

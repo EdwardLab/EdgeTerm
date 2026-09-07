@@ -1,0 +1,6 @@
+Types: deb
+URIs: https://packages.digitalplat.org
+Suites: stable
+Components: main
+Architectures: wasm32-wasix
+Signed-By: /usr/share/keyrings/edgeterm-packages.asc

@@ -1,0 +1,68 @@
+--- a/lib/dpkg/dpkg.h
++++ b/lib/dpkg/dpkg.h
+@@ -100,1 +100,5 @@
++#ifdef __wasi__
++#define BACKEND		"/bin/dpkg-deb"
++#else
+-#define BACKEND		"dpkg-deb"
++#define BACKEND		"dpkg-deb"
++#endif
+@@ -109,5 +113,13 @@
++#ifdef __wasi__
++#define RM		"/bin/rm"
++#define LESS		"/bin/less"
++#define MORE		"/bin/more"
++#define CAT		"/bin/cat"
++#define DIFF		"/bin/diff"
++#else
+-#define RM		"rm"
+-#define LESS		"less"
+-#define MORE		"more"
+-#define CAT		"cat"
+-#define DIFF		"diff"
++#define RM		"rm"
++#define LESS		"less"
++#define MORE		"more"
++#define CAT		"cat"
++#define DIFF		"diff"
++#endif
+--- a/lib/dpkg/command.c
++++ b/lib/dpkg/command.c
+@@ -208,2 +208,6 @@ command_shell(const char *cmd, const char *name)
++#ifdef __wasi__
++	shell = "/bin/sh";
++#else
+-	if (str_is_unset(shell))
+-		shell = DPKG_DEFAULT_SHELL;
++	if (str_is_unset(shell))
++		shell = DPKG_DEFAULT_SHELL;
++#endif
+@@ -231,4 +235,16 @@ command_in_path(const char *cmd)
+ 	const char *path, *path_end;
+ 
++#ifdef __wasi__
++	static const char *const available_commands[] = {
++		"sh", "/bin/sh", "rm", "/bin/rm", "tar", "/bin/tar",
++		"diff", "/bin/diff", "dpkg-deb", "/bin/dpkg-deb", NULL
++	};
++	const char *const *available;
++
++	for (available = available_commands; *available != NULL; available++)
++		if (strcmp(cmd, *available) == 0)
++			return true;
++	return false;
++#endif
+ 	if (cmd[0] == '/')
+ 		return file_is_exec(cmd);
+--- a/src/main/help.c
++++ b/src/main/help.c
+@@ -84,5 +84,9 @@ checkpath(void)
+     DPKG_DEFAULT_SHELL,
+     RM,
++#ifdef __wasi__
++    "/bin/tar",
++#else
+     TAR,
++#endif
+     DIFF,
+     BACKEND,

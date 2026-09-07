@@ -260,6 +260,31 @@ def package_files(root):
     return files
 
 
+def installed_record_complete(name, record):
+    root = f"{PACKAGES_DIR}/{name}"
+    manifest = record.get("manifest") or {}
+    manifest_path = f"{root}/package.json"
+    if not os.path.isfile(manifest_path):
+        return False
+    expected_files = record.get("files") or []
+    for relative_path in expected_files:
+        clean_path = str(relative_path or "").replace("\\", "/").lstrip("/")
+        if not clean_path or ".." in clean_path.split("/"):
+            return False
+        if not os.path.exists(f"{root}/{clean_path}"):
+            return False
+    for target in (manifest.get("bin") or {}).values():
+        clean_target = str(target or "").replace("\\", "/").lstrip("/")
+        if not clean_target or ".." in clean_target.split("/"):
+            return False
+        if not os.path.isfile(f"{root}/{clean_target}"):
+            return False
+    for asset in (manifest.get("js"), manifest.get("wasm")):
+        if asset and not os.path.isfile(f"{root}/{str(asset).lstrip('/')}"):
+            return False
+    return True
+
+
 def load_status():
     ensure_dirs()
     status = read_json(STATUS_PATH, {"format": "edgeterm-pkg-status-v1", "installed": {}, "auto": {}, "updatedAt": None})
@@ -498,14 +523,14 @@ def resolve_dependencies(specs, status, include_installed=False):
         if name in visited:
             return
         installed = status.get("installed", {}).get(name)
-        if installed and not include_installed and dependency_satisfied(installed.get("version"), "", ""):
+        if installed and installed_record_complete(name, installed) and not include_installed and dependency_satisfied(installed.get("version"), "", ""):
             visited.add(name)
             return
         visiting.append(name)
         for dep in pkg.get("dependencies", []) or []:
             dep_name, op, dep_version = parse_dependency(dep)
             installed_dep = status.get("installed", {}).get(dep_name)
-            if installed_dep and dependency_satisfied(installed_dep.get("version"), op, dep_version):
+            if installed_dep and installed_record_complete(dep_name, installed_dep) and dependency_satisfied(installed_dep.get("version"), op, dep_version):
                 continue
             dep_spec = f"{dep_name}={dep_version}" if op == "=" and dep_version else dep_name
             dep_pkg = select_package(dep_spec)
@@ -661,7 +686,7 @@ async def install_one(pkg, manual, status, options):
     name = pkg["name"]
     version = pkg["version"]
     current = status["installed"].get(name)
-    if current and current.get("version") == version and not options.reinstall:
+    if current and current.get("version") == version and installed_record_complete(name, current) and not options.reinstall:
         log(f"{name} is already installed ({version}).", options)
         if manual:
             current["manual"] = True
@@ -755,6 +780,9 @@ async def install_one(pkg, manual, status, options):
 async def cmd_install(args, options):
     if not args:
         raise PkgError("missing package name")
+    if not load_indexes():
+        log("Package lists are missing; refreshing sources automatically.", options)
+        await cmd_update(options)
     status = load_status()
     log("Resolving dependencies...", options)
     plan = resolve_dependencies(args, status, include_installed=options.reinstall)
@@ -1104,6 +1132,7 @@ async def main(argv):
     if args[0] in ("-v", "--version"):
         print(f"pkg {VERSION}")
         return 0
+    warn("pkg is retained for one compatibility release; use APT for wasm32-wasix packages")
     command, tail = args[0], args[1:]
     try:
         if command == "update":

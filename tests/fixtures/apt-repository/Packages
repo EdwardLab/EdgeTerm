@@ -1,0 +1,20 @@
+Package: edgeterm-apt-test
+Version: 1.0.0
+Architecture: all
+Maintainer: EdgeTerm Test Suite <test@invalid.example>
+Installed-Size: 1
+Filename: ./edgeterm-apt-test_1.0.0_all.deb
+Size: 786
+SHA256: 878a977600895df7e27e9acb81941e2efbfd5646b7cbf1a82bbe644dcc3a8d24
+Description: EdgeTerm APT and dpkg integration test package
+
+Package: fastfetch
+Version: 2.66.0-1edgeterm1
+Architecture: wasm32-wasix
+Maintainer: EdgeTerm Project <support@digitalplat.org>
+Installed-Size: 1360
+Filename: ./fastfetch_2.66.0-1edgeterm1_wasm32-wasix.deb
+Size: 354250
+SHA256: b1c719b78d15532729ba886ea178d2f72050947530e4b71c4c695c6644b69923
+Homepage: https://github.com/fastfetch-cli/fastfetch
+Description: Fastfetch system information tool for EdgeTerm

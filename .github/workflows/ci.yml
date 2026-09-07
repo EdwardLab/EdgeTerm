@@ -1,0 +1,49 @@
+name: Verify EdgeTerm
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: edgeterm-ci-only
+        ports:
+          - 33306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pedgeterm-ci-only"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: npm ci
+      - run: npm run prepare:runtime
+      - run: python -m pip install -r backend/requirements-lock.txt
+      - run: npm run build:offline
+      - run: npm run build:cloud
+      - run: npm run build:embed
+      - run: npm test
+      - run: python -m unittest discover -s tests/backend
+        env:
+          EDGETERM_TEST_MYSQL_HOST: 127.0.0.1
+          EDGETERM_TEST_MYSQL_PORT: 33306
+          EDGETERM_TEST_MYSQL_USER: root
+          EDGETERM_TEST_MYSQL_PASSWORD: edgeterm-ci-only
+      - run: git diff --exit-code

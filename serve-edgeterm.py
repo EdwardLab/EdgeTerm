@@ -11,6 +11,7 @@ import threading
 import time
 import zipfile
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
@@ -1109,7 +1110,7 @@ class EdgeTermHandler(SimpleHTTPRequestHandler):
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
-        self.send_header("Cross-Origin-Embedder-Policy", "credentialless")
+        self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
         self.send_header("Origin-Agent-Cluster", "?1")
         self.send_header("Permissions-Policy", "cross-origin-isolated=(self)")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -1133,12 +1134,22 @@ def main():
     args = parser.parse_args()
 
     global EXTERNAL_PACKAGES_ROOT
-    os.chdir(args.dir)
-    EXTERNAL_PACKAGES_ROOT = Path(args.packages_dir).resolve()
-    init_cloud(args.cloud_dir)
+    content_root = Path(args.dir).resolve()
+    if not content_root.is_dir():
+        parser.error(f"Static directory does not exist: {content_root}")
+    packages_root = Path(args.packages_dir)
+    cloud_root = Path(args.cloud_dir)
+    EXTERNAL_PACKAGES_ROOT = (
+        packages_root.resolve()
+        if packages_root.is_absolute()
+        else (content_root / packages_root).resolve()
+    )
+    init_cloud(cloud_root if cloud_root.is_absolute() else content_root / cloud_root)
     configure_admin_gate(args.admin_gate_user, args.admin_gate_password, args.secure_cookies)
-    server = ThreadingHTTPServer((args.host, args.port), EdgeTermHandler)
+    handler = partial(EdgeTermHandler, directory=str(content_root))
+    server = ThreadingHTTPServer((args.host, args.port), handler)
     print(f"Serving EdgeTerm on http://{args.host}:{args.port}/")
+    print(f"Static content root: {content_root}")
     print(f"Cloud backend storage: {CLOUD_ROOT}")
     print(f"External package root: {EXTERNAL_PACKAGES_ROOT}")
     print("/admin is protected by the EdgeTerm admin login session.")

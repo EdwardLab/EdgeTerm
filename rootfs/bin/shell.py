@@ -15,8 +15,7 @@ if os.path.isdir("/usr/lib") and "/usr/lib" not in sys.path:
 from edgeterm_shell import EdgeTermShell, ShellExit
 
 
-print("[BOOTLOADER] EdgeTerm, kernel 0.27.5")
-print(f"[BOOT] Python {os.sys.version}")
+print(f"EdgeTerm 0.27.5 · Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
 
 
 def print_motd():

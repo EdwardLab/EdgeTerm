@@ -1,0 +1,17 @@
+diff --git a/apt-private/private-output.cc b/apt-private/private-output.cc
+index c095e996d..eabbb80cb 100644
+--- a/apt-private/private-output.cc
++++ b/apt-private/private-output.cc
+@@ -118,6 +118,12 @@ static std::string DeterminePager()
+ 
+ bool InitOutputPager()
+ {
++#ifdef __wasi__
++   // EdgeTerm already provides a persistent, scrollable terminal. Starting an
++   // external pager would require a separate interactive process tree.
++   return true;
++#endif
++
+    // InitOutputPager() behaves like a singleton, do not run twice-
+    static bool alreadyRan = false;
+    if (alreadyRan)

@@ -1,0 +1,6 @@
+--- a/methods/basehttp.cc
++++ b/methods/basehttp.cc
+@@ -294 +294,2 @@
+-					   varnishsupport.begin(), varnishsupport.end()) < 0)
++					   varnishsupport.data(),
++					   varnishsupport.data() + varnishsupport.length()) < 0)

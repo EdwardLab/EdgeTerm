@@ -1,0 +1,13 @@
+diff --git a/lib/dpkg/subproc.c b/lib/dpkg/subproc.c
+index 4d224c3a3..5b56f8b7a 100644
+--- a/lib/dpkg/subproc.c
++++ b/lib/dpkg/subproc.c
+@@ -103,7 +103,7 @@ subproc_fork(void)
+ {
+ 	pid_t pid;
+ 
+-	pid = fork();
++	pid = edgeterm_vfork();
+ 	if (pid < 0) {
+ 		onerr_abort++;
+ 		ohshite(_("fork failed"));

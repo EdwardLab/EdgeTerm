@@ -657,17 +657,20 @@ def default_signup_tier(db):
 
 
 def can_view_share(share, viewer):
+    if viewer and viewer["id"] == share.get("ownerId"):
+        return True, None
     if share["visibility"] == "public":
         return True, None
     if share["visibility"] == "private":
-        return (viewer is not None), "login required"
+        return False, "not allowed" if viewer else "login required"
     if share["visibility"] == "restricted":
         allowed = set(share.get("allowedUsers", []))
         if not viewer:
             return False, "login required"
         if viewer["email"] not in allowed:
             return False, "not allowed"
-    return True, None
+        return True, None
+    return False, "not allowed"
 
 
 def enforce_user_tier_expiry(db, user):

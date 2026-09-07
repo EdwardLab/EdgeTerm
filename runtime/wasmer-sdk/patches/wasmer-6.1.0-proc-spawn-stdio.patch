@@ -1,0 +1,544 @@
+diff --git a/lib/wasix/src/bin_factory/exec.rs b/lib/wasix/src/bin_factory/exec.rs
+index 75e7f254ea..b6744a3f26 100644
+--- a/lib/wasix/src/bin_factory/exec.rs
++++ b/lib/wasix/src/bin_factory/exec.rs
+@@ -58,12 +58,19 @@ pub fn package_command_by_name<'a>(
+     pkg: &'a BinaryPackage,
+     name: &str,
+ ) -> Result<&'a BinaryPackageCommand, SpawnError> {
++    let basename = std::path::Path::new(name)
++        .file_name()
++        .and_then(|value| value.to_str());
++
+     // If an explicit command is provided, use it.
+     // Otherwise, use the entrypoint.
+     // If no entrypoint exists, and the package has a single
+     // command, then use it. This is done for backwards
+     // compatibility.
+-    let cmd = if let Some(cmd) = pkg.get_command(name) {
++    let cmd = if let Some(cmd) = pkg
++        .get_command(name)
++        .or_else(|| basename.and_then(|value| pkg.get_command(value)))
++    {
+         cmd
+     } else if let Some(cmd) = pkg.get_entrypoint_command() {
+         cmd
+@@ -123,6 +130,15 @@ pub fn spawn_exec_module(
+     module: Module,
+     env: WasiEnv,
+     runtime: &Arc<dyn Runtime + Send + Sync + 'static>,
++) -> Result<TaskJoinHandle, SpawnError> {
++    spawn_exec_module_with_recycle(module, env, runtime, None)
++}
++
++pub fn spawn_exec_module_with_recycle(
++    module: Module,
++    env: WasiEnv,
++    runtime: &Arc<dyn Runtime + Send + Sync + 'static>,
++    recycle: Option<Box<TaskWasmRecycle>>,
+ ) -> Result<TaskJoinHandle, SpawnError> {
+     // Create a new task manager
+     let tasks = runtime.task_manager();
+@@ -135,16 +151,19 @@ pub fn spawn_exec_module(
+         // Create a thread that will run this process
+         let tasks_outer = tasks.clone();
+ 
+-        tasks_outer
+-            .task_wasm(
+-                TaskWasm::new(Box::new(run_exec), env, module, true, true).with_pre_run(Box::new(
++        let mut task = TaskWasm::new(Box::new(run_exec), env, module, true, true)
++            .with_pre_run(Box::new(
+                     |ctx, store| {
+                         Box::pin(async move {
+                             ctx.data(store).state.fs.close_cloexec_fds().await;
+                         })
+                     },
+-                )),
+-            )
++                ));
++        if let Some(recycle) = recycle {
++            task = task.with_recycle(recycle);
++        }
++        tasks_outer
++            .task_wasm(task)
+             .map_err(|err| {
+                 error!("wasi[{}]::failed to launch module - {}", pid, err);
+                 SpawnError::Other(Box::new(err))
+diff --git a/lib/wasix/src/bin_factory/mod.rs b/lib/wasix/src/bin_factory/mod.rs
+index 5dfd00cc0f..dc9400b559 100644
+--- a/lib/wasix/src/bin_factory/mod.rs
++++ b/lib/wasix/src/bin_factory/mod.rs
+@@ -20,8 +20,8 @@ mod exec;
+ pub use self::{
+     binary_package::*,
+     exec::{
+-        package_command_by_name, run_exec, spawn_exec, spawn_exec_module, spawn_exec_wasm,
+-        spawn_load_module, spawn_union_fs,
++        package_command_by_name, run_exec, spawn_exec, spawn_exec_module,
++        spawn_exec_module_with_recycle, spawn_exec_wasm, spawn_load_module, spawn_union_fs,
+     },
+ };
+ use crate::{
+diff --git a/lib/wasix/src/fs/mod.rs b/lib/wasix/src/fs/mod.rs
+index 1de82fc713..3f6e0b7a6f 100644
+--- a/lib/wasix/src/fs/mod.rs
++++ b/lib/wasix/src/fs/mod.rs
+@@ -1917,19 +1917,7 @@ impl WasiFs {
+                 path: PathBuf::from(preopen_name),
+                 entries: Default::default(),
+             };
+-            let rights = Rights::FD_ADVISE
+-                | Rights::FD_TELL
+-                | Rights::FD_SEEK
+-                | Rights::FD_READ
+-                | Rights::PATH_OPEN
+-                | Rights::FD_READDIR
+-                | Rights::PATH_READLINK
+-                | Rights::PATH_FILESTAT_GET
+-                | Rights::FD_FILESTAT_GET
+-                | Rights::PATH_LINK_SOURCE
+-                | Rights::PATH_RENAME_SOURCE
+-                | Rights::POLL_FD_READWRITE
+-                | Rights::SOCK_SHUTDOWN;
++            let rights = ALL_RIGHTS;
+             let inode = self
+                 .create_inode(inodes, kind, true, preopen_name.clone())
+                 .map_err(|e| {
+@@ -1937,7 +1925,7 @@ impl WasiFs {
+                         "Failed to create inode for preopened dir (name `{preopen_name}`): WASI error code: {e}",
+                     )
+                 })?;
+-            let fd_flags = Fd::READ;
++            let fd_flags = Fd::READ | Fd::WRITE | Fd::APPEND | Fd::TRUNCATE | Fd::CREATE;
+             let fd = self
+                 .create_fd(
+                     rights,
+diff --git a/lib/wasix/src/os/task/process.rs b/lib/wasix/src/os/task/process.rs
+index 6ca980c80d..52bf69f152 100644
+--- a/lib/wasix/src/os/task/process.rs
++++ b/lib/wasix/src/os/task/process.rs
+@@ -765,12 +765,33 @@ impl WasiProcess {
+     /// Waits until the process is finished.
+     pub async fn join(&self) -> Result<ExitCode, Arc<WasiRuntimeError>> {
+         let _guard = WasiProcessWait::new(self);
++        if let Some(status) = self.finished.status().into_finished() {
++            return status;
++        }
++        let main_thread = {
++            let inner = self.inner.0.lock().unwrap();
++            inner
++                .threads
++                .values()
++                .find(|thread| thread.is_main())
++                .cloned()
++        };
++        if let Some(thread) = main_thread {
++            return thread.join().await;
++        }
+         self.finished.await_termination().await
+     }
+ 
+     /// Attempts to join on the process
+     pub fn try_join(&self) -> Option<Result<ExitCode, Arc<WasiRuntimeError>>> {
+-        self.finished.status().into_finished()
++        self.finished.status().into_finished().or_else(|| {
++            let inner = self.inner.0.lock().unwrap();
++            inner
++                .threads
++                .values()
++                .find(|thread| thread.is_main())
++                .and_then(WasiThread::try_join)
++        })
+     }
+ 
+     /// Waits for all the children to be finished
+@@ -801,6 +822,34 @@ impl WasiProcess {
+             .next()
+     }
+ 
++    /// Waits for any of the children to finished
++    pub fn try_join_any_child(&mut self) -> Result<Option<(WasiProcessId, ExitCode)>, Errno> {
++        let children = {
++            let inner = self.inner.0.lock().unwrap();
++            inner.children.clone()
++        };
++        if children.is_empty() {
++            return Err(Errno::Child);
++        }
++
++        for child in children {
++            let Some(result) = child.try_join() else {
++                continue;
++            };
++            let code = result.unwrap_or_else(|error| {
++                error
++                    .as_exit_code()
++                    .unwrap_or_else(|| Errno::Canceled.into())
++            });
++            let pid = child.pid;
++            let mut inner = self.inner.0.lock().unwrap();
++            inner.children.retain(|candidate| candidate.pid != pid);
++            return Ok(Some((pid, code)));
++        }
++
++        Ok(None)
++    }
++
+     /// Waits for any of the children to finished
+     pub async fn join_any_child(&mut self) -> Result<Option<(WasiProcessId, ExitCode)>, Errno> {
+         let _guard = WasiProcessWait::new(self);
+diff --git a/lib/wasix/src/runners/wasi.rs b/lib/wasix/src/runners/wasi.rs
+index a41496d4d2..adb08eb28d 100644
+--- a/lib/wasix/src/runners/wasi.rs
++++ b/lib/wasix/src/runners/wasi.rs
+@@ -15,7 +15,7 @@ use crate::{
+     capabilities::Capabilities,
+     journal::{DynJournal, DynReadableJournal, SnapshotTrigger},
+     runners::{MappedDirectory, MountedDirectory, wasi_common::CommonWasiOptions},
+-    runtime::task_manager::VirtualTaskManagerExt,
++    runtime::task_manager::{TaskWasmRecycle, VirtualTaskManagerExt},
+ };
+ 
+ use super::wasi_common::{MAPPED_CURRENT_DIR_DEFAULT_PATH, MappedCommand};
+@@ -334,6 +334,62 @@ impl WasiRunner {
+         program_name: &str,
+         module: Module,
+         module_hash: ModuleHash,
++    ) -> Result<(), Error> {
++        self.run_wasm_inner(
++            runtime_or_engine,
++            program_name,
++            module,
++            module_hash,
++            None,
++            None,
++        )
++    }
++
++    pub fn run_wasm_with_root_fs(
++        &self,
++        runtime_or_engine: RuntimeOrEngine,
++        program_name: &str,
++        module: Module,
++        module_hash: ModuleHash,
++        root_fs: TmpFileSystem,
++    ) -> Result<(), Error> {
++        self.run_wasm_inner(
++            runtime_or_engine,
++            program_name,
++            module,
++            module_hash,
++            Some(root_fs),
++            None,
++        )
++    }
++
++    pub fn run_wasm_with_root_fs_and_recycle(
++        &self,
++        runtime_or_engine: RuntimeOrEngine,
++        program_name: &str,
++        module: Module,
++        module_hash: ModuleHash,
++        root_fs: TmpFileSystem,
++        recycle: Box<TaskWasmRecycle>,
++    ) -> Result<(), Error> {
++        self.run_wasm_inner(
++            runtime_or_engine,
++            program_name,
++            module,
++            module_hash,
++            Some(root_fs),
++            Some(recycle),
++        )
++    }
++
++    fn run_wasm_inner(
++        &self,
++        runtime_or_engine: RuntimeOrEngine,
++        program_name: &str,
++        module: Module,
++        module_hash: ModuleHash,
++        root_fs: Option<TmpFileSystem>,
++        recycle: Option<Box<TaskWasmRecycle>>,
+     ) -> Result<(), Error> {
+         // Just keep the runtime and enter guard alive until we're done running the module
+         let tokio_runtime = Self::ensure_tokio_runtime();
+@@ -346,7 +402,7 @@ impl WasiRunner {
+             &wasi,
+             PackageOrHash::Hash(module_hash),
+             runtime_or_engine,
+-            None,
++            root_fs,
+         )?;
+ 
+         #[cfg(feature = "ctrlc")]
+@@ -390,8 +446,13 @@ impl WasiRunner {
+         let runtime = env.runtime.clone();
+         let tasks = runtime.task_manager().clone();
+ 
+-        let mut task_handle =
+-            crate::bin_factory::spawn_exec_module(module, env, &runtime).context("Spawn failed")?;
++        let mut task_handle = crate::bin_factory::spawn_exec_module_with_recycle(
++            module,
++            env,
++            &runtime,
++            recycle,
++        )
++        .context("Spawn failed")?;
+ 
+         #[cfg(feature = "ctrlc")]
+         task_handle.install_ctrlc_handler();
+diff --git a/lib/wasix/src/state/env.rs b/lib/wasix/src/state/env.rs
+index e316a21684..293de50819 100644
+--- a/lib/wasix/src/state/env.rs
++++ b/lib/wasix/src/state/env.rs
+@@ -1269,26 +1269,31 @@ impl WasiEnv {
+         if let Some(process_exit_code) = process_exit_code {
+             let process = self.process.clone();
+             let disable_fs_cleanup = self.disable_fs_cleanup;
++            #[cfg(not(feature = "js"))]
+             let pid = self.pid();
+-
++            #[cfg(not(feature = "js"))]
+             let timeout = self.tasks().sleep_now(CLEANUP_TIMEOUT);
++            #[cfg(not(feature = "js"))]
+             let state = self.state.clone();
+             Box::pin(async move {
+                 if !disable_fs_cleanup {
+-                    tracing::trace!(pid = %pid, "cleaning up open file handles");
++                    #[cfg(not(feature = "js"))]
++                    {
++                        tracing::trace!(pid = %pid, "cleaning up open file handles");
+ 
+-                    // Perform the clean operation using the asynchronous runtime
+-                    tokio::select! {
+-                        _ = timeout => {
+-                            tracing::debug!(
+-                                "WasiEnv::cleanup has timed out after {CLEANUP_TIMEOUT:?}"
+-                            );
+-                        },
+-                        _ = state.fs.close_all() => { }
+-                    }
++                        // Perform the clean operation using the asynchronous runtime
++                        tokio::select! {
++                            _ = timeout => {
++                                tracing::debug!(
++                                    "WasiEnv::cleanup has timed out after {CLEANUP_TIMEOUT:?}"
++                                );
++                            },
++                            _ = state.fs.close_all() => { }
++                        }
+ 
+-                    // Now send a signal that the thread is terminated
+-                    process.signal_process(Signal::Sigquit);
++                        // Now send a signal that the thread is terminated
++                        process.signal_process(Signal::Sigquit);
++                    }
+                 }
+ 
+                 // Terminate the process
+diff --git a/lib/wasix/src/syscalls/wasi/fd_close.rs b/lib/wasix/src/syscalls/wasi/fd_close.rs
+index 17b6162ec3..90232d6e77 100644
+--- a/lib/wasix/src/syscalls/wasi/fd_close.rs
++++ b/lib/wasix/src/syscalls/wasi/fd_close.rs
+@@ -34,6 +34,12 @@ pub fn fd_close(mut ctx: FunctionEnvMut<'_, WasiEnv>, fd: WasiFd) -> Result<Errn
+     // closed without flushing first. Hence, we flush once here.
+     match __asyncify_light(env, None, state.fs.flush(fd))? {
+         Ok(_) | Err(Errno::Isdir) | Err(Errno::Io) | Err(Errno::Access) => {}
++        #[cfg(feature = "js")]
++        Err(Errno::Inval) => {
++            // Browser memory-backed files persist writes synchronously. Some
++            // adapters do not implement a separate flush operation and report
++            // EINVAL even though closing the descriptor is valid.
++        }
+         Err(e) => {
+             return Ok(e);
+         }
+diff --git a/lib/wasix/src/syscalls/wasi/path_filestat_set_times.rs b/lib/wasix/src/syscalls/wasi/path_filestat_set_times.rs
+index e2e35eb5bd..cd129bc4e4 100644
+--- a/lib/wasix/src/syscalls/wasi/path_filestat_set_times.rs
++++ b/lib/wasix/src/syscalls/wasi/path_filestat_set_times.rs
+@@ -80,7 +80,6 @@ pub(crate) fn path_filestat_set_times_internal(
+     let env = ctx.data();
+     let (memory, mut state, inodes) = unsafe { env.get_memory_and_wasi_state_and_inodes(&ctx, 0) };
+     let fd_entry = state.fs.get_fd(fd)?;
+-    let fd_inode = fd_entry.inode;
+     if !fd_entry
+         .inner
+         .rights
+@@ -98,10 +97,8 @@ pub(crate) fn path_filestat_set_times_internal(
+         state
+             .fs
+             .get_inode_at_path(inodes, fd, path, flags & __WASI_LOOKUP_SYMLINK_FOLLOW != 0)?;
+-    let stat = {
+-        let guard = file_inode.read();
+-        state.fs.get_stat_for_kind(guard.deref())?
+-    };
++    let mut atime = None;
++    let mut mtime = None;
+ 
+     if fst_flags.contains(Fstflags::SET_ATIM) || fst_flags.contains(Fstflags::SET_ATIM_NOW) {
+         let time_to_set = if fst_flags.contains(Fstflags::SET_ATIM) {
+@@ -109,7 +106,8 @@ pub(crate) fn path_filestat_set_times_internal(
+         } else {
+             get_current_time_in_nanos()?
+         };
+-        fd_inode.stat.write().unwrap().st_atim = time_to_set;
++        file_inode.stat.write().unwrap().st_atim = time_to_set;
++        atime = Some(time_to_set);
+     }
+     if fst_flags.contains(Fstflags::SET_MTIM) || fst_flags.contains(Fstflags::SET_MTIM_NOW) {
+         let time_to_set = if fst_flags.contains(Fstflags::SET_MTIM) {
+@@ -117,7 +115,17 @@ pub(crate) fn path_filestat_set_times_internal(
+         } else {
+             get_current_time_in_nanos()?
+         };
+-        fd_inode.stat.write().unwrap().st_mtim = time_to_set;
++        file_inode.stat.write().unwrap().st_mtim = time_to_set;
++        mtime = Some(time_to_set);
++    }
++
++    if let Kind::File {
++        handle: Some(handle),
++        ..
++    } = file_inode.kind.write().unwrap().deref()
++    {
++        let mut handle = handle.write().unwrap();
++        handle.set_times(atime, mtime);
+     }
+ 
+     Ok(())
+diff --git a/lib/wasix/src/syscalls/wasi/proc_exit.rs b/lib/wasix/src/syscalls/wasi/proc_exit.rs
+index 722e1bd704..a336be99a5 100644
+--- a/lib/wasix/src/syscalls/wasi/proc_exit.rs
++++ b/lib/wasix/src/syscalls/wasi/proc_exit.rs
+@@ -69,5 +69,7 @@ pub fn proc_exit<M: MemorySize>(
+     }
+ 
+     // Otherwise just exit
++    #[cfg(feature = "js")]
++    ctx.data().thread.set_status_finished(Ok(code));
+     Err(WasiError::Exit(code))
+ }
+diff --git a/lib/wasix/src/syscalls/wasix/path_open2.rs b/lib/wasix/src/syscalls/wasix/path_open2.rs
+index a593a74c88..065612a4e9 100644
+--- a/lib/wasix/src/syscalls/wasix/path_open2.rs
++++ b/lib/wasix/src/syscalls/wasix/path_open2.rs
+@@ -1,4 +1,5 @@
+ use super::*;
++use crate::VIRTUAL_ROOT_FD;
+ use crate::syscalls::*;
+ 
+ /// ### `path_open()`
+@@ -65,10 +66,15 @@ pub fn path_open2<M: MemorySize>(
+ 
+     let path_string = unsafe { get_input_str_ok!(&memory, path, path_len) };
+     Span::current().record("path", path_string.as_str());
++    let effective_dirfd = if path_string.starts_with('/') {
++        VIRTUAL_ROOT_FD
++    } else {
++        dirfd
++    };
+ 
+     let out_fd = wasi_try_ok!(path_open_internal(
+         ctx.data(),
+-        dirfd,
++        effective_dirfd,
+         dirflags,
+         &path_string,
+         o_flags,
+@@ -85,7 +91,7 @@ pub fn path_open2<M: MemorySize>(
+         JournalEffector::save_path_open(
+             &mut ctx,
+             out_fd,
+-            dirfd,
++            effective_dirfd,
+             dirflags,
+             path_string,
+             o_flags,
+@@ -151,6 +157,10 @@ pub(crate) fn path_open_internal(
+     // Maximum rights: should be the working dir rights
+     // Minimum rights: whatever rights are provided
+     let adjusted_rights = /*fs_rights_base &*/ working_dir_rights_inheriting;
++    let has_write_access = fs_rights_base.contains(Rights::FD_WRITE)
++        || fs_flags.contains(Fdflags::APPEND)
++        || o_flags.contains(Oflags::TRUNC)
++        || o_flags.contains(Oflags::CREATE);
+     let mut open_options = state.fs_new_open_options();
+ 
+     let target_rights = match maybe_inode {
+@@ -179,7 +189,7 @@ pub(crate) fn path_open_internal(
+         }
+         Err(_) => virtual_fs::OpenOptionsConfig {
+             append: fs_flags.contains(Fdflags::APPEND),
+-            write: fs_rights_base.contains(Rights::FD_WRITE),
++            write: has_write_access,
+             read: fs_rights_base.contains(Rights::FD_READ),
+             create_new: o_flags.contains(Oflags::CREATE) && o_flags.contains(Oflags::EXCL),
+             create: o_flags.contains(Oflags::CREATE),
+diff --git a/lib/wasix/src/syscalls/wasix/proc_join.rs b/lib/wasix/src/syscalls/wasix/proc_join.rs
+index 87c12ea03e..db74f20a43 100644
+--- a/lib/wasix/src/syscalls/wasix/proc_join.rs
++++ b/lib/wasix/src/syscalls/wasix/proc_join.rs
+@@ -188,7 +188,6 @@ pub(super) fn proc_join_internal<M: MemorySize + 'static>(
+             }
+         } else {
+             // Wait for the process to finish
+-            let process2 = process.clone();
+             let res = __asyncify_with_deep_sleep::<M, _, _>(ctx, async move {
+                 let exit_code = process.join().await.unwrap_or_else(|_| Errno::Child.into());
+                 tracing::trace!(%exit_code, "triggered child join");
+diff --git a/lib/wasix/src/syscalls/wasix/proc_spawn2.rs b/lib/wasix/src/syscalls/wasix/proc_spawn2.rs
+index cc64b740ef..71ec72a41b 100644
+--- a/lib/wasix/src/syscalls/wasix/proc_spawn2.rs
++++ b/lib/wasix/src/syscalls/wasix/proc_spawn2.rs
+@@ -119,6 +119,11 @@ pub fn proc_spawn2<M: MemorySize>(
+ 
+     Span::current().record("full_path", &name);
+ 
++    // Capture the current directory explicitly. Browser worker-backed process
++    // launches rebuild the child instance on another worker, so relying only
++    // on the cloned descriptor table can reset relative path resolution to `/`.
++    let parent_current_dir = ctx.data().state.fs.current_dir.lock().unwrap().clone();
++
+     // Fork the environment which will copy all the open file handlers
+     // and associate a new context but otherwise shares things like the
+     // file system interface. The handle to the forked process is stored
+@@ -131,6 +136,7 @@ pub fn proc_spawn2<M: MemorySize>(
+             return Ok(Errno::Perm);
+         }
+     };
++    child_env.state.fs.set_current_dir(&parent_current_dir);
+ 
+     {
+         let mut inner = ctx.data().process.lock();
+@@ -164,9 +170,27 @@ pub fn proc_spawn2<M: MemorySize>(
+             }
+ 
+             let env = builder.take().unwrap();
++            let tasks = env.tasks().clone();
+ 
+-            // Spawn a new process with this current execution environment
+-            block_on(bin_factory.spawn(name, env))
++            // Browser runtimes execute the parent module inside a local
++            // executor. Starting another module synchronously on that same
++            // executor is not reentrant, so launch the child on a dedicated
++            // runtime worker and wait only for the startup result.
++            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
++            if let Err(err) = tasks.task_dedicated(Box::new(move || {
++                let result = block_on(bin_factory.spawn(name, env));
++                let _ = sender.send(result);
++            })) {
++                error!("failed to schedule child process: {err}");
++                return Ok(Errno::Noexec);
++            }
++            match receiver.recv() {
++                Ok(result) => result,
++                Err(err) => {
++                    error!("failed to receive child process result: {err}");
++                    Err(SpawnError::InternalError)
++                }
++            }
+         }
+     };
+ 

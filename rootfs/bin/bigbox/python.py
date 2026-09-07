@@ -36,6 +36,8 @@ Options and arguments (EdgeTerm subset):
 
 NOOP_FLAGS = {"-u", "-B", "-S", "-E", "-I"}
 _TERMINAL_RAW_OPTIONS = None
+_TERMINAL_STDOUT = sys.stdout
+_TERMINAL_STDERR = sys.stderr
 
 
 def _banner():
@@ -47,13 +49,7 @@ def _banner():
 
 
 def _terminal_echo(text):
-    try:
-        if hasattr(js, "term") and hasattr(js.term, "echo"):
-            js.term.echo(str(text))
-            return
-    except Exception:
-        pass
-    print(text)
+    _terminal_write(f"{text}\n")
 
 
 def _terminal_write(text, is_error=False):
@@ -62,6 +58,12 @@ def _terminal_write(text, is_error=False):
     if not text:
         return
     try:
+        if hasattr(js, "terminal") and hasattr(js.terminal, "write"):
+            js.terminal.write(text, bool(is_error))
+            return
+    except Exception:
+        pass
+    try:
         if _TERMINAL_RAW_OPTIONS is None:
             _TERMINAL_RAW_OPTIONS = js.JSON.parse('{"newline": false}')
         if hasattr(js, "term") and hasattr(js.term, "echo"):
@@ -69,10 +71,10 @@ def _terminal_write(text, is_error=False):
             return
     except Exception:
         pass
-    if is_error:
-        print(text, end="", file=sys.stderr)
-    else:
-        print(text, end="")
+    stream = _TERMINAL_STDERR if is_error else _TERMINAL_STDOUT
+    if stream is not None:
+        stream.write(text)
+        stream.flush()
 
 
 async def _terminal_input(prompt=""):
@@ -402,6 +404,8 @@ def _remember_env(state, *keys):
 
 
 async def _rehydrate_runtime_installs():
+    if getattr(builtins, "_EDGETERM_RUNTIME_INSTALLS_REHYDRATED", False):
+        return
     try:
         from edgeterm_pip import rehydrate_runtime_installs
 
@@ -412,8 +416,26 @@ async def _rehydrate_runtime_installs():
             error = item.get("error") if isinstance(item, dict) else item
             if name or error:
                 print(f"python: warning: runtime package rehydrate failed for {name or 'package'}: {error}", file=sys.stderr)
+        builtins._EDGETERM_RUNTIME_INSTALLS_REHYDRATED = True
     except Exception as exc:
         print(f"python: warning: runtime package rehydrate skipped: {exc}", file=sys.stderr)
+
+
+def _code_requires_runtime_installs(source):
+    try:
+        tree = ast.parse(str(source or ""), mode="exec")
+    except SyntaxError:
+        return False
+    roots = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            roots.add(node.module.split(".", 1)[0])
+    return any(
+        root not in sys.stdlib_module_names and root not in sys.modules
+        for root in roots
+    )
 
 
 def _install_pygame_compat():
@@ -1293,6 +1315,7 @@ async def _run_repl(namespace=None, quiet=False):
         except Exception:
             traceback.print_exc()
             prompt = ">>> "
+    console.persistent_restore_streams()
 
 
 async def _run_code(code, argv0="<string>", argv_tail=None):
@@ -1301,9 +1324,17 @@ async def _run_code(code, argv0="<string>", argv_tail=None):
     old_stdin = sys.stdin
     sys.stdin = _make_tty_stdin(old_stdin)
     sys.argv = [argv0, *(argv_tail or [])]
-    _install_pygame_compat()
+    needs_async_compat = any(
+        marker in code
+        for marker in ("input(", "time.sleep(", "pygame", "await ")
+    )
+    if "pygame" in code:
+        _install_pygame_compat()
     try:
-        await _run_module_source(code, "<string>", namespace)
+        if needs_async_compat:
+            await _run_module_source(code, "<string>", namespace)
+        else:
+            exec(compile(code, "<string>", "exec"), namespace, namespace)
         return namespace
     finally:
         sys.stdin = old_stdin
@@ -1503,28 +1534,10 @@ async def _run_module(module_name, args):
     old_stdin = sys.stdin
     sys.stdin = _make_tty_stdin(old_stdin)
     sys.argv = [module_name, *args]
-    # Filter command dirs and apply PYTHONPATH before runpy.run_module,
-    # matching the _run_script behaviour.
-    COMMAND_DIRS = {"/bin/bigbox", "/bin"}
-    clean_path = []
-    pythonpath = os.environ.get("PYTHONPATH", "")
-    if pythonpath:
-        for pp_entry in pythonpath.split(":"):
-            pp_entry = pp_entry.strip()
-            if not pp_entry:
-                continue
-            pp_abs = os.path.abspath(pp_entry)
-            if pp_abs not in clean_path:
-                if not any(pp_abs == os.path.abspath(d) for d in COMMAND_DIRS):
-                    clean_path.append(pp_abs)
-    for entry in old_path:
-        if entry in clean_path:
-            continue
-        entry_abs = os.path.abspath(entry) if entry else entry
-        if any(entry == d or entry_abs == os.path.abspath(d) for d in COMMAND_DIRS):
-            continue
-        clean_path.append(entry)
-    sys.path[:] = clean_path
+    # CPython places the current working directory at sys.path[0] for
+    # `python -m`. Reuse the script path builder so module execution and test
+    # discovery can import project modules without exposing command shims.
+    sys.path[:] = _pythonpath_for_script(os.getcwd(), old_path)
     _install_pygame_compat()
     try:
         runpy.run_module(module_name, run_name="__main__", alter_sys=True)
@@ -1651,16 +1664,21 @@ async def main(args):
     try:
         _apply_flags(options)
         _remember_env(state, "DJANGO_ALLOW_ASYNC_UNSAFE", "DJANGO_SETTINGS_MODULE")
-        await _rehydrate_runtime_installs()
         if options["command"] is not None:
+            if _code_requires_runtime_installs(options["command"]):
+                await _rehydrate_runtime_installs()
             namespace = await _run_code(options["command"], argv0="-c", argv_tail=options["script_args"])
         elif options["module"] is not None:
+            await _rehydrate_runtime_installs()
             namespace = await _run_module(options["module"], options["script_args"])
         elif options["stdin"]:
+            await _rehydrate_runtime_installs()
             namespace = await _run_stdin(options["script_args"])
         elif options["script"] is not None:
+            await _rehydrate_runtime_installs()
             namespace = await _run_script(options["script"], options["script_args"])
         else:
+            await _rehydrate_runtime_installs()
             await _run_repl(quiet=options["quiet"])
             return
 

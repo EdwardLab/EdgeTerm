@@ -1,0 +1,49 @@
+diff --git a/apt-pkg/contrib/mmap.cc b/apt-pkg/contrib/mmap.cc
+index 56e0801f6..afbacc46a 100644
+--- a/apt-pkg/contrib/mmap.cc
++++ b/apt-pkg/contrib/mmap.cc
+@@ -109,6 +109,14 @@ bool MMap::Map(FileFd &Fd)
+ 	    return Fd.Read(Base, iSize);
+ 	 }
+ 	 // FIXME: Writing to compressed fd's ?
++#ifdef __wasi__
++	 Base = calloc(iSize, 1);
++	 if (unlikely(Base == nullptr))
++	    return _error->Errno("MMap-calloc", _("Couldn't make mmap of %llu bytes"), iSize);
++	 SyncToFd = new FileFd();
++	 if (!Fd.Seek(0L) || !Fd.Read(Base, iSize))
++	    return false;
++#else
+ 	 int const dupped_fd = dup(Fd.Fd());
+ 	 if (dupped_fd == -1)
+ 	    return _error->Errno("mmap", _("Couldn't duplicate file descriptor %i"), Fd.Fd());
+@@ -119,6 +127,7 @@ bool MMap::Map(FileFd &Fd)
+ 	 SyncToFd = new FileFd (dupped_fd);
+ 	 if (!SyncToFd->Seek(0L) || !SyncToFd->Read(Base, iSize))
+ 	    return false;
++#endif
+       }
+       else
+ 	 return _error->Errno("MMap-mmap", _("Couldn't make mmap of %llu bytes"), iSize);
+@@ -168,6 +177,10 @@ bool MMap::Sync()
+    {
+       if (SyncToFd != NULL)
+       {
++#ifdef __wasi__
++	 if (!SyncToFd->IsOpen())
++	    return true;
++#endif
+ 	 if (!SyncToFd->Seek(0) || !SyncToFd->Write(Base, iSize))
+ 	    return false;
+       }
+@@ -194,6 +207,10 @@ bool MMap::Sync(unsigned long Start,unsigned long Stop)
+    {
+       if (SyncToFd != 0)
+       {
++#ifdef __wasi__
++	 if (!SyncToFd->IsOpen())
++	    return true;
++#endif
+ 	 if (!SyncToFd->Seek(0) ||
+ 	     !SyncToFd->Write (((char *)Base)+Start, Stop-Start))
+ 	    return false;

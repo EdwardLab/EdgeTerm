@@ -1,0 +1,19 @@
+--- a/apt-pkg/contrib/fileutl.cc
++++ b/apt-pkg/contrib/fileutl.cc
+@@ -1223,7 +1223,15 @@ public:
+       return true;
+    }
+    virtual ssize_t InternalWrite(void const * const From, unsigned long long const Size) = 0;
+-   virtual bool InternalWriteError() { return filefd->FileFdErrno("write",_("Write error")); }
++   virtual bool InternalWriteError()
++   {
++      if (filefd->Name().empty())
++         return filefd->FileFdErrno("write",
++               _("Write error for unnamed file descriptor %d"), filefd->Fd());
++      return filefd->FileFdErrno("write",
++            _("Write error for %s (file descriptor %d)"),
++            filefd->Name().c_str(), filefd->Fd());
++   }
+    virtual bool InternalSeek(unsigned long long const To)
+    {
+       // Our poor man seeking is costly, so try to avoid it
